@@ -108,7 +108,10 @@ public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wP
     }
 }
 
-function Split-Path2 { param([string]$Value) @($Value -split ';') | Where-Object { $_.Trim() } }
+# Always an ARRAY. The runner sets Set-StrictMode -Version Latest, and under strict mode a
+# pipeline that yields 0 or 1 items is $null or a scalar, so a later .Count throws
+# "The property 'Count' cannot be found on this object" and kills an otherwise fine install.
+function Split-Path2 { param([string]$Value) return @(@($Value -split ';') | Where-Object { $_.Trim() }) }
 function Test-Admin {
     (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     ).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
@@ -139,8 +142,17 @@ Write-Head 'Current PATH'
 Write-Info2 ("machine : {0,5} chars, {1} entries" -f $machine.Length, $mEntries.Count)
 Write-Info2 ("user    : {0,5} chars, {1} entries" -f $user.Length, $uEntries.Count)
 Write-Info2 ("session : {0,5} chars  <- what this process actually received" -f $env:Path.Length)
-if ($env:Path.Length -lt ($machine.Length + $user.Length)) {
-    Write-Warn2 'This shell received LESS than machine+user: the PATH is being truncated.'
+# Detect truncation by its SIGNATURE, not by a length comparison. A session PATH is legitimately
+# shorter than machine+user (de-duplication, per-process edits, a parent that started earlier), so
+# "shorter" alone cries wolf - it did, on a freshly consolidated 1818-char PATH. What truncation
+# actually looks like is a final entry chopped mid-string, leaving a directory that cannot exist.
+$sessEntries = Split-Path2 $env:Path
+if ($sessEntries.Count -gt 0) {
+    $lastEntry = $sessEntries[-1]
+    if (-not (Test-Path -LiteralPath $lastEntry -ErrorAction SilentlyContinue)) {
+        Write-Warn2 "This shell's PATH ends in a directory that does not exist ('$lastEntry')."
+        Write-Warn2 "That is the signature of a PATH truncated in flight at $($env:Path.Length) chars."
+    }
 }
 
 if (-not (Test-Path $NativeBin)) {
@@ -151,7 +163,7 @@ if (-not (Test-Path $NativeBin)) {
 # Resolution order is machine-then-user, which is how Windows composes the session PATH. Keeping
 # that order is what makes "first one wins" match what resolves today.
 $ordered = @($mEntries + $uEntries)
-$targets = $ordered | Where-Object { $_ -like '*\WinGet\Packages\*' } | Select-Object -Unique
+$targets = @($ordered | Where-Object { $_ -like '*\WinGet\Packages\*' } | Select-Object -Unique)
 
 Write-Head "Winget package directories to collapse: $($targets.Count)"
 if ($targets.Count -eq 0) { Write-Ok 'nothing to collapse'; }

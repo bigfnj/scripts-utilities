@@ -19,7 +19,10 @@ param(
     [switch]$SkipWireshark,
     [switch]$SkipWDK,
     [switch]$InstallGhidra,
-    [switch]$InstallLlm
+    [switch]$InstallLlm,
+    # Escape hatch only. Leaving PATH unconsolidated is what makes installed tools invisible to a
+    # shell that inherits the machine PATH only, or that receives a PATH truncated at ~4 KB.
+    [switch]$SkipPathConsolidation
 )
 
 Set-StrictMode -Version Latest
@@ -30,12 +33,14 @@ $Bootstrap = Join-Path $RepoRoot "bootstrap.ps1"
 $Smoke = Join-Path $RepoRoot "scripts\smoke-test.ps1"
 $GhidraInstaller = Join-Path $RepoRoot "scripts\install-ghidra.ps1"
 $LlmInstaller = Join-Path $RepoRoot "scripts\install-llm.ps1"
+$PathConsolidator = Join-Path $RepoRoot "scripts\consolidate-path.ps1"
 $LogDir = Join-Path $RepoRoot "logs\fresh-workstation"
 $LogFile = Join-Path $LogDir ("setup-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
 
 function Write-Step { param([string]$Message) Write-Host "`n== $Message ==" -ForegroundColor White }
 function Write-Info { param([string]$Message) Write-Host "  $Message" -ForegroundColor Cyan }
 function Write-Ok { param([string]$Message) Write-Host "OK $Message" -ForegroundColor Green }
+function Write-Warn { param([string]$Message) Write-Host "WARN $Message" -ForegroundColor Yellow }
 
 function Assert-Prerequisites {
     $nativeArch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
@@ -98,6 +103,24 @@ try {
         } else {
             Invoke-Checked "Install local LLM stack" { & $LlmInstaller }
         }
+    }
+
+    # Must run AFTER every group, because each one appends to PATH and this measures the result.
+    # Skipping it leaves the machine in the state this repo exists to prevent: tools installed,
+    # registered, and invisible - either past the ~4 KB point where Windows truncates the PATH it
+    # hands a new process, or on the user PATH only, which a machine-PATH-only shell never sees.
+    if (-not $SkipPathConsolidation) {
+        Write-Step "PATH consolidation"
+        if ($DryRun) {
+            & $PathConsolidator -DryRun
+        } else {
+            # Deliberately not Invoke-Checked: a PATH that cannot be consolidated is worth
+            # reporting loudly, but it must not fail an otherwise good install. The script backs
+            # both PATH values up first and prints its own -Restore line.
+            try { & $PathConsolidator } catch { Write-Warn "PATH consolidation failed: $_" }
+        }
+    } else {
+        Write-Info "PATH consolidation skipped (-SkipPathConsolidation)"
     }
 
     Write-Step "verification"
