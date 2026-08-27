@@ -84,6 +84,30 @@ function Set-RawPath {
     finally { $k.Close() }
 }
 
+function Publish-EnvChange {
+    # Writing the registry directly does NOT tell anything that the environment moved. The System
+    # Properties UI broadcasts WM_SETTINGCHANGE for you; a SetValue call does not, so Explorer and
+    # every process it later spawns keep serving the OLD environment until the next logon. Without
+    # this the fix appears not to have worked, which is the worst possible outcome for a PATH
+    # repair - you check, it still fails, you conclude the tool is broken.
+    try {
+        if (-not ('Win32.NativeEnv' -as [type])) {
+            Add-Type -Namespace Win32 -Name NativeEnv -MemberDefinition @'
+[DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Auto)]
+public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);
+'@
+        }
+        $res = [UIntPtr]::Zero
+        # HWND_BROADCAST, WM_SETTINGCHANGE, SMTO_ABORTIFHUNG, 5 s - a hung top-level window must
+        # not wedge the installer.
+        $sent = [Win32.NativeEnv]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$res)
+        if ($sent -ne [IntPtr]::Zero) { Write-Ok 'broadcast WM_SETTINGCHANGE (new processes pick up the PATH without a logon)' }
+        else { Write-Warn2 'WM_SETTINGCHANGE broadcast returned 0 - sign out and back in for the PATH to take effect.' }
+    } catch {
+        Write-Warn2 "could not broadcast the environment change ($($_.Exception.Message)) - sign out and back in."
+    }
+}
+
 function Split-Path2 { param([string]$Value) @($Value -split ';') | Where-Object { $_.Trim() } }
 function Test-Admin {
     (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -227,7 +251,9 @@ if (Test-Admin) {
     Write-Warn2 'Until then the toolbox stays on the user PATH only, which is the bug being fixed.'
 }
 
+Publish-EnvChange
+
 Write-Head 'Done'
-Write-Warn2 'Open a NEW shell: PATH changes only reach new processes.'
+Write-Warn2 'Open a NEW shell: an already-running process keeps the environment block it started with.'
 Write-Info2 'Re-run after a winget upgrade: a version-stamped package folder moves and its shim goes stale.'
 Write-Info2 'scripts\smoke-test.ps1 reports any shim whose target no longer exists.'
