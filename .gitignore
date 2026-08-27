@@ -1,0 +1,26 @@
+# AI agent infrastructure - local only, not for version control
+AI_UNDERSTANDING/
+.codex/
+**/*.aiu.json
+CLAUDE.md
+AGENTS.md
+
+# Archives
+*.zip
+
+# Generated per-workstation install inventory
+manifest/tools.json
+logs/
+
+# Env / secrets
+.env
+.env.*
+*.pem
+*.key
+
+SESSION_LOG*.md
+SESSION_HANDOFF*.md
+
+.cursorrules
+.windsurfrules
+SESSION_*

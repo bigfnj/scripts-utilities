@@ -1,0 +1,206 @@
+{
+  "$comment": "Declarative source of truth for scripts-utilities. Consumed by modules/*.ps1 (via lib/catalog.ps1), scripts/install-machine-scope.ps1, and (later) the uninstaller and GUI. Stage-1 toolbox contents live in scripts/build-devtoolbox.ps1 and are represented here only as coarse layer toggles. Keep machine_scope_ids in sync with the machineScope entries in build-devtoolbox.ps1.",
+  "schema_version": 1,
+  "tools": [
+    {
+      "name": "gh", "group": "cli-tools", "channel": "winget-user",
+      "id": "GitHub.cli", "binary": "gh", "detect": "gh --version",
+      "default": true, "optional": false,
+      "notes": "GitHub CLI - auth, PRs, issues, releases"
+    },
+    {
+      "name": "fzf", "group": "cli-tools", "channel": "winget-user",
+      "id": "junegunn.fzf", "binary": "fzf", "detect": "fzf --version",
+      "default": true, "optional": false,
+      "notes": "fuzzy finder for interactive CLI selection"
+    },
+    {
+      "name": "bat", "group": "cli-tools", "channel": "winget-user",
+      "id": "sharkdp.bat", "binary": "bat", "detect": "bat --version",
+      "default": true, "optional": false,
+      "notes": "syntax-highlighted file pager"
+    },
+    {
+      "name": "git-delta", "group": "cli-tools", "channel": "winget-user",
+      "id": "dandavison.delta", "binary": "delta", "detect": "delta --version",
+      "default": true, "optional": false,
+      "notes": "syntax-highlighted diff viewer; set as git core.pager"
+    },
+    {
+      "name": "just", "group": "cli-tools", "channel": "winget-user",
+      "id": "Casey.Just", "binary": "just", "detect": "just --version",
+      "default": true, "optional": false,
+      "notes": "task runner (Justfile); cross-platform parity with Linux just"
+    },
+    {
+      "name": "hyperfine", "group": "cli-tools", "channel": "winget-user",
+      "id": "sharkdp.hyperfine", "binary": "hyperfine", "detect": "hyperfine --version",
+      "default": true, "optional": false,
+      "notes": "benchmark runner and CLI timer"
+    },
+    {
+      "name": "sops", "group": "cli-tools", "channel": "winget-user",
+      "id": "SecretsOPerationS.SOPS", "binary": "sops", "detect": "sops --version",
+      "default": true, "optional": false,
+      "notes": "encrypted YAML/JSON/env secrets management; pairs with age"
+    },
+    {
+      "name": "age", "group": "cli-tools", "channel": "winget-user",
+      "id": "FiloSottile.age", "binary": "age", "detect": "age --version",
+      "default": true, "optional": false,
+      "notes": "modern file encryption; age-keygen generates recipient keys"
+    },
+    {
+      "name": "tokei", "group": "cli-tools", "channel": "winget-user",
+      "id": "XAMPPRocky.Tokei", "binary": "tokei", "detect": "tokei --version",
+      "default": true, "optional": false,
+      "notes": "code statistics and LOC counter"
+    },
+    {
+      "name": "podman", "group": "cli-tools", "channel": "winget-default",
+      "id": "Podman.CLI", "binary": "podman", "detect": "podman --version",
+      "default": true, "optional": false,
+      "path_fallback": "%LOCALAPPDATA%\\Programs\\Podman",
+      "notes": "daemonless OCI container engine. winget-default is deliberate: the Podman.CLI manifest declares no scope, so BOTH --scope user and --scope machine fail with 0x8A150010 'No applicable installer found' (verified as user and as SYSTEM). With no --scope flag it installs per-user to %LOCALAPPDATA%\\Programs\\Podman and adds itself to the USER PATH - no elevation, no system PATH entry. Linux containers need a VM: `podman machine init --provider hyperv` (Hyper-V feature + Hyper-V Administrators membership, admin for the first init only) or the default WSL provider. Pair with docker-compose for full compose-spec fidelity."
+    },
+    {
+      "name": "docker-compose", "group": "cli-tools", "channel": "winget-user",
+      "id": "Docker.DockerCompose", "binary": "docker-compose", "detect": "docker-compose version",
+      "default": true, "optional": false,
+      "notes": "standalone Compose v2 binary. Drives Podman over its Docker-compatible API pipe (npipe:////./pipe/docker_engine) - preferred over podman-compose because it is the reference Compose implementation (profiles, ${VAR:-default}, depends_on, project name all behave identically)."
+    },
+    {
+      "name": "curl-libressl", "group": "cli-tools", "channel": "winget-user",
+      "id": "cURL.cURL", "binary": "trurl", "detect": "trurl --version",
+      "default": true, "optional": false,
+      "notes": "curl built against LibreSSL instead of Schannel. Windows' bundled C:\\Windows\\System32\\curl.exe uses Schannel, whose AcquireCredentialsHandle fails with SEC_E_NO_CREDENTIALS inside sandboxed agent runners (see docs/agent-rules.md 'Native HTTPS in agent sandboxes'). This build does TLS in userspace and ships its own curl-ca-bundle.crt, so it works there. Detection uses trurl because System32 curl.exe wins bare-name PATH resolution and would mask a missing install; call this curl.exe by absolute path from its package bin dir."
+    },
+    {
+      "name": "yt-dlp", "group": "cli-tools", "channel": "winget-user",
+      "id": "yt-dlp.yt-dlp", "binary": "yt-dlp", "detect": "yt-dlp --version",
+      "default": true, "optional": false,
+      "notes": "video/audio downloader (actively maintained youtube-dl fork; supports 1000+ sites). Auto-discovers the toolbox's ffmpeg/ffprobe on PATH, so stream-merging (-f bestvideo+bestaudio), audio extraction (-x --audio-format mp3), and remuxing work with no separate ffmpeg install. YouTube needs a JavaScript runtime to solve nsig/PO-token challenges (extraction fails otherwise): the EJS solver SCRIPTS are already bundled in this PyInstaller standalone binary, but the RUNTIME is not - install `deno` (its own catalog entry) and yt-dlp auto-detects it. Refresh the bundled solver between releases with `--remote-components ejs:github`. Self-updates via `yt-dlp -U`, but winget owns this copy - prefer `winget upgrade yt-dlp.yt-dlp` to stay channel-clean."
+    },
+    {
+      "name": "deno", "group": "cli-tools", "channel": "winget-user",
+      "id": "DenoLand.Deno", "binary": "deno", "detect": "deno --version",
+      "default": true, "optional": false,
+      "notes": "secure JavaScript/TypeScript runtime. Also serves as yt-dlp's JS challenge runtime: yt-dlp enables deno by DEFAULT, auto-detects it on PATH, and runs its bundled EJS scripts under Deno's restricted permissions to solve YouTube nsig/PO-token challenges. Without a JS runtime, YouTube downloads are blocked. yt-dlp requires deno >=2.3. Node (already in the toolbox, >=22) also works but is not default - opt in per-call/config with `--js-runtimes node`."
+    },
+    {
+      "name": "tshark", "group": "security", "channel": "winget-machine",
+      "id": "WiresharkFoundation.Wireshark", "binary": "tshark", "detect": "tshark --version",
+      "default": true, "optional": false,
+      "path_fallback": "%ProgramFiles%\\Wireshark",
+      "notes": "CLI packet analysis (Wireshark backend); GUI at wireshark.exe"
+    },
+    {
+      "name": "etl2pcapng", "group": "security", "channel": "winget-user",
+      "id": "Microsoft.etl2pcapng", "binary": "etl2pcapng", "detect": "etl2pcapng",
+      "default": true, "optional": false,
+      "notes": "convert pktmon/netsh-trace .etl captures to .pcapng for tshark/Wireshark (driver-free capture path)"
+    },
+    {
+      "name": "frida", "group": "security", "channel": "pip-toolbox",
+      "id": "frida-tools", "binary": "frida", "import": "frida", "detect": "frida --version",
+      "default": true, "optional": false,
+      "notes": "dynamic instrumentation toolkit (toolbox venv)"
+    },
+    {
+      "name": "markdownlint-cli", "group": "extras", "channel": "npm-global",
+      "id": "markdownlint-cli", "binary": "markdownlint", "detect": "markdownlint --version",
+      "default": true, "optional": false,
+      "notes": "markdown linter; run 'markdownlint **/*.md' to lint docs"
+    },
+    {
+      "name": "jupyterlab", "group": "extras", "channel": "pip-toolbox",
+      "id": "jupyterlab", "binary": "jupyter-lab", "import": "jupyterlab", "detect": "jupyter-lab --version",
+      "default": true, "optional": false,
+      "notes": "Jupyter notebook server (toolbox venv); launch with 'jupyter-lab'"
+    },
+    {
+      "name": "sqlite-utils", "group": "extras", "channel": "pip-toolbox",
+      "id": "sqlite-utils", "binary": "sqlite-utils", "import": "sqlite_utils", "detect": "sqlite-utils --version",
+      "default": true, "optional": false,
+      "notes": "SQLite CLI automation: insert, query, transform, export"
+    },
+    {
+      "name": "csvkit", "group": "extras", "channel": "pip-toolbox",
+      "id": "csvkit", "binary": "csvlook", "import": "csvkit", "detect": "csvlook --version",
+      "default": true, "optional": false,
+      "notes": "CSV utilities: csvlook, csvcut, csvstat, csvjoin, in2csv, sql2csv"
+    },
+    {
+      "name": "pytoshop", "group": "extras", "channel": "pip-toolbox",
+      "id": "pytoshop", "binary": null, "import": "pytoshop", "detect": null,
+      "register_manifest": false, "default": true, "optional": false,
+      "notes": "write layered Photoshop .psd files from Python (import-only; no CLI)"
+    },
+    {
+      "name": "ollama", "group": "llm", "channel": "winget-user",
+      "id": "Ollama.Ollama", "binary": "ollama", "detect": "ollama --version",
+      "default": false, "optional": true,
+      "notes": "local LLM runtime; per-user background service at 127.0.0.1:11434 (OpenAI-compatible). Installed by scripts/install-llm.ps1, not the default groups."
+    }
+  ],
+  "machine_scope_ids": [
+    "TheDocumentFoundation.LibreOffice",
+    "tesseract-ocr.tesseract",
+    "QPDF.QPDF",
+    "ImageMagick.ImageMagick",
+    "7zip.7zip",
+    "OpenJS.NodeJS.LTS",
+    "WiresharkFoundation.Wireshark",
+    "Microsoft.WindowsWDK.10.0.26100"
+  ],
+  "toolbox_layers": [
+    { "name": "core-python", "always": true, "notes": "Python 3.11 venv + document/PDF/OCR/image/data packages" },
+    { "name": "heavy-gpu", "skip_switch": "-SkipHeavy", "notes": "GPU/ML stack (torch CUDA, onnxruntime-gpu, rembg, ...)" },
+    { "name": "native-cli", "always": true, "notes": "native CLI tools: ffmpeg, pandoc, tesseract, rg, fd, jq, node, ..." },
+    { "name": "playwright", "skip_switch": "-SkipPlaywrightBrowsers", "notes": "Chromium/Firefox/WebKit browser binaries" },
+    { "name": "sysinternals", "always": true, "notes": "Sysinternals suite (procdump, handle, sigcheck, ...)" }
+  ],
+  "llm": {
+    "$comment": "Optional local-LLM stack, provisioned by scripts/install-llm.ps1 (opt-in, not a default group). Ollama is the default runtime; llama.cpp is an opt-in alternative (see BACKLOG). Model pulls are VRAM-tiered so an 8 GB box does not waste disk on models it cannot run.",
+    "runtime": "ollama",
+    "endpoint": "http://127.0.0.1:11434/v1",
+    "models_base": ["moondream", "qwen2.5:3b", "qwen3-embedding:0.6b", "mistral:7b"],
+    "models_24gb": ["mistral-small"],
+    "tier_24gb_min_vram_mb": 20000,
+    "embedding_model": "qwen3-embedding:0.6b",
+    "embedding_fallbacks": ["nomic-embed-text", "bge-m3"],
+    "reranker": {
+      "name": "bge-reranker-base",
+      "hf_repo": "Xenova/bge-reranker-base",
+      "files": ["onnx/model.onnx", "tokenizer.json", "config.json"],
+      "dir_relative": "models\\reranker\\bge-reranker-base",
+      "notes": "cross-encoder reranker run via the toolbox onnxruntime (not Ollama)"
+    }
+  },
+  "side_effects": {
+    "$comment": "Inventory of everything the toolbox mutates, so the uninstaller can reverse it. Paths under path_entries_relative are relative to the toolbox root (CODEX_TOOLBOX or %LOCALAPPDATA%\\DevToolbox).",
+    "path_entries_relative": [
+      "native\\bin",
+      "python\\.venv\\Scripts",
+      "sysinternals"
+    ],
+    "path_entries_absolute": [
+      "%ProgramFiles%\\Wireshark",
+      "%APPDATA%\\npm"
+    ],
+    "env_vars": [
+      "TESSDATA_PREFIX",
+      "_NT_SYMBOL_PATH",
+      "GHIDRA_INSTALL_DIR",
+      "WINDBG_DEBUGGERS_PATH",
+      "CODEX_TOOLBOX",
+      "TOOLBOX_PYTHON",
+      "NODE_EXTRA_CA_CERTS",
+      "OLLAMA_MODELS",
+      "TOOLBOX_LLM_URL"
+    ],
+    "registry_keys": [
+      "HKCU:\\Software\\Sysinternals"
+    ]
+  }
+}
