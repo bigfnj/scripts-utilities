@@ -72,7 +72,29 @@ git --version
 winget --version
 ```
 
-### Install
+### Install — one line, no clone
+
+```powershell
+irm https://raw.githubusercontent.com/bigfnj/scripts-utilities/main/get.ps1 | iex
+```
+
+Runs from memory. It installs `git` if missing, clones the repo to
+`%USERPROFILE%\scripts-utilities`, prints the tool catalog, and opens a menu: dry run, full
+install, lean install, the GUI, the elevated machine-scope pre-install, and a smoke test. Re-run
+the same line any time to update the clone and reopen the menu.
+
+`| iex` cannot take parameters, so set these **before** the one-liner if you need them:
+
+```powershell
+$env:TOOLBOX_DIR = "$HOME\dev\scripts-utilities"   # clone somewhere else
+$env:TOOLBOX_REF = 'v1.0.0'                        # pin to a tag instead of main
+```
+
+> **Read it before you run it.** Piping a remote script to `iex` executes whatever is at that URL
+> at that moment. [`get.ps1`](get.ps1) is the whole file and it is short. For a reproducible
+> install, point `TOOLBOX_REF` at a tag rather than a moving branch.
+
+### Install — clone it yourself
 
 ```powershell
 git clone https://github.com/bigfnj/scripts-utilities.git
@@ -180,6 +202,7 @@ alone.
 ## Repository layout
 
 ```text
+get.ps1                             one-line `irm | iex` bootstrap: clone + menu
 bootstrap.ps1                       main idempotent entry point
 fresh-toolbox-setup-runner.ps1      fresh-workstation orchestration and logging
 catalog.json                        the tool catalog: groups, layers, LLM models
