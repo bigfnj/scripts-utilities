@@ -54,6 +54,43 @@ An agent that reads the discovery block knows this and stops guessing.
 whether the toolbox installed it. "Check this file before installing anything" is a cheap
 instruction that prevents the most common and most annoying agent failure mode.
 
+### The PATH problem this had to solve
+
+Two failures make a correctly installed tool report "not found" in an agent shell, and both are
+silent.
+
+**Windows truncates a long PATH.** Measured on the reference machine: a 4,363-char machine PATH
+arrived in the spawned shell as exactly **4,095 chars**, with the final entry chopped mid-string
+at `C:\Users\Admin\AppD`. Everything past the 4 KB boundary was simply gone, including `git`.
+Nothing was misconfigured. 27 winget package directories accounted for 3,380 of 5,264 total chars,
+because winget registers a full package folder complete with its
+`_Microsoft.Winget.Source_8wekyb3d8bbwe` suffix and a version-stamped subfolder.
+
+**Some shells inherit the machine PATH only**, which makes the user PATH invisible. That is
+precisely where a non-elevated install puts `native\bin` and `sysinternals`.
+
+[`scripts/consolidate-path.ps1`](scripts/consolidate-path.ps1) fixes both by extending the shim
+pattern one level out: it wraps every executable reachable through those winget package
+directories into `native\bin`, drops the directories from PATH, and registers `native\bin` and
+`sysinternals` machine-wide. On the reference box that took the machine PATH from **4,332 chars
+to 1,726** and made `git`, `tesseract`, `procdump`, `deno` and `yt-dlp` resolvable again.
+
+```powershell
+.\scripts\consolidate-path.ps1 -DryRun    # report, change nothing
+.\scripts\consolidate-path.ps1            # apply (needs elevation for the machine PATH)
+.\scripts\consolidate-path.ps1 -Restore logs\path-backup-<timestamp>.json
+```
+
+Both PATH values are backed up to timestamped JSON first, and the registry value kind
+(`REG_EXPAND_SZ`) is preserved by writing the key directly, because
+`[Environment]::SetEnvironmentVariable` silently rewrites it as `REG_SZ`. Where two packages ship
+the same executable, the one that resolves today keeps winning; shadowed copies are reported, not
+reassigned.
+
+Re-run it after a winget upgrade: a version-stamped folder moves and its shim goes stale. The
+smoke test fails loudly on any shim whose target no longer exists, and on a PATH that has crept
+back toward the truncation point.
+
 Nothing here requires an agent. It is a good toolbox on its own; the discovery layer is additive.
 
 ---
@@ -213,6 +250,7 @@ scripts/build-devtoolbox.ps1        Python + native DevToolbox builder
 scripts/install-ghidra.ps1          optional digest-verified Ghidra/JDK
 scripts/install-llm.ps1             optional local LLM stack
 scripts/install-machine-scope.ps1   one-elevation machine-scope pre-install
+scripts/consolidate-path.ps1        collapse winget dirs into shims; PATH truncation fix
 scripts/install-whisper.ps1         whisper.cpp + a GGML model
 scripts/uninstall-toolbox.ps1       full-reset uninstaller
 scripts/smoke-test.ps1              repository-level functional gate

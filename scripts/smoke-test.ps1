@@ -200,11 +200,45 @@ Test-Hdr "toolbox PATH readiness"
 $tbRoot = if ($env:CODEX_TOOLBOX) { $env:CODEX_TOOLBOX } else { "$env:LOCALAPPDATA\DevToolbox" }
 if (Test-Path $tbRoot) {
     $userPath = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+    $machinePath = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
     $nativeBin = Join-Path $tbRoot 'native\bin'
     if (Test-Path $nativeBin) {
-        $onPath = @($userPath -split ';' | Where-Object { $_.TrimEnd('\') -ieq $nativeBin.TrimEnd('\') })
-        if ($onPath.Count -gt 0) { Test-Ok "user PATH includes native\bin" }
-        else { Test-Fail "user PATH missing native\bin: $nativeBin (run .\bootstrap.ps1)" }
+        $onUser = @($userPath -split ';' | Where-Object { $_.TrimEnd('\') -ieq $nativeBin.TrimEnd('\') })
+        $onMachine = @($machinePath -split ';' | Where-Object { $_.TrimEnd('\') -ieq $nativeBin.TrimEnd('\') })
+        # Machine scope is what makes the toolbox visible to shells that inherit the machine PATH
+        # only - which some agent hosts do. User-only is the state that silently hides every tool
+        # from exactly the audience this repo exists to serve.
+        if ($onMachine.Count -gt 0) { Test-Ok "MACHINE PATH includes native\bin (visible to machine-PATH-only shells)" }
+        elseif ($onUser.Count -gt 0) { Test-Warn "native\bin is on the USER PATH only - invisible to shells that inherit machine PATH only (run .\scripts\consolidate-path.ps1 elevated)" }
+        else { Test-Fail "PATH missing native\bin: $nativeBin (run .\bootstrap.ps1)" }
+    }
+
+    # PATH length. Windows hands a spawned process a bounded environment block, and a PATH past
+    # that bound is truncated MID-ENTRY with no error at all. Measured on the reference box: a
+    # 4363-char machine PATH arrived as exactly 4095, ending "C:\Users\Admin\AppD", which quietly
+    # removed git and the whole sysinternals layer. Assert headroom rather than wait for it.
+    $combined = ($machinePath.TrimEnd(';') + ';' + $userPath.TrimEnd(';'))
+    if ($combined.Length -ge 4095)  { Test-Fail "PATH is $($combined.Length) chars - at or past the 4095 truncation point; entries WILL be silently dropped (run .\scripts\consolidate-path.ps1)" }
+    elseif ($combined.Length -ge 3500) { Test-Warn "PATH is $($combined.Length) chars - close to the 4095 truncation point" }
+    else { Test-Ok "PATH is $($combined.Length) chars, clear of the 4095 truncation point" }
+
+    # Stale shims. A winget upgrade moves a version-stamped package folder, so a generated wrapper
+    # keeps resolving by name and then fails on execution. A wrapper whose target is gone is worse
+    # than a missing wrapper, because the tool looks installed.
+    if (Test-Path $nativeBin) {
+        $stale = @()
+        foreach ($w in Get-ChildItem -LiteralPath $nativeBin -Filter '*.cmd' -File -ErrorAction SilentlyContinue) {
+            $line = Get-Content -LiteralPath $w.FullName -ErrorAction SilentlyContinue |
+                Where-Object { $_ -match '^"([^"]+)" %\*$' } | Select-Object -First 1
+            if ($line -and $line -match '^"([^"]+)" %\*$') {
+                if (-not (Test-Path -LiteralPath $Matches[1])) { $stale += "$($w.BaseName) -> $($Matches[1])" }
+            }
+        }
+        if ($stale.Count -eq 0) { Test-Ok "all native\bin shims resolve to an existing target" }
+        else {
+            Test-Fail "$($stale.Count) stale shim(s) - target no longer exists (re-run .\scripts\consolidate-path.ps1):"
+            $stale | Select-Object -First 8 | ForEach-Object { Write-Host "     $_" -ForegroundColor Red }
+        }
     }
     # The venv Scripts dir must NOT be on the persistent PATH - it holds python.exe,
     # and a 3.11 interpreter on PATH is what trips compliance scanners.
