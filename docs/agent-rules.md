@@ -205,6 +205,8 @@ When in doubt: if it's a CLI you type by name -> winget here. If it's a Python
 - The `Sync-EnvPath` helper in `lib/common.ps1` refreshes the current session's
   PATH from the registry after a winget install - use it; do not restart shells
   or start new processes to pick up new tools.
+- **A tool that is "not recognized" is usually present.** See *When a tool is
+  missing from PATH* below before installing anything a second time.
 - `bootstrap.ps1` (via `Register-ToolboxUserPath`) persists the durable toolbox
   layer on the **user** PATH so it resolves by bare name in any new shell without
   activation: `native\bin` and `sysinternals` (appended last so it never shadows
@@ -218,6 +220,56 @@ When in doubt: if it's a CLI you type by name -> winget here. If it's a Python
   persisted. A bare `python` stays the sanctioned system interpreter. When a tool
   or script needs the toolbox's Python 3.11, call `%TOOLBOX_PYTHON%` explicitly -
   never assume `python` is 3.11.
+
+### When a tool is missing from PATH
+
+**Check the registry before concluding the tool is not installed.** The usual
+cause is a stale environment block, not a missing tool, and the usual wrong
+response is to install it again.
+
+Windows never retro-fits a new PATH into a running process. It broadcasts
+`WM_SETTINGCHANGE`, Explorer acts on it, and processes Explorer starts *after
+that* inherit the new value. A long-running agent host is not one of those: it
+captured its environment at launch and keeps it, so every shell it spawns
+inherits the old PATH no matter how many are opened.
+
+Observed on this box, 2026-08-27: git was installed to `C:\Anthropic\.Git` and
+registered on both the machine and user PATH, yet `git` was unresolvable in every
+agent shell. So were the toolbox's own `native\bin` and `sysinternals`, plus
+Ghidra and DOSBox-X - all present in the registry, none visible in-process.
+
+Confirm it is staleness rather than absence:
+
+```powershell
+# Registry truth, unaffected by any running process.
+(Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment').Path -split ';' |
+    Where-Object { $_ -match 'git' }
+```
+
+If the entry is there and `Get-Command` still fails, it is staleness.
+
+**Per-command fix.** Refresh from the registry inside the invocation that needs
+it. `Sync-EnvPath` does this, or inline:
+
+```powershell
+$m = [System.Environment]::GetEnvironmentVariable('PATH','Machine')
+$u = [System.Environment]::GetEnvironmentVariable('PATH','User')
+$env:PATH = (@(($m -split ';') + ($u -split ';')) | Where-Object { $_ } | Select-Object -Unique) -join ';'
+```
+
+This does **not** carry to the next tool call. Agent tool calls do not share
+session state: each one is a fresh process inheriting the host's stale block, so
+the refresh has to be repeated per invocation. Calling a binary by absolute path
+works equally well for a one-off.
+
+**Durable fix: restart the agent host.** Not the machine. A reboot works only
+because it restarts the host as a side effect. On restart the host reads a current
+environment and every shell it spawns inherits it.
+
+Note that broadcasting `WM_SETTINGCHANGE` after writing PATH, which
+`scripts/consolidate-path.ps1` does, cannot solve this. The broadcast helps
+Explorer and what Explorer launches next; it has no effect on a process that is
+already running and never re-reads the registry.
 
 ---
 

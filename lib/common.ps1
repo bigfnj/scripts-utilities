@@ -456,6 +456,14 @@ Manifest:     $toolboxManifest
 On PATH:      bootstrap.ps1 adds native\bin (native CLIs + wrapped venv CLIs)
               and sysinternals to your user PATH, so every tool below is
               available by name in any new shell - no activation needed.
+Not found?    Check the registry PATH before concluding a tool is missing, and
+              do NOT install it again. A long-running agent host caches its
+              environment at launch, so anything added to PATH afterwards is
+              invisible to every shell it spawns - including the toolbox itself.
+              Refreshing PATH fixes one invocation and does not carry to the next
+              tool call. Durable fix: restart the agent host (a reboot is not
+              needed). See the "When a tool is missing from PATH" section of
+              $RepoRoot\docs\agent-rules.md.
 Python 3.11:  the toolbox venv interpreter is deliberately NOT on PATH - a bare
               'python' stays your sanctioned system version. Call the toolbox
               Python explicitly via %TOOLBOX_PYTHON% (=
