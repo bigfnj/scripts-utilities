@@ -95,6 +95,23 @@ $NoScopeFlag = @(
     'Microsoft.WindowsWDK.10.0.26100'
 )
 
+# A manifest that ships several installers may default to the wrong one, so the catalog entry can pin it.
+# Read from catalog.json rather than hardcoded here, so the pin lives in one place with the tool it belongs
+# to. Microsoft.PowerShell is the only user today: winget 7.6.0+ defaults that id to the MSIX, which is
+# single-user and sandboxes $PSHOME, and only the wix (MSI) installer is machine-scope at all.
+$installerTypes = @{}
+try {
+    foreach ($t in (Get-Catalog).tools) {
+        if ($t.PSObject.Properties['installer_type'] -and $t.installer_type) {
+            $installerTypes[[string]$t.id] = [string]$t.installer_type
+        }
+    }
+}
+catch {
+    Log "WARN could not read installer_type pins from catalog.json: $($_.Exception.Message)"
+    Log "WARN continuing WITHOUT installer pins - a pinned package may install the wrong installer type"
+}
+
 $failures = @()
 foreach ($id in $Ids) {
     $listed = & $winget list --id $id -e --accept-source-agreements 2>&1
@@ -103,14 +120,17 @@ foreach ($id in $Ids) {
         continue
     }
     $scopeArgs = if ($id -in $NoScopeFlag) { @() } else { @('--scope', 'machine') }
+    $typeArgs = if ($installerTypes.ContainsKey($id)) { @('--installer-type', $installerTypes[$id]) } else { @() }
     if ($DryRun) {
         $scopeStr = if ($scopeArgs) { "--scope machine" } else { "(no --scope flag)" }
-        Log "[DRY-RUN] would: winget install --id $id -e $scopeStr"
+        $typeStr = if ($typeArgs) { " --installer-type $($installerTypes[$id])" } else { "" }
+        Log "[DRY-RUN] would: winget install --id $id -e $scopeStr$typeStr"
         continue
     }
     $scopeLabel = if ($scopeArgs) { "machine scope" } else { "default scope (no --scope flag)" }
+    if ($typeArgs) { $scopeLabel += ", installer-type $($installerTypes[$id])" }
     Log "install $id ($scopeLabel)"
-    & $winget install --id $id -e @scopeArgs `
+    & $winget install --id $id -e @scopeArgs @typeArgs `
         --accept-source-agreements --accept-package-agreements --silent
     if ($LASTEXITCODE -ne 0) {
         Log "FAIL $id (winget exit $LASTEXITCODE)"

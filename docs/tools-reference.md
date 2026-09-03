@@ -22,6 +22,31 @@ gh release create v1.0.0 --generate-notes
 
 Reach for `gh` any time you would otherwise construct a GitHub REST/GraphQL call.
 
+In a repo that has an `upstream` remote, `gh` resolves to **upstream, not your fork**, so `gh run list`
+and `gh release list` silently report the parent project's runs and releases. Pass `-R owner/repo`
+explicitly whenever a fork is involved.
+
+### pwsh - PowerShell 7
+
+```powershell
+pwsh -NoProfile -File .\build.ps1                # run a script under PS7
+pwsh -NoProfile -Command '$PSVersionTable'       # confirm which engine you are in
+powershell -NoProfile -File .\build.ps1          # the SAME script under Windows PowerShell 5.1
+```
+
+Installed **side by side** with Windows PowerShell 5.1 at `%ProgramFiles%\PowerShell\7`; `powershell.exe`
+is untouched and stays the default. The reason to have both is that CI almost always runs
+`shell: pwsh`, so a repo's build and test scripts execute under PS7 there and under 5.1 in a local
+terminal. Anything that differs between the two fails in exactly one place and is painful to diagnose:
+
+- `&&` / `||`, `??`, `?.` and ternary `? :` are **PS7 only** and are parse errors under 5.1.
+- `Get-WmiObject`, `Invoke-WmiMethod`, `New-WebServiceProxy` and `-Encoding Byte` were **removed in PS7**
+  and work fine under 5.1, which is the dangerous direction: green locally, broken in CI.
+- `Set-Content` defaults to **ANSI** under 5.1 and **UTF-8 no BOM** under PS7, and `Out-File` differs too,
+  so the same script writes different bytes on each. Always pass `-Encoding` explicitly.
+
+Run a build or gate under `pwsh` before trusting that CI will agree with your terminal.
+
 ### fzf - fuzzy finder
 
 ```powershell

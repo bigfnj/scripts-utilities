@@ -81,6 +81,22 @@ lands before using this: Podman installs **per-user** to
 still channel- and PATH-clean and needs no elevation. Do not reach for
 `winget-default` to dodge a legitimate `--scope user` failure.
 
+Exception - pinning the installer type: a manifest may ship several installers
+and default to the wrong one. Set `"installer_type"` on the `catalog.json` entry
+and it is passed through as `winget --installer-type <x>` by `Install-WingetTool`,
+`lib/catalog.ps1` and `scripts/install-machine-scope.ps1`. Absent on every other
+tool, and an absent value leaves the winget arguments untouched.
+
+`Microsoft.PowerShell` is the case that forced it. Since winget 7.6.0 that id
+defaults to the **MSIX** package, which is single-user, runs in an app sandbox
+that blocks writes to `$PSHOME`, and cannot host incoming remoting, all-users
+profiles or a machine-wide execution policy. CI runners install the **MSI**, so
+the MSI is the build that reproduces them - hence `"installer_type": "wix"`. The
+wix installer is **machine-scope only**: `--installer-type wix --scope user`
+returns `0x8A150010 "No applicable installer found"`, so it is also
+`winget-machine` with its id in `machine_scope_ids` and a `path_fallback` of
+`%ProgramFiles%\PowerShell\7`. Do not "fix" that by switching it to the MSIX.
+
 Exception: some security tools with GUI installers, such as Wireshark, do not
 support user scope. Give those the `winget-machine` channel in `catalog.json`,
 add the id to the `machine_scope_ids` array, and set a `path_fallback` so the CLI

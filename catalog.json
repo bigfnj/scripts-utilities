@@ -9,6 +9,14 @@
       "notes": "GitHub CLI - auth, PRs, issues, releases"
     },
     {
+      "name": "pwsh", "group": "cli-tools", "channel": "winget-machine",
+      "id": "Microsoft.PowerShell", "binary": "pwsh", "detect": "pwsh --version",
+      "default": true, "optional": false,
+      "installer_type": "wix",
+      "path_fallback": "%ProgramFiles%\\PowerShell\\7",
+      "notes": "PowerShell 7 side by side with Windows PowerShell 5.1; installer_type=wix is REQUIRED - winget 7.6.0+ defaults this id to the MSIX, which is single-user, sandboxes $PSHOME and cannot set machine-wide execution policy. CI runners use the MSI, so the MSI is what reproduces them. The wix installer is machine-scope only: --installer-type wix --scope user returns 0x8A150010."
+    },
+    {
       "name": "fzf", "group": "cli-tools", "channel": "winget-user",
       "id": "junegunn.fzf", "binary": "fzf", "detect": "fzf --version",
       "default": true, "optional": false,
@@ -144,6 +152,7 @@
     }
   ],
   "machine_scope_ids": [
+    "Microsoft.PowerShell",
     "TheDocumentFoundation.LibreOffice",
     "tesseract-ocr.tesseract",
     "QPDF.QPDF",

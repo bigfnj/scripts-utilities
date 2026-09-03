@@ -54,12 +54,15 @@ function Install-CatalogItem {
     $preexisting = if ($script:DryRun) { $false } else { (Get-CatalogItemState -Item $Item).installed }
 
     $ok = $false
+    # Optional per-tool installer pin, for a manifest that ships several installers and defaults to the
+    # wrong one. Absent on every tool but pwsh, and an absent value leaves the winget args untouched.
+    $installerType = if ($Item.PSObject.Properties['installer_type']) { [string]$Item.installer_type } else { "" }
     switch ($Item.channel) {
         'winget-user' {
-            $ok = Install-WingetTool -Id $Item.id -Binary $Item.binary -Name $Item.name
+            $ok = Install-WingetTool -Id $Item.id -Binary $Item.binary -Name $Item.name -InstallerType $installerType
         }
         'winget-machine' {
-            $ok = Install-WingetTool -Id $Item.id -Binary $Item.binary -Name $Item.name -MachineScope
+            $ok = Install-WingetTool -Id $Item.id -Binary $Item.binary -Name $Item.name -MachineScope -InstallerType $installerType
             if ($ok -and $Item.path_fallback -and -not (Test-CommandAvailable $Item.binary)) {
                 $expanded = [System.Environment]::ExpandEnvironmentVariables($Item.path_fallback)
                 Add-UserPathEntry $expanded | Out-Null
@@ -69,7 +72,7 @@ function Install-CatalogItem {
             # No --scope flag: the manifest declares no scope and winget rejects
             # both user and machine with 0x8A150010. Installs wherever the
             # package's own installer puts it (per-user for Podman).
-            $ok = Install-WingetTool -Id $Item.id -Binary $Item.binary -Name $Item.name -NoScope
+            $ok = Install-WingetTool -Id $Item.id -Binary $Item.binary -Name $Item.name -NoScope -InstallerType $installerType
             if ($ok -and $Item.path_fallback -and -not (Test-CommandAvailable $Item.binary)) {
                 $expanded = [System.Environment]::ExpandEnvironmentVariables($Item.path_fallback)
                 Add-UserPathEntry $expanded | Out-Null

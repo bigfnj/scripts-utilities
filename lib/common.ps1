@@ -135,7 +135,13 @@ function Install-WingetTool {
         # 0x8A150010 "No applicable installer found" (e.g. Podman.CLI, the WDK).
         # Without the flag winget picks the manifest's only installer, which for
         # Podman is a per-user MSI - so this stays PATH-clean and needs no UAC.
-        [switch]$NoScope
+        [switch]$NoScope,
+        # Pin winget to one installer when a manifest ships several and the default
+        # is the wrong one. Microsoft.PowerShell is the case that forced this:
+        # winget 7.6.0+ defaults it to the MSIX, which is single-user and sandboxes
+        # $PSHOME, so 'wix' is required to get the MSI that CI runners actually use.
+        # Left empty for every other tool, which keeps their behaviour unchanged.
+        [string]$InstallerType = ""
     )
     if (Test-CommandAvailable $Binary) {
         Write-Skip "$Name already present ($Binary)"
@@ -160,6 +166,9 @@ function Install-WingetTool {
         "--accept-package-agreements",
         "--silent"
     )
+    if ($InstallerType) {
+        $args += @("--installer-type", $InstallerType)
+    }
     if ($NoScope) {
         # Deliberately no --scope flag; see the parameter comment above.
     }
@@ -477,9 +486,19 @@ qpdf, ghostscript, LibreOffice, 7z, rg, fd, jq, yq, exiftool, aria2c, rclone,
 DuckDB, Node.js, uv/uvx. Sysinternals (procdump, handle, sigcheck, ...) is on
 PATH too. Set CODEX_TOOLBOX to override the toolbox root path.
 
-### Developer CLI tools - installed on user PATH (winget)
+### Developer CLI tools - on PATH (winget; user scope unless noted)
 
+  pwsh        PowerShell 7, MACHINE scope at %ProgramFiles%\PowerShell\7, side by
+              side with 5.1 (powershell.exe is untouched and still the default).
+              CI almost always runs 'shell: pwsh', so run a build or gate under
+              pwsh before trusting that CI agrees with your terminal:
+                pwsh -NoProfile -File .\build.ps1
+              Divergences that bite: && || ?? ?. and ternary are PS7-only (parse
+              errors under 5.1); Get-WmiObject / -Encoding Byte were REMOVED in 7
+              (green locally, broken in CI); Set-Content defaults to ANSI on 5.1
+              and UTF-8 no BOM on 7, so always pass -Encoding explicitly.
   gh          GitHub operations: gh pr list / gh issue create / gh repo clone
+              In a fork, gh resolves to UPSTREAM - pass -R owner/repo explicitly.
   fzf         Fuzzy select from a list: pipe to fzf; --filter for scripts
   bat         Syntax-highlighted file view: bat <file> (replaces type/cat)
   delta       Git diff pager: set via git config core.pager delta
