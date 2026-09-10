@@ -38,8 +38,16 @@ if (Test-Path $MANIFEST_PATH) {
             Test-Ok "$($t.name) ($($t.binary))"
         } elseif ($t.install_method -eq "existing" -and $t.detect) {
             try {
+                # Truthiness alone is not detection. A detect string may be a native command,
+                # and a FAILING native command still writes to stdout - `winget list --id X -e`
+                # prints "No installed package found matching input criteria", which is a
+                # non-empty string and therefore truthy. Reset and inspect $LASTEXITCODE so a
+                # native failure is caught; a pure PowerShell expression leaves it at 0 and is
+                # judged on its result as before.
+                $global:LASTEXITCODE = 0
                 $detected = Invoke-Expression $t.detect
-                if ($detected) { Test-Ok "$($t.name) detected ($detected)" }
+                if ($LASTEXITCODE -ne 0) { Test-Fail "$($t.name): detection command exited $LASTEXITCODE" }
+                elseif ($detected) { Test-Ok "$($t.name) detected ($detected)" }
                 else { Test-Fail "$($t.name): detection returned no result" }
             } catch {
                 Test-Fail "$($t.name): detection failed: $_"
@@ -57,8 +65,20 @@ Test-Hdr "functional checks"
 
 # gh: version responds (auth not required for smoke)
 if (Test-CommandAvailable "gh") {
-    try { $v = gh --version 2>&1 | Select-Object -First 1; Test-Ok "gh: $v" }
-    catch { Test-Fail "gh --version failed" }
+    # $LASTEXITCODE, not try/catch. A native command that RUNS and fails raises no PowerShell
+    # exception, so the catch below only ever fires if the process cannot be started at all -
+    # which means this check could not fail for the thing it claims to test. Demonstrated:
+    # `cmd /c "echo boom 1>&2 & exit 3"` takes the success branch with $LASTEXITCODE = 3.
+    try {
+        # Collect the WHOLE stream before taking a line. `... | Select-Object -First 1`
+        # raises StopUpstreamCommandsException to short-circuit the pipeline, which kills the
+        # native process mid-write and leaves $LASTEXITCODE = -1 - so pairing an exit-code
+        # check with -First 1 invents a failure for a tool that worked. Found immediately on
+        # adding the exit check here: gh reported "exited -1" while being perfectly healthy.
+        $vAll = gh --version 2>&1 | Out-String
+        $v = ($vAll -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+        if ($LASTEXITCODE -eq 0) { Test-Ok "gh: $v" } else { Test-Fail "gh --version exited $LASTEXITCODE" }
+    } catch { Test-Fail "gh --version could not start: $_" }
 } else { Test-Warn "gh not present - skipping" }
 
 # fzf: pipe input through fzf non-interactively
@@ -83,13 +103,23 @@ if (Test-CommandAvailable "bat") {
 # delta: diff two small files
 if (Test-CommandAvailable "delta") {
     try {
-        Set-Content "$tmp\a.txt" "line one`nline two"
-        Set-Content "$tmp\b.txt" "line one`nline THREE"
-        $diff = (Compare-Object (Get-Content "$tmp\a.txt") (Get-Content "$tmp\b.txt") | Out-String)
-        # delta is a pager; just verify it starts
-        $v = delta --version 2>&1
-        Test-Ok "delta responds ($v)"
-    } catch { Test-Fail "delta check failed: $_" }
+        # This used to write two files, compute a Compare-Object into $diff, never read it, and
+        # then run `delta --version`. Delta was never handed a diff: a version probe wearing a
+        # diff test's name. Feed it a real unified diff and assert it rendered the changed line.
+        # The diff is a literal rather than shelled out to git, so the check tests delta and not
+        # git's availability.
+        $unified = @"
+--- a/a.txt
++++ b/b.txt
+@@ -1,2 +1,2 @@
+ line one
+-line two
++line THREE
+"@
+        $rendered = $unified | delta --paging=never 2>&1 | Out-String
+        if ($LASTEXITCODE -eq 0 -and $rendered -match 'THREE') { Test-Ok "delta renders a unified diff" }
+        else { Test-Fail "delta did not render the diff (exit $LASTEXITCODE)" }
+    } catch { Test-Fail "delta check could not run: $_" }
 } else { Test-Warn "delta not present - skipping" }
 
 # just: run a minimal recipe
@@ -135,15 +165,23 @@ if ((Test-CommandAvailable "age") -and (Test-CommandAvailable "age-keygen")) {
 
 # tshark: version responds
 if (Test-CommandAvailable "tshark") {
-    try { $v = tshark --version 2>&1 | Select-Object -First 1; Test-Ok "tshark: $v" }
-    catch { Test-Fail "tshark --version failed" }
+    try {
+        # See the gh check: -First 1 on a native command corrupts $LASTEXITCODE.
+        $vAll = tshark --version 2>&1 | Out-String
+        $v = ($vAll -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+        if ($LASTEXITCODE -eq 0) { Test-Ok "tshark: $v" } else { Test-Fail "tshark --version exited $LASTEXITCODE" }
+    } catch { Test-Fail "tshark --version could not start: $_" }
 } else { Test-Warn "tshark not present - skipping" }
 
 # cdb: console debugger from Debugging Tools for Windows (Windows SDK via WDK)
 # detect-only tool - warn rather than fail if absent
 if (Test-CommandAvailable "cdb") {
-    try { $v = cdb -version 2>&1 | Select-Object -First 1; Test-Ok "cdb: $v" }
-    catch { Test-Warn "cdb present but -version failed: $_" }
+    try {
+        # See the gh check: -First 1 on a native command corrupts $LASTEXITCODE.
+        $vAll = cdb -version 2>&1 | Out-String
+        $v = ($vAll -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+        if ($LASTEXITCODE -eq 0) { Test-Ok "cdb: $v" } else { Test-Warn "cdb -version exited $LASTEXITCODE" }
+    } catch { Test-Warn "cdb present but -version could not start: $_" }
 } else { Test-Warn "cdb not present - run '.\bootstrap.ps1 -Only security' after WDK/SDK install" }
 
 # poolmon: pool-tag monitor from the WDK
@@ -165,9 +203,16 @@ if (Test-CommandAvailable "tokei") {
 # markdownlint: lint a minimal markdown file
 if (Test-CommandAvailable "markdownlint") {
     try {
-        Set-Content "$tmp\test.md" "# Hello`n`nThis is a test.`n"
-        markdownlint "$tmp\test.md" 2>&1 | Out-Null
-        Test-Ok "markdownlint lints a markdown file"
+        # No trailing `n: Set-Content adds one, and the explicit one made it two, so the
+        # fixture violated MD047/MD012 and markdownlint was right to exit 1. The check wants a
+        # deliberately clean fixture so that a non-zero exit means something is actually wrong.
+        Set-Content "$tmp\test.md" "# Hello`n`nThis is a test."
+        # Output was discarded AND the exit code ignored, so this passed whatever markdownlint
+        # did. The fixture is deliberately lint-clean, so exit 0 is the correct expectation:
+        # a non-zero code here means markdownlint found a problem or failed to run.
+        $mdOut = markdownlint "$tmp\test.md" 2>&1 | Out-String
+        if ($LASTEXITCODE -eq 0) { Test-Ok "markdownlint lints a markdown file" }
+        else { Test-Fail "markdownlint exited $LASTEXITCODE on a clean fixture: $($mdOut.Trim())" }
     } catch { Test-Fail "markdownlint check failed: $_" }
 } else { Test-Warn "markdownlint not present - skipping" }
 
@@ -361,6 +406,44 @@ if ($fxFiles.Count) {
             Test-Fail ("{0} does not parse under 5.1: {1}" -f $p[0], $p[1])
         }
     } else { Test-Ok ("{0} forensics script(s) parse under Windows PowerShell 5.1" -f $fxFiles.Count) }
+}
+
+# Every check in THIS file must be capable of failing.
+#
+# Six checks here wrapped a native command in try/catch and called Test-Ok unconditionally. A
+# native command that runs and exits non-zero raises no PowerShell exception, so the catch only
+# fires when the process cannot start - meaning those checks could not fail for the thing they
+# claimed to test. Measured: a shim printing a plausible version banner and exiting 3 was
+# reported "OK".
+#
+# The rule targets the exact defect shape: a try block that RENDERS A VERDICT (calls Test-Ok)
+# without inspecting an exit code or comparing anything. Such a block reaches Test-Ok on every
+# path where the process started at all.
+#
+# A try that only GATHERS is explicitly fine, and the first draft of this lint was wrong to
+# flag it. The SysmonDrv and USN checks below read a native command inside a try and decide
+# outside it, with an explicit warn-on-unreadable branch - that is a better pattern than the
+# one being outlawed, not a worse one, and a lint that cried wolf about it would be turned off
+# within a week.
+$selfLint = {
+    param($File)
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($File, [ref]$null, [ref]$null)
+    $tries = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TryStatementAst] }, $true)
+    $bad = @()
+    foreach ($t in $tries) {
+        $body = $t.Body.Extent.Text
+        if ($body -notmatch '\bTest-Ok\b') { continue }          # gathers only; verdict is elsewhere
+        $hasExit = $body -match '\$LASTEXITCODE'
+        $hasCompare = $body -match '\s-(eq|ne|match|notmatch|like|notlike|gt|lt|ge|le|contains|in|is)\s'
+        if (-not ($hasExit -or $hasCompare)) { $bad += $t.Extent.StartLineNumber }
+    }
+    ($bad -join ',')
+}
+$lintOut = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -Command $selfLint -Args $PSCommandPath 2>&1 | Out-String).Trim()
+if ($lintOut) {
+    Test-Fail ("try block(s) at line(s) $lintOut check neither an exit code nor a comparison, so they cannot fail")
+} else {
+    Test-Ok "every try block in this file inspects an exit code or compares a result"
 }
 
 # The forensics report's own suites. Both run WITHOUT Ollama and without reading the real
