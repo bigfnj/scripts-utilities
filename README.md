@@ -244,7 +244,14 @@ machine.
 .\bootstrap.ps1 -Only cli-tools    # comma-separated groups
 .\bootstrap.ps1 -RefreshToolbox    # rerun the idempotent builder
 .\scripts\smoke-test.ps1           # functional gate; must pass before committing
+.\run-gate.ps1                     # the above plus every test suite, one answer
 ```
+
+`run-gate.ps1` is the one to run before committing. It treats a **missing** suite as a failure
+rather than a warning, and a suite that exits 0 without printing a tally as a failure too —
+both are shapes this repository has actually shipped. It invokes `powershell.exe` for every
+suite regardless of which host you launch it from, because 5.1 is what the weekly task runs and
+a gate that checks whichever host you happened to use is not checking the thing that matters.
 
 Set `CODEX_TOOLBOX` before running to relocate the toolbox root.
 
