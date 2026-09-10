@@ -342,7 +342,14 @@ function Register-ToolboxUserPath {
     # tesseract reads TESSDATA_PREFIX to find its language data; persist it so OCR
     # works from a bare shell without activating the toolbox.
     $tessdata = Join-Path $toolboxRoot "native\tesseract\tessdata"
-    if (Test-Path -LiteralPath $tessdata) {
+    # Test-Path on the DIRECTORY is not enough. The 2026-09-09 rebuild created this directory
+    # empty, so the guard passed and TESSDATA_PREFIX was pointed at a tessdata holding no
+    # language data -- which breaks OCR HARDER than leaving the variable unset, because an
+    # absent TESSDATA_PREFIX lets tesseract fall back to its own install-relative tessdata.
+    # Every tesseract call on the box then died with "Failed loading language 'eng'".
+    # Require real language data before claiming the toolbox owns the path.
+    $hasLangData = @(Get-ChildItem -LiteralPath $tessdata -Filter '*.traineddata' -File -ErrorAction SilentlyContinue).Count -gt 0
+    if ($hasLangData) {
         $current = [System.Environment]::GetEnvironmentVariable("TESSDATA_PREFIX", "User")
         if ($current -ne $tessdata) {
             if ($DryRun) {
