@@ -251,7 +251,17 @@ border-left:4px solid var(--warn);border-radius:8px;padding:12px 14px;margin:0 0
 
     # ---- novelty ----
     & $add '<div class="panel"><h2>Never seen before</h2>'
-    if (-not $Baseline) {
+    # THREE states here too, and this panel was the one missed. Adding the unreadable arm to
+    # the top banner and to the tile but not here left the page contradicting itself: a
+    # BASELINE UNREADABLE banner above, and "Nothing new. Every one of this window's N
+    # pairing(s) has been seen in a previous run" below - a false all-clear about the same
+    # thing, on the same page. The render tests did not catch it because they asserted only the
+    # ABSENCE of the novel directory string, which that sentence does not contain.
+    if ($BaselineUnreadable) {
+        & $add ('<p class="none">Not computed. The baseline file exists but could not be parsed, so this ' +
+                'window could not be compared against anything. The damaged file has been set aside and the ' +
+                'next run starts a fresh one. This is NOT a statement that nothing was new.</p>')
+    } elseif (-not $Baseline) {
         & $add ('<p class="none">No baseline yet. This run recorded ' + ('{0:N0}' -f $DistinctPairs) +
                 ' distinct program/directory pairing(s); from the next run on, anything outside that set is called out here.</p>')
     } elseif (@($Novel).Count) {

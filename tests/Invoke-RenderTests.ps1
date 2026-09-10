@@ -166,6 +166,14 @@ It 'and does NOT present the resulting false-positive list' {
     # $novel here is the everything-looks-new list an empty Pairs set produces.
     $html -notmatch [regex]::Escape($novel[0].Dir)
 }
+It 'and does NOT claim "Nothing new" anywhere on the page' {
+    # This assertion is here because its absence hid a real bug. The banner and the tile were
+    # given an unreadable arm; the "Never seen before" PANEL was not, so the page carried a
+    # BASELINE UNREADABLE warning at the top and a false all-clear further down. Asserting only
+    # that the novel Dir is absent did not catch it - that sentence does not contain the Dir.
+    $html = New-HtmlWithBaselineState -Unreadable -BaselineObj @{ Runs = 0; Pairs = @{} } -NovelRows @()
+    ($html -notmatch 'Nothing new') -and ($html -match 'Not computed')
+}
 It 'a healthy baseline still shows its novelty list, so the guard is not just suppression' {
     # The positive control. A tile that never shows anything is as useless as one that shows
     # everything.

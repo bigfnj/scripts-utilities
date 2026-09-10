@@ -175,8 +175,21 @@ function Install-WingetTool {
         # User scope keeps PATH changes in user scope and avoids elevation where supported.
         $args += @("--scope", "user")
     }
-    winget @args
+    # CAPTURED, not emitted. An unredirected native command inside a function writes to that
+    # FUNCTION'S OUTPUT STREAM, so `return $false` below produced [<winget's stdout lines>,
+    # $false] and the caller's `if (-not $ok)` guard silently stopped working - `-not` on a
+    # multi-element array is $false. Measured: 3 elements returned, guard fires = False.
+    #
+    # That defeated the whole failure-propagation chain from the bottom: a run in which every
+    # winget install failed still counted zero failures, printed "group complete", exited 0,
+    # AND recorded each failed tool in the manifest as toolbox-installed, so a later
+    # -RemoveWingetTools would try to uninstall packages that were never installed.
+    #
+    # Kept in a variable rather than sent to Out-Null so the diagnostics survive for the
+    # failure branch, which is the only place they are worth reading.
+    $wingetOut = winget @args 2>&1
     if ($LASTEXITCODE -ne 0) {
+        foreach ($line in @($wingetOut)) { Write-Host "    $line" -ForegroundColor DarkGray }
         Write-Err "$Name install failed via winget id $Id (exit $LASTEXITCODE)"
         return $false
     }
@@ -325,8 +338,11 @@ function Install-NpmGlobal {
     # npm registry hang far past a sane wait (a TCP connect to the proxy succeeds
     # but the fetch stalls). These flags fail fast (~1-2 min) instead of wedging
     # the whole run; a failure is non-fatal here (returns $false, caller warns).
-    npm install -g $Package --no-audit --no-fund --fetch-timeout=60000 --fetch-retries=1 --fetch-retry-maxtimeout=20000
+    # Captured for the same reason as winget above: unredirected, npm's stdout becomes part
+    # of this function's return value and the caller's boolean guard stops working.
+    $npmOut = npm install -g $Package --no-audit --no-fund --fetch-timeout=60000 --fetch-retries=1 --fetch-retry-maxtimeout=20000 2>&1
     if ($LASTEXITCODE -ne 0) {
+        foreach ($line in @($npmOut)) { Write-Host "    $line" -ForegroundColor DarkGray }
         Write-Err "$Package npm install failed or timed out (exit $LASTEXITCODE)"
         return $false
     }

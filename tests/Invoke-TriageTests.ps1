@@ -117,7 +117,11 @@ It 'an uppercase confidence is normalised, not silently rendered verbatim' {
     $r = Get-FxTriage -Facts $facts -Responder {
         '{"findings":[{"process":"rm.exe","directory":"C:\\Users\\Admin\\.ssh","concern":"x","confidence":"HIGH"}]}'
     }
-    ($r.Findings.Count -eq 1) -and ($r.Findings[0].Confidence -eq 'high')
+    # -ceq, not -eq. PowerShell's -eq is CASE-INSENSITIVE, so 'HIGH' -eq 'high' is true and
+    # this test passed with or without the normalisation it exists to pin - a mutation
+    # removing .ToLowerInvariant() survived it. The test reproduced the very defect its own
+    # comment describes.
+    ($r.Findings.Count -eq 1) -and ($r.Findings[0].Confidence -ceq 'high')
 }
 
 It 'good and bad findings in one response are separated, not both dropped' {
