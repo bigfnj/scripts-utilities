@@ -65,6 +65,87 @@ $SentinelPatterns = @(
     '\\AppData\\Local\\DevToolbox($|\\)', '\\Documents($|\\)'
 )
 
+# ---- novelty ------------------------------------------------------------------------------
+# What a WEEKLY report should surface is not "what happened" - the counts already say that -
+# but "what happened that does not usually happen". The strongest available signal for that is
+# a process/directory pairing appearing for the FIRST time.
+#
+# Deliberately statistics and not a model. An earlier plan for this used embeddings; looking at
+# the actual data shape - (process, directory, count) - that is the wrong tool. Embeddings
+# measure semantic similarity between path strings, while the thing that makes a deletion
+# suspicious here is that this program has never deleted in this place before. That is a
+# frequency question, it is exactly reproducible run to run, it needs no model to be running,
+# and every row can state its own reason in one sentence. None of those are true of a model.
+
+function Get-FxPairKey {
+    <#
+        A stable key for "this program deleting in this place".
+
+        The directory is generalised to a bounded prefix, because the full path is too specific
+        to ever repeat: .cargo\registry\src\<hash>\<crate>-1.2.3 is a different string every
+        release, so a raw-path baseline would report everything as novel forever and mean
+        nothing. Four segments below the profile is deep enough to separate .ollama\models from
+        .cargo\registry and shallow enough to be stable across versions.
+    #>
+    param([string]$Image, [string]$Path)
+    $dir = try { Split-Path $Path -Parent } catch { $Path }
+    $m = [regex]::Match($dir, '(?i)^([A-Za-z]:\\Users\\[^\\]+)\\(.*)$')
+    if ($m.Success) {
+        $tail = @($m.Groups[2].Value -split '\\' | Where-Object { $_ }) | Select-Object -First 4
+        $dir = $m.Groups[1].Value + '\' + ($tail -join '\')
+    }
+    return ('{0}|{1}' -f [IO.Path]::GetFileName($Image), $dir)
+}
+
+function Read-FxBaseline {
+    <#
+        Pairings seen in previous runs. Absent on the first run, which is not an error - it just
+        means nothing can be called novel yet, and the report says so rather than flagging all
+        4,000 events as new.
+
+        Kept beside the Sysmon config in ProgramData rather than in the toolbox, for the same
+        reason the config is: DevToolbox was destroyed in the incident this tooling exists to
+        investigate, so nothing it depends on should live inside its own subject.
+    #>
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    try {
+        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json
+        $h = @{}
+        foreach ($p in $raw.pairs) { $h[[string]$p.key] = $p }
+        return @{ Pairs = $h; FirstRun = [string]$raw.firstRun; Runs = [int]$raw.runs }
+    } catch { return $null }
+}
+
+function Write-FxBaseline {
+    param([string]$Path, [hashtable]$Seen, $Existing)
+    # Bounded. A pairing not seen for a long time is dropped so the file cannot grow forever;
+    # 5,000 is far above the ~100 distinct pairings this machine actually produces.
+    $now = (Get-Date).ToString('o')
+    $merged = @{}
+    if ($Existing) { foreach ($k in $Existing.Pairs.Keys) { $merged[$k] = $Existing.Pairs[$k] } }
+    foreach ($k in $Seen.Keys) {
+        if ($merged.ContainsKey($k)) {
+            $merged[$k].lastSeen = $now
+            $merged[$k].count = [int]$merged[$k].count + [int]$Seen[$k]
+        } else {
+            $merged[$k] = [pscustomobject]@{ key = $k; firstSeen = $now; lastSeen = $now; count = [int]$Seen[$k] }
+        }
+    }
+    $keep = @($merged.Values | Sort-Object { [datetime]$_.lastSeen } -Descending | Select-Object -First 5000)
+    $obj = [ordered]@{
+        firstRun = $(if ($Existing -and $Existing.FirstRun) { $Existing.FirstRun } else { $now })
+        runs     = $(if ($Existing) { [int]$Existing.Runs + 1 } else { 1 })
+        updated  = $now
+        pairs    = $keep
+    }
+    try {
+        New-Item -ItemType Directory -Path (Split-Path $Path -Parent) -Force | Out-Null
+        $obj | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Path -Encoding UTF8
+        return $true
+    } catch { return $false }
+}
+
 function Get-InteractiveUser {
     # SYSTEM runs the scheduled task, so "the user" is whoever owns the console session, not the
     # process. Same problem pc-maintenance solves; same approach.
@@ -223,6 +304,31 @@ try {
     }
 } catch { }
 
+# ---- novelty against the baseline ---------------------------------------------------------
+$baselinePath = Join-Path $env:ProgramData 'Sysmon\forensics-baseline.json'
+$baseline = Read-FxBaseline -Path $baselinePath
+$seen = @{}
+foreach ($d in $deletes) {
+    $k = Get-FxPairKey -Image $d.Image -Path $d.Path
+    if ($seen.ContainsKey($k)) { $seen[$k]++ } else { $seen[$k] = 1 }
+}
+$novel = @()
+if ($baseline) {
+    foreach ($k in $seen.Keys) {
+        if (-not $baseline.Pairs.ContainsKey($k)) {
+            $parts = $k -split '\|', 2
+            $novel += [pscustomobject]@{ Image = $parts[0]; Dir = $parts[1]; Count = $seen[$k] }
+        }
+    }
+    $novel = @($novel | Sort-Object Count -Descending)
+}
+# Written AFTER novelty is computed, or this run's own pairings would already be in the
+# baseline it is compared against and nothing could ever be novel.
+$baselineWritten = Write-FxBaseline -Path $baselinePath -Seen $seen -Existing $baseline
+Write-Host ("  {0} distinct pairing(s); {1}" -f $seen.Count,
+    $(if ($baseline) { "$($novel.Count) never seen before (baseline: $($baseline.Runs) run(s))" }
+      else { 'no baseline yet - first run establishes it' })) -ForegroundColor DarkGray
+
 $usnMax = $null
 try {
     $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
@@ -243,7 +349,7 @@ $outPath = Join-Path $OutDir "Deletion Forensics Report - $stamp.html"
 $html = New-ForensicsHtml -Deletes $deletes -ByImage $byImage -ByDir $byDir -Bursts $bursts `
     -Sentinels $sentinelHits -Coverage $coverage -UsnMax $usnMax -Procs $procs `
     -StateChanges $stateChanges -Days $Days -MaxRows $MaxRows -SentinelPatterns $SentinelPatterns `
-    -BurstThreshold $BurstThreshold
+    -BurstThreshold $BurstThreshold -Novel $novel -Baseline $baseline -DistinctPairs $seen.Count
 
 [IO.File]::WriteAllText($outPath, $html, (New-Object Text.UTF8Encoding($false)))
 Write-Host "report: $outPath" -ForegroundColor Green

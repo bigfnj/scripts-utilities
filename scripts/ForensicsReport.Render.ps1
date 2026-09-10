@@ -14,7 +14,8 @@ function New-ForensicsHtml {
     param(
         $Deletes, $ByImage, $ByDir, $Bursts, $Sentinels, $Coverage, $UsnMax,
         $Procs, $StateChanges, [int]$Days, [int]$MaxRows, $SentinelPatterns,
-        [int]$BurstThreshold = 50
+        [int]$BurstThreshold = 50,
+        $Novel, $Baseline, [int]$DistinctPairs = 0
     )
 
     $css = @'
@@ -114,6 +115,15 @@ mark{background:rgba(210,153,34,.32);color:inherit;border-radius:2px}
         @{ Label = 'Bursts'; Value = ('{0:N0}' -f $Bursts.Count); Cls = $(if ($Bursts.Count) { 'bad' } else { 'ok' })
            Blurb = 'A burst is one process deleting many files in a short window - the shape of a mass deletion, as opposed to a machine steadily working. Detail below.'
            Rows = @($Bursts | ForEach-Object { @{ K = (Split-Path $_.Image -Leaf); V = ('{0:N0} in {1}s' -f $_.Count, $_.Seconds) } }) }
+        @{ Label = 'New pairings'; Value = $(if ($Baseline) { '{0:N0}' -f @($Novel).Count } else { 'n/a' })
+           Cls = $(if (-not $Baseline) { '' } elseif (@($Novel).Count) { 'warn' } else { 'ok' })
+           Blurb = $(if ($Baseline) {
+                       'A program deleting somewhere it has never deleted before, across ' + $Baseline.Runs +
+                       ' previous run(s). This is the signal a WEEKLY report is actually for: the counts say what happened, this says what does not usually happen.'
+                     } else {
+                       'No baseline yet - this run establishes one. Nothing can be called new until there is something to be new against, and flagging all of it would say nothing.'
+                     })
+           Rows = @($Novel | Select-Object -First 12 | ForEach-Object { @{ K = ('{0}  ->  {1}' -f $_.Image, $_.Dir); V = ('{0:N0}' -f $_.Count) } }) }
         @{ Label = 'Sentinel paths'; Value = ('{0:N0}' -f $Sentinels.Count); Cls = $(if ($Sentinels.Count) { 'warn' } else { 'ok' })
            Blurb = 'Deletions in quiet, valuable directories - credentials, agent configs, the toolbox, Documents. Any activity here is unusual by construction, which is why these make better sentinels than a cache.'
            Rows = @($sentinelDirs | Select-Object -First 12 | ForEach-Object { @{ K = $_.Name; V = ('{0:N0}' -f $_.Count) } }) }
@@ -155,6 +165,30 @@ mark{background:rgba(210,153,34,.32);color:inherit;border-radius:2px}
             & $add '</div>'
         }
     } else { & $add '<p class="none">No process deleted enough files quickly enough to qualify.</p>' }
+    & $add '</div>'
+
+    # ---- novelty ----
+    & $add '<div class="panel"><h2>Never seen before</h2>'
+    if (-not $Baseline) {
+        & $add ('<p class="none">No baseline yet. This run recorded ' + ('{0:N0}' -f $DistinctPairs) +
+                ' distinct program/directory pairing(s); from the next run on, anything outside that set is called out here.</p>')
+    } elseif (@($Novel).Count) {
+        & $add ('<p class="blurb">Measured against ' + $Baseline.Runs + ' previous run(s), covering ' +
+                ('{0:N0}' -f $DistinctPairs) + ' pairing(s) this window. Each row is a program deleting somewhere it has not deleted before - which is not by itself wrong, only unusual, and the reason it is worth a look rather than an alarm.</p>')
+        & $add '<ul class="rows">'
+        foreach ($n in @($Novel | Select-Object -First 25)) {
+            & $add ('<li><span class="k">' + (ConvertTo-Html ('{0}  ->  {1}' -f $n.Image, $n.Dir)) +
+                    '</span><span class="v">' + ('{0:N0}' -f $n.Count) + ' deletion(s)</span></li>')
+        }
+        & $add '</ul>'
+        if (@($Novel).Count -gt 25) {
+            & $add ('<p class="blurb">Showing 25 of ' + ('{0:N0}' -f @($Novel).Count) + '.</p>')
+        }
+    } else {
+        & $add ('<p class="none">Nothing new. Every one of this window''s ' + ('{0:N0}' -f $DistinctPairs) +
+                ' pairing(s) has been seen in a previous run.</p>')
+    }
+    & $add '<p class="blurb">Directories are generalised to four segments below the profile, because a full path is too specific to ever repeat - a per-release crate directory would make everything look new forever. Statistics, not a model: exactly reproducible run to run, and every row states its own reason.</p>'
     & $add '</div>'
 
     # ---- coverage: what this report cannot see ----
