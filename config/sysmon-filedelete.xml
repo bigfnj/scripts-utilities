@@ -59,6 +59,25 @@
         <!-- Anything running out of a scratch or download location. -->
         <Image condition="contains">\AppData\Local\Temp\</Image>
         <Image condition="contains">\Downloads\</Image>
+        <!--
+          The Unix coreutils that actually DELETE. These were missing, and their absence was a
+          real hole: a live test deleting a file from the agent shell recorded the deletion
+          against C:\Anthropic\.Git\usr\bin\rm.exe - bash forks rm as its own process, so bash
+          is never the deleting image. Event 26 therefore named rm.exe while nothing anywhere
+          recorded WHAT rm was asked to remove.
+          Their own command line is better evidence than the bash wrapper's, because it is
+          already resolved: "rm -rf /c/Users/Admin/.ollama" rather than a shell string.
+          Cost measured before adding: ZERO occurrences in 40,000 sampled ProcessCreate events.
+          git.exe is here for `git clean -fdx`, which removes more than people expect.
+        -->
+        <Image condition="end with">\rm.exe</Image>
+        <Image condition="end with">\rmdir.exe</Image>
+        <Image condition="end with">\unlink.exe</Image>
+        <Image condition="end with">\shred.exe</Image>
+        <Image condition="end with">\mv.exe</Image>
+        <Image condition="end with">\find.exe</Image>
+        <Image condition="end with">\xargs.exe</Image>
+        <Image condition="end with">\git.exe</Image>
       </ProcessCreate>
     </RuleGroup>
 
@@ -78,16 +97,27 @@
       The ParentImage rule is what makes this work - cmd.exe is a real mass-deletion vector and
       is NOT excluded on its own, only when the agent's bash spawned it.
 
-      What this costs, stated plainly: if the agent's shell is ever the thing that deletes your
-      profile, event 26 still records bash.exe as the deleting image, with the pid, the user and
-      every path - we lose only the COMMAND LINE of that shell invocation. That is a real loss
-      and it is the right trade: excluding it moved projected retention from 16 hours to ~124,
-      and the deletion history is the actual product.
+      What this costs, stated plainly: the bash wrapper's command line. The deletion itself is
+      untouched - event 26 still records every path, the pid and the user - and since the
+      coreutils above are now included, `rm -rf /c/Users/Admin/.ollama` is captured directly,
+      which is better evidence than the shell string that produced it. Excluding the shells
+      moved projected retention from 16 hours to ~124.
+
+      NARROWED so it cannot swallow the coreutils above. An earlier version excluded everything
+      under C:\Anthropic\.Git\ by prefix, and by ParentImage too - which would have discarded
+      rm.exe both ways, since bash is always its parent. Exclude wins over include in Sysmon, so
+      that broad rule would have silently cancelled the most valuable evidence in the file.
+      Only the SHELLS are dropped now, plus cmd.exe when the agent's bash spawned it; cmd.exe
+      on its own remains watched, because it is a real mass-deletion vector.
     -->
     <RuleGroup name="proc-create-noise" groupRelation="or">
       <ProcessCreate onmatch="exclude">
-        <Image condition="begin with">C:\Anthropic\.Git\</Image>
-        <ParentImage condition="begin with">C:\Anthropic\.Git\</ParentImage>
+        <Image condition="end with">\.Git\usr\bin\bash.exe</Image>
+        <Image condition="end with">\.Git\bin\bash.exe</Image>
+        <Rule groupRelation="and">
+          <Image condition="end with">\cmd.exe</Image>
+          <ParentImage condition="begin with">C:\Anthropic\.Git\</ParentImage>
+        </Rule>
       </ProcessCreate>
     </RuleGroup>
 

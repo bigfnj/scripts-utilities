@@ -326,7 +326,30 @@ happened to my files". Every exclusion was measured before being added, over fou
 | 1 | ProcessTerminate off; ProcessCreate narrowed to shells and installers | 997 → 233 events/min |
 | 2 | `.dotnet\TelemetryStorageService` (160 of a 1,500 sample) | → 67 events/min |
 | 3 | Vendor cache churn — Backblaze 1,566, Razer 720, Steam 380 | 51% of the log |
-| 4 | Agent shell tooling (`C:\Anthropic\.Git\` and its children) | 94% of remaining ProcessCreate |
+| 4 | Agent shell tooling (`C:\Anthropic\.Git\` bash, and the cmd it spawns) | 94% of remaining ProcessCreate |
+
+Round 4 needed correcting almost immediately, and the correction is the useful part. Excluding
+that whole tree by prefix also discarded **`rm.exe`** - and a live test showed `rm.exe` is what
+actually performs a deletion from an agent shell, because bash forks it as a separate process.
+Sysmon resolves *exclude over include*, so the broad rule would have silently cancelled the
+single most valuable record in the file.
+
+The coreutils that delete (`rm`, `rmdir`, `mv`, `find`, `xargs`, `shred`, `unlink`, `git`) are
+now explicitly **included** in `ProcessCreate`, and the exclusion names only the shells.
+Measured cost of adding them: **zero occurrences in 40,000 sampled events**. Verified end to
+end - an `rm -rf` from the agent shell now records both the files and the command that removed
+them:
+
+```
+image   : C:\Anthropic\.Git\usr\bin\rm.exe
+cmdline : rm.exe -rf /c/Users/Admin/.rmproof
+parent  : C:\Anthropic\.Git\usr\bin\bash.exe
+```
+
+That matters beyond tidiness. On a machine that runs coding agents all day, a shell `rm -rf`
+with an over-broad glob or an unset variable is a leading explanation for the kind of loss this
+was built after - and it is the one explanation the tooling could previously observe happening
+without being able to say what was asked for.
 
 Final measured rate: **4,620 events/hour at 3,756 bytes each → ~124 hours at 2 GB**, comfortably
 past the target.
