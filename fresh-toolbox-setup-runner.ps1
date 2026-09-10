@@ -59,12 +59,45 @@ function Assert-Prerequisites {
     }
 }
 
+# A PowerShell script that does not end in an explicit `exit` leaves $LASTEXITCODE exactly as it
+# found it: the code of whatever NATIVE process it last happened to run. bootstrap.ps1 is such a
+# script, and on a dry run the last native thing it runs is lib\common.ps1's `find_spec` probe,
+# which exits 1 for every package that is not installed yet. This function used to zero
+# $LASTEXITCODE, call bootstrap and then read it back, so a perfectly good dry run aborted with
+# "Run bootstrap.ps1 failed (exit 1)" - a failure invented by a probe doing its job. The callee
+# cannot be fixed from here, so stop asking it a question it cannot answer.
+#
+# How a PowerShell script actually reports failure is a terminating error, and every callee here
+# sets $ErrorActionPreference = 'Stop', so that error propagates out of `& $Action` and we catch
+# it. $LASTEXITCODE is consulted only when the caller states that this particular callee sets it
+# on purpose:
+#   -NonFatalExitCodes  codes the callee raises deliberately that are NOT failures. Honoured on
+#                       its own, because a script can exit explicitly on one branch and fall off
+#                       the end (leaking a code) on another - consolidate-path.ps1 does exactly
+#                       that: `exit 2` when elevation is declined, no exit at all on success.
+#   -TrustExitCode      the callee ends EVERY path in an explicit exit, so any unlisted non-zero
+#                       code is genuinely its own and is fatal. Only smoke-test.ps1 qualifies.
 function Invoke-Checked {
-    param([string]$Description, [scriptblock]$Action)
+    param(
+        [string]$Description,
+        [scriptblock]$Action,
+        [hashtable]$NonFatalExitCodes = @{},
+        [switch]$TrustExitCode
+    )
     Write-Info $Description
     $global:LASTEXITCODE = 0
-    & $Action
-    if ($LASTEXITCODE -ne 0) { throw "$Description failed (exit $LASTEXITCODE)" }
+    try {
+        & $Action
+    } catch {
+        throw "$Description failed: $($_.Exception.Message)"
+    }
+    $code = $LASTEXITCODE
+    if ($null -eq $code) { $code = 0 }
+    if ($code -ne 0 -and $NonFatalExitCodes.ContainsKey($code)) {
+        Write-Warn ("{0}: {1}" -f $Description, $NonFatalExitCodes[$code])
+        return
+    }
+    if ($TrustExitCode -and $code -ne 0) { throw "$Description failed (exit $code)" }
 }
 
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
@@ -111,13 +144,23 @@ try {
     # hands a new process, or on the user PATH only, which a machine-PATH-only shell never sees.
     if (-not $SkipPathConsolidation) {
         Write-Step "PATH consolidation"
+        # Exit 2 from consolidate-path.ps1 is a decision, not a crash: the script self-elevates
+        # through UAC and returns 2 when consent is refused (or -NoElevate suppressed the prompt),
+        # having written NOTHING. Treating that as a failure would abort a setup that is otherwise
+        # complete; ignoring it would hide the one outcome the user needs to act on.
+        $consolidatorCodes = @{
+            2 = "skipped - elevation declined, PATH left exactly as it was. Re-run '.\scripts\consolidate-path.ps1' from an elevated shell to apply it."
+        }
         if ($DryRun) {
-            & $PathConsolidator -DryRun
+            # -DryRun returns before the elevation gate, so it never exits 2 and never sets its
+            # own code - hence no -TrustExitCode here either.
+            Invoke-Checked "Report the PATH consolidation plan" { & $PathConsolidator -DryRun }
         } else {
-            # Deliberately not Invoke-Checked: a PATH that cannot be consolidated is worth
-            # reporting loudly, but it must not fail an otherwise good install. The script backs
-            # both PATH values up first and prints its own -Restore line.
-            try { & $PathConsolidator } catch { Write-Warn "PATH consolidation failed: $_" }
+            # A PATH that cannot be consolidated is worth reporting loudly, but it must not fail
+            # an otherwise good install. The script backs both PATH values up first and prints
+            # its own -Restore line.
+            try { Invoke-Checked "Consolidate PATH" { & $PathConsolidator } -NonFatalExitCodes $consolidatorCodes }
+            catch { Write-Warn "PATH consolidation failed: $_" }
         }
     } else {
         Write-Info "PATH consolidation skipped (-SkipPathConsolidation)"
@@ -127,7 +170,9 @@ try {
     if ($DryRun) {
         Write-Info "[DRY-RUN] would run scripts\smoke-test.ps1 after installation"
     } else {
-        Invoke-Checked "Run repository smoke test" { & $Smoke }
+        # smoke-test.ps1 is the one callee that ends every path in an explicit exit (1 on any
+        # failed check, 0 otherwise), so its code is genuinely its own and must stay fatal.
+        Invoke-Checked "Run repository smoke test" { & $Smoke } -TrustExitCode
     }
 
     Write-Step "complete"

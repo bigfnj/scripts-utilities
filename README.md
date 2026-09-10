@@ -77,7 +77,7 @@ to 1,726** and made `git`, `tesseract`, `procdump`, `deno` and `yt-dlp` resolvab
 
 ```powershell
 .\scripts\consolidate-path.ps1 -DryRun    # report, change nothing
-.\scripts\consolidate-path.ps1            # apply (needs elevation for the machine PATH)
+.\scripts\consolidate-path.ps1            # apply (self-elevates via UAC; exit 2 if you decline, nothing written)
 .\scripts\consolidate-path.ps1 -Restore logs\path-backup-<timestamp>.json
 ```
 
