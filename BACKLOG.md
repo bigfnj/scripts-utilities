@@ -98,7 +98,7 @@ Both require elevation, so neither can live in the unelevated smoke test - they 
 `install-deletion-forensics.ps1 -Verify`. An unelevated SKIP is the honest answer there; a PASS
 would be the very defect this backlog is about.
 
-### 3. The weekly report lands in `C:\Windows\TEMP` when nobody is logged in
+### 3. ~~The weekly report lands in `C:\Windows\TEMP` when nobody is logged in~~ DONE 2026-09-10
 
 `New-ForensicsReport.ps1:156-175`. `Get-InteractiveUser` falls back to the *current process*
 identity when `Win32_ComputerSystem.UserName` is null - under the SYSTEM task with nobody signed
@@ -107,7 +107,7 @@ exist. The task is `-StartWhenAvailable`, so a machine that was off at Sunday 04
 *before* anyone logs in: the likely case, not the edge case. pc-maintenance's
 `Get-PMInteractiveUserSid` deliberately refuses this and flags `Inferred`; port that behaviour.
 
-### 4. Four smoke-test checks named "functional" cannot fail
+### 4. ~~SIX smoke-test checks named "functional" cannot fail~~ DONE 2026-09-10
 
 `smoke-test.ps1:59-62, 84-93, 137-140, 166-172`. The pattern is
 `try { $v = gh --version 2>&1; Test-Ok } catch { Test-Fail }` - a native command exiting non-zero
@@ -117,14 +117,42 @@ output and calls `Test-Ok` unconditionally. `hyperfine` (`:108-110`) does it cor
 `$LASTEXITCODE` like that one. Related: `:88` builds two files and a `Compare-Object` for the
 `delta` check and never uses the result, so **delta is never actually fed a diff**.
 
-### 5. Unverified binaries are kept, despite the comment saying they never are
+**Fixed 2026-09-10, and it was SIX sites, not four** - `cdb` had the same shape, and the
+manifest `detect` probe was subtler than any of them: a FAILING `winget list --id X -e` still
+prints "No installed package found matching input criteria", which is non-empty and therefore
+truthy. (That branch only fires for `install_method = "existing"`, and npcap is the only such
+tool, whose detect is a real PowerShell expression - so it was fragile rather than actively
+misfiring. The audit's example, WinDbg, has method "winget" and never reaches it.)
+
+Two things surfaced only by RUNNING the fixed checks, both of which would otherwise have
+shipped:
+
+- **`... | Select-Object -First 1` sets `$LASTEXITCODE` to -1 even when the command SUCCEEDED.**
+  It raises StopUpstreamCommandsException to short-circuit, which kills the native process
+  mid-write. Pairing an exit-code check with `-First 1` therefore INVENTS failures - a healthy
+  `gh` immediately reported "exited -1". Collect the whole stream, then take the line.
+- **markdownlint was right to exit 1.** `Set-Content` appends a newline on top of the fixture's
+  explicit backtick-n, so the file ended with a blank line. The fixture was fixed rather than
+  the assertion loosened.
+
+`delta` was never actually fed a diff - it wrote two files, computed a `Compare-Object` nothing
+read, and ran `delta --version`. It now receives a literal unified diff and must render the
+changed line.
+
+A lint in the gate now fails any `try` block that calls `Test-Ok` without inspecting an exit
+code or comparing anything. Verified against git history: it flags exactly the six original
+sites, and zero afterwards. Its first draft was broader and wrongly flagged blocks that GATHER
+inside a try and decide outside it - a better pattern than the one being outlawed, and a lint
+that cries wolf gets switched off within a week.
+
+### 5. ~~Unverified binaries are kept, despite the comment saying they never are~~ DONE 2026-09-10
 
 `build-devtoolbox.ps1:482-493`. `Expand-Archive` writes ~151 Sysinternals executables *before*
 the signature check, and the catch only warns - nothing is deleted. The downstream gate at `:785`
 is `Test-Path sigcheck64.exe`, now true, so the readiness smoke passes against unverified
 binaries. Only one file is ever checked although the comment says "binaries".
 
-### 6. `install-llm.ps1` puts multi-GB models outside the toolbox and then asserts otherwise
+### 6. ~~`install-llm.ps1` puts multi-GB models outside the toolbox and then asserts otherwise~~ DONE 2026-09-10
 
 `:73-79, 166, 194, 204`. `OLLAMA_MODELS` is set for *future* processes; when Ollama is already
 running the catalog install short-circuits, `Wait-Ollama` is satisfied by the **old** server, and
@@ -132,7 +160,7 @@ running the catalog install short-circuits, `Wait-Ollama` is satisfied by the **
 the uninstall story depends on it. This is the "Ollama desktop app blocks its service" problem
 expressed in code.
 
-### 7. Group installs report success even when every install failed
+### 7. ~~Group installs report success even when every install failed~~ DONE 2026-09-10
 
 `lib/catalog.ps1:131` pipes every result to `Out-Null`, so `cli-tools_install` prints
 `OK cli-tools group complete` regardless and bootstrap then prints `bootstrap complete`
@@ -141,7 +169,7 @@ expressed in code.
 `OK reranker provisioned`; `:108`'s `if (Test-Path $out) { continue }` accepts a truncated
 partial download forever.
 
-### 8. Manifest provenance is asserted rather than measured
+### 8. ~~Manifest provenance is asserted rather than measured~~ DONE 2026-09-10
 
 `modules/security.ps1:135-137, 226-229, 323-326, 417-420` omit `-InstalledByToolbox`, which
 defaults to `$true`. The live manifest records `WinDbg` and `npcap` as toolbox-installed although
@@ -149,7 +177,7 @@ npcap is documented as detect-only and `Install-WingetTool` returns early for a 
 WinDbg. Consequence: `uninstall-toolbox.ps1 -RemoveWingetTools` would `winget uninstall` a WinDbg
 the toolbox never installed.
 
-### 9. A corrupt baseline silently destroys the novelty history
+### 9. ~~A corrupt baseline silently destroys the novelty history~~ DONE 2026-09-10
 
 `New-ForensicsReport.ps1` `Read-FxBaseline` returns `$null` on **any** read or parse failure. The
 report then says "No baseline yet - this run establishes one", writes `runs = 1`, and every
@@ -158,7 +186,7 @@ pairing is reported as novel next week. A lost history reads as a clean slate. D
 { [datetime]$_.lastSeen }` sits outside the try/catch under `$ErrorActionPreference='Stop'`, so
 one entry missing `lastSeen` kills report generation outright.
 
-### 10. The novelty baseline never forgets
+### 10. ~~The novelty baseline never forgets~~ DONE 2026-09-10
 
 `Write-FxBaseline` prunes only by count (top 5,000 by `lastSeen`), never by age, so the "New
 pairings" tile - which the renderer itself calls "the signal a WEEKLY report is actually for" -
@@ -166,7 +194,7 @@ trends monotonically to zero and stays there. Add an age horizon.
 (The related trap, that investigating an incident folded it into the baseline, was fixed by
 `-NoBaseline` on 2026-09-10.)
 
-### 11. The report generator's pure functions cannot be tested
+### 11. ~~The report generator's pure functions cannot be tested~~ DONE 2026-09-10
 
 `Get-FxPairKey`, `Read-FxBaseline`, `Write-FxBaseline`, `Get-InteractiveUser` and
 `Get-DownloadsPath` live in `New-ForensicsReport.ps1`, which begins reading the event log the
@@ -180,22 +208,22 @@ than by running it. Extract them into `ForensicsReport.Core.ps1` alongside the e
 
 ## Bugs - LOW
 
-- **`security_desc` over-claims 4 of 6 items** (`modules/security.ps1:11`), and it is printed by
+- ~~**`security_desc` over-claims 4 of 6 items** (`modules/security.ps1:11`), and it is printed by
   `bootstrap.ps1 -List` and `get.ps1` - i.e. *before* consent. It advertises installing WinDbg,
   the WDK, console debuggers and Ghidra; the bodies only detect-and-wrap. `modules/cli-tools.ps1:7`
-  omits `pwsh` and `curl-libressl`.
-- **A stray literal backtick ships in the manifest** (`modules/security.ps1:401`): `-c '`.logopen`
+  omits `pwsh` and `curl-libressl`.~~ DONE 2026-09-10
+- ~~**A stray literal backtick ships in the manifest** (`modules/security.ps1:401`): `-c '`.logopen`
   in a double-quoted string, so the recorded command is paste-broken. `lib/common.ps1:532` has the
-  same text correctly.
-- **The GUI ignores its own per-tool checkboxes** (`gui/toolbox-gui.ps1:206-214`): `Get-RunnerArgs`
-  reads only the five global toggles, so unchecking a tool and pressing Install installs it.
-- **The GUI can hang forever** (`gui/toolbox-gui.ps1:192-201`): only stdout is drained inside the
+  same text correctly.~~ DONE 2026-09-10
+- ~~**The GUI ignores its own per-tool checkboxes** (`gui/toolbox-gui.ps1:206-214`): `Get-RunnerArgs`
+  reads only the five global toggles, so unchecking a tool and pressing Install installs it.~~ DONE 2026-09-10
+- ~~**The GUI can hang forever** (`gui/toolbox-gui.ps1:192-201`): only stdout is drained inside the
   wait loop; a child filling the ~4 KB stderr pipe never exits and `while (-not $proc.HasExited)`
-  spins. bootstrap's winget/pip children do write to stderr.
-- **Undisposed resources**: `Process` and `CancellationTokenSource` in `gui/toolbox-gui.ps1:66,
+  spins. bootstrap's winget/pip children do write to stderr.~~ DONE 2026-09-10
+- ~~**Undisposed resources**: `Process` and `CancellationTokenSource` in `gui/toolbox-gui.ps1:66,
   191, 277`; ~150 `X509Certificate2` per call in `lib/common.ps1:229-237`; `New-TemporaryFile` in
   `smoke-test.ps1:26` creates a file only its *name* is used from and the cleanup removes a
-  directory instead (76 stray zero-byte `tmp*.tmp` currently in `%TEMP%`).
+  directory instead (76 stray zero-byte `tmp*.tmp` currently in `%TEMP%`).~~ DONE 2026-09-10
 - **A partial tessdata download is permanent** despite the warning saying "rerun to retry"
   (`build-devtoolbox.ps1:445-458`): `Install-Tessdata` short-circuits on `Test-Path` before the
   self-healing size check can run. Only `eng` and `osd` of 11 declared languages exist on this box,
@@ -207,12 +235,38 @@ than by running it. Extract them into `ForensicsReport.Core.ps1` alongside the e
   emits a Sysmon/deletion-forensics paragraph the four deployed `CLAUDE.md`/`AGENTS.md` copies do
   not have, and nothing verifies deployed against generator - the gap pc-maintenance's
   `Invoke-DeploymentSmoke.ps1` exists to close for its own payload.
-- **`fresh-toolbox-setup-runner.ps1:62-68, 87`** reads a leaked `$LASTEXITCODE` as bootstrap's
+- ~~**`fresh-toolbox-setup-runner.ps1:62-68, 87`** reads a leaked `$LASTEXITCODE` as bootstrap's
   status (bootstrap has no trailing `exit`). It now also needs to handle
-  `consolidate-path.ps1` exit **2** (elevation declined), added 2026-09-10.
-- **`README.md:80`** says consolidate-path "needs elevation"; it now self-elevates.
+  `consolidate-path.ps1` exit **2** (elevation declined), added 2026-09-10.~~ DONE 2026-09-10
+- ~~**`README.md:80`** says consolidate-path "needs elevation"; it now self-elevates.~~ DONE 2026-09-10
 
 ---
+
+
+**Three of these were not what the audit said, and the corrections matter more than the fixes.**
+The half-uninstall item was ALREADY closed by an earlier commit the same day - current behaviour
+was verified (exit 1, zero of three mutation steps reached, with a control proving "zero
+reached" is not vacuous) and nothing was changed. `catalog.json tools[].default` is NOT dead:
+`gui\toolbox-gui.ps1` reads it to pre-tick checkboxes, so only `optional` was removed. And the
+temp-file leak had grown from the recorded 138 to 154 by the time it was fixed, because the
+smoke test had been run repeatedly that day - the clearest possible confirmation the leak was
+ours.
+
+**One fix introduced a bug that was caught in its own review.** Making provenance a measurement
+means the SECOND bootstrap run finds a tool already present and would DISOWN it, so a later
+`-RemoveWingetTools` would leave behind everything the toolbox installed. Provenance is now
+sticky: false -> true is a measurement we accept, true -> false is one we refuse.
+
+**A PowerShell engine bug, found while verifying the GUI stderr fix.** `Register-ObjectEvent`
+assigns `EventIdentifier`s without an interlock, so two events raised at the same instant on the
+stdout and stderr reader threads can share one id - measured 2 runs in 6, always the
+end-of-stream marker pair. `Remove-Event` then consumes both and throws, which under the GUI's
+`$ErrorActionPreference = 'Stop'` would have killed the click handler AFTER a successful
+install. Worth knowing before anyone writes another event-driven pump.
+
+**Still open in this section:** the permanent partial tessdata download, the unconditional shim
+overwrite in `consolidate-path.ps1`, the stale deployed agent block, and `.bak-<timestamp>`
+files accumulating unpruned.
 
 ## Dead code
 
