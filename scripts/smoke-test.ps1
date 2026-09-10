@@ -332,13 +332,27 @@ if (-not $fxElevated) {
 
 # The generator and its renderer must at least parse under 5.1 - the scheduled task runs
 # powershell.exe, not pwsh, and a parse error there fails silently at 04:00 on a Sunday.
-foreach ($fxScript in 'New-ForensicsReport.ps1', 'ForensicsReport.Render.ps1') {
+foreach ($fxScript in 'New-ForensicsReport.ps1', 'ForensicsReport.Render.ps1', 'ForensicsReport.Triage.ps1') {
     $fxPath = Join-Path $PSScriptRoot $fxScript
     if (-not (Test-Path $fxPath)) { Test-Fail "missing $fxScript"; continue }
     $fxErr = $null
     [void][System.Management.Automation.Language.Parser]::ParseFile($fxPath, [ref]$null, [ref]$fxErr)
     if ($fxErr -and $fxErr.Count) { Test-Fail "$fxScript does not parse: $($fxErr[0].Message)" }
     else { Test-Ok "$fxScript parses" }
+}
+
+# The triage layer's own suite. Runs WITHOUT Ollama by design - what is worth testing is that
+# a model claim citing something it was never shown gets discarded, and a test whose result
+# depends on what a model says today fails for reasons unrelated to the code.
+$fxTri = Join-Path $REPO_ROOT 'tests\Invoke-TriageTests.ps1'
+if (-not (Test-Path $fxTri)) { Test-Warn 'triage test suite not found' }
+else {
+    $tOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $fxTri 2>&1 | Out-String
+    $tLine = ($tOut -split "`r?`n" | Where-Object { $_ -match 'passed,.*failed' } | Select-Object -Last 1)
+    if ($tLine -match '(\d+) passed, (\d+) failed') {
+        if ([int]$Matches[2] -eq 0) { Test-Ok "triage suite: $($Matches[1]) passed" }
+        else { Test-Fail "triage suite: $($Matches[2]) failed" }
+    } else { Test-Fail 'triage suite produced no tally' }
 }
 
 # -- Catalog integrity ---------------------------------------------------------

@@ -41,7 +41,14 @@ param(
     # A process deleting this many files inside BurstWindowSeconds is called out as a burst.
     [int]$BurstThreshold = 50,
     [int]$BurstWindowSeconds = 300,
-    [switch]$NoPrune
+    [switch]$NoPrune,
+    # Model-assisted triage. ON when a local Ollama is reachable, because a feature nobody opts
+    # into is a feature nobody gets - but it is an ADDITION, never a dependency: -NoTriage, an
+    # absent server, a slow one or a nonsensical answer all produce the same report minus one
+    # clearly-fenced panel.
+    [switch]$NoTriage,
+    [string]$TriageModel = 'mistral-small3.2:24b',
+    [string]$TriageUri = 'http://127.0.0.1:11434'
 )
 $ErrorActionPreference = 'Stop'
 $SysmonLog = 'Microsoft-Windows-Sysmon/Operational'
@@ -339,6 +346,32 @@ try {
 } catch { }
 
 . (Join-Path $PSScriptRoot 'ForensicsReport.Render.ps1')
+. (Join-Path $PSScriptRoot 'ForensicsReport.Triage.ps1')
+
+# ---- optional model-assisted triage -------------------------------------------------------
+# Runs LAST, on the aggregates the facts above already produced, and cannot alter any of them.
+# The liveness probe comes first so an absent server costs 5 seconds rather than a timeout.
+$triage = $null
+if ($NoTriage) {
+    Write-Host '  triage: skipped (-NoTriage)' -ForegroundColor DarkGray
+} elseif (-not (Test-FxLlmAvailable -BaseUri $TriageUri)) {
+    Write-Host '  triage: skipped (no local model reachable)' -ForegroundColor DarkGray
+} else {
+    Write-Host ("  triage: asking {0} ..." -f $TriageModel) -ForegroundColor DarkGray
+    $facts = @{
+        TopProcesses = @($byImage | Select-Object -First 12 | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Count = $_.Count } })
+        Bursts       = @($bursts  | Select-Object -First 8  | ForEach-Object { [pscustomobject]@{ Image = $_.Image; Count = $_.Count; Seconds = $_.Seconds } })
+        Novel        = @($novel   | Select-Object -First 12)
+        Sentinels    = @($sentinelHits | ForEach-Object { [pscustomobject]@{ Image = [IO.Path]::GetFileName($_.Image); Dir = (Split-Path $_.Path -Parent) } } |
+                          Group-Object Image, Dir | Select-Object -First 12 | ForEach-Object {
+                              [pscustomobject]@{ Image = $_.Group[0].Image; Dir = $_.Group[0].Dir; Count = $_.Count } })
+    }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $triage = Get-FxTriage -Facts $facts -Model $TriageModel -BaseUri $TriageUri
+    $sw.Stop()
+    Write-Host ("  triage: {0} finding(s) kept, {1} discarded for citing nothing, {2:N1}s" -f
+        @($triage.Findings).Count, $triage.Rejected, $sw.Elapsed.TotalSeconds) -ForegroundColor DarkGray
+}
 
 # ---- write ---------------------------------------------------------------------------------
 $user = Get-InteractiveUser
@@ -349,7 +382,8 @@ $outPath = Join-Path $OutDir "Deletion Forensics Report - $stamp.html"
 $html = New-ForensicsHtml -Deletes $deletes -ByImage $byImage -ByDir $byDir -Bursts $bursts `
     -Sentinels $sentinelHits -Coverage $coverage -UsnMax $usnMax -Procs $procs `
     -StateChanges $stateChanges -Days $Days -MaxRows $MaxRows -SentinelPatterns $SentinelPatterns `
-    -BurstThreshold $BurstThreshold -Novel $novel -Baseline $baseline -DistinctPairs $seen.Count
+    -BurstThreshold $BurstThreshold -Novel $novel -Baseline $baseline -DistinctPairs $seen.Count `
+    -Triage $triage
 
 [IO.File]::WriteAllText($outPath, $html, (New-Object Text.UTF8Encoding($false)))
 Write-Host "report: $outPath" -ForegroundColor Green
