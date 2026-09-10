@@ -365,9 +365,28 @@ border-left:4px solid var(--warn);border-radius:8px;padding:12px 14px;margin:0 0
     & $add '</div>'
     & $add '<div class="tblwrap"><table><thead><tr><th>Time</th><th>Process</th><th>Path</th></tr></thead><tbody id="tb">'
 
+    # THE ONE HOT LOOP IN THIS FILE. Everything above renders once; this runs MaxRows times,
+    # 4,000 by default, and three conveniences that are free elsewhere are not free here:
+    #
+    #   & $add          a scriptblock invocation per line - 257 ms per 4,000 rows against 10 ms
+    #                   for calling AppendLine directly. Kept everywhere else in this file,
+    #                   where it reads better and costs nothing.
+    #   Split-Path -Leaf  a cmdlet with provider resolution per row - 318 ms against 17 ms for
+    #                   [IO.Path]::GetFileName.
+    #   re-matching the sentinel patterns  15 regexes per row, recomputing a classification the
+    #                   gather loop already did and stored on the record.
+    #
+    # $r.IsSentinel is preferred when present, with the pattern loop kept as the fallback so a
+    # caller that hands over raw records (a test, or an older gather) still gets the right
+    # answer rather than silently losing the highlight.
+    $useFlag = ($rows.Count -gt 0) -and ($null -ne $rows[0].PSObject.Properties['IsSentinel'])
     foreach ($r in $rows) {
-        $isSent = $false
-        foreach ($p in $SentinelPatterns) { if ($r.Path -match $p) { $isSent = $true; break } }
+        if ($useFlag) {
+            $isSent = [bool]$r.IsSentinel
+        } else {
+            $isSent = $false
+            foreach ($p in $SentinelPatterns) { if ($r.Path -match $p) { $isSent = $true; break } }
+        }
         $cls = if ($isSent) { ' class="sent"' } else { '' }
         # The COMMAND LINE, joined from Sysmon event 1 by pid. This was gathered, counted on the
         # console and handed to this function, and then never rendered - so the report showed
@@ -375,9 +394,9 @@ border-left:4px solid var(--warn);border-radius:8px;padding:12px 14px;margin:0 0
         # for. "rm.exe" and "rm -rf /c/Users/Admin/.ollama" are not the same finding.
         $cmd = if ($Procs -and $r.Guid -and $Procs.ContainsKey([string]$r.Guid)) { [string]$Procs[[string]$r.Guid] } else { '' }
         $ttl = if ($cmd) { ' title="' + (ConvertTo-FxHtml $cmd) + '"' } else { '' }
-        & $add ('<tr' + $cls + ' data-i="' + (ConvertTo-FxHtml $r.Image) + '" data-s="' + $(if ($isSent) { '1' } else { '0' }) + '">' +
+        [void]$sb.AppendLine('<tr' + $cls + ' data-i="' + (ConvertTo-FxHtml $r.Image) + '" data-s="' + $(if ($isSent) { '1' } else { '0' }) + '">' +
                 '<td class="t">' + (ConvertTo-FxHtml ('{0:MM-dd HH:mm:ss}' -f $r.Time)) + '</td>' +
-                '<td class="p"' + $ttl + '>' + (ConvertTo-FxHtml (Split-Path $r.Image -Leaf)) + '</td>' +
+                '<td class="p"' + $ttl + '>' + (ConvertTo-FxHtml ([IO.Path]::GetFileName($r.Image))) + '</td>' +
                 '<td class="p">' + (ConvertTo-FxHtml $r.Path) + '</td></tr>')
     }
     & $add '</tbody></table></div>'

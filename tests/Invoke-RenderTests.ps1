@@ -143,6 +143,32 @@ It 'two processes sharing a recycled pid do not share a command line' {
     ($html -notmatch '<td class="t">[34]</td><td class="p">cmd\.exe /c ping')
 }
 
+Write-Host "`n== the hot loop's shortcut must not change what is rendered ==" -ForegroundColor Cyan
+
+It 'using the precomputed IsSentinel flag produces the same page as re-matching the patterns' {
+    # The row loop now trusts $r.IsSentinel when present instead of re-running 15 regexes per
+    # row. That is only safe while the flag and the patterns agree - and in production they do,
+    # because the gather loop computes the flag from the same list. This asserts it rather than
+    # assuming it: the same rows rendered both ways must produce byte-identical HTML.
+    $pats = @('\\\.ssh($|\\)')
+    $withFlag = @($deletes | ForEach-Object {
+        $m = $false
+        foreach ($pat in $pats) { if ($_.Path -match $pat) { $m = $true; break } }
+        [pscustomobject]@{ Time = $_.Time; Pid = $_.Pid; Guid = $_.Guid; User = $_.User
+                           Image = $_.Image; Path = $_.Path; IsSentinel = $m }
+    })
+    $common = @{ ByImage = $byImage; ByDir = $byDir; Bursts = $bursts; Coverage = $coverage
+                 UsnMax = 2GB; Procs = $procsFixture; StateChanges = $stateChanges; Days = 7
+                 MaxRows = 100; SentinelPatterns = $pats; BurstThreshold = 50; Novel = $novel
+                 Baseline = $baseline; DistinctPairs = 9; Triage = $triage }
+    $a = New-ForensicsHtml -Deletes $deletes  -Sentinels $deletes @common
+    $b = New-ForensicsHtml -Deletes $withFlag -Sentinels $deletes @common
+    # The timestamp in the header differs between calls, so compare the rows only.
+    $rowsA = ($a -split "`n" | Where-Object { $_ -like '<tr*' }) -join "`n"
+    $rowsB = ($b -split "`n" | Where-Object { $_ -like '<tr*' }) -join "`n"
+    ($rowsA -eq $rowsB) -and ($rowsA -match 'class="sent"')
+}
+
 Write-Host "`n== the report says whose machine it is describing ==" -ForegroundColor Cyan
 
 It 'an INFERRED user produces a warning banner at the top of the page' {
