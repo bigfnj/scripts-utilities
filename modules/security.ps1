@@ -8,9 +8,21 @@
 # binwalk and foremost are intentionally omitted - firmware carving is a
 # WSL-native workflow with no good Windows equivalents.
 
-function security_desc { "Wireshark (tshark), WinDbg + cdb/kd/ntsd + symbols, WDK (poolmon), optional Ghidra, frida (toolbox venv), deletion forensics (Sysmon + USN)" }
+# Printed by 'bootstrap.ps1 -List' and by get.ps1 - i.e. BEFORE the user agrees to
+# anything - so it must not advertise installs this module does not perform. It used
+# to read as though WinDbg, the WDK/poolmon, cdb/kd/ntsd and Ghidra were all
+# installed here; only WinDbg is. The rest are detected on the machine and wrapped
+# into native\bin, which is a very different consent question (nothing is downloaded,
+# and if they are absent you get a warning, not a tool).
+function security_desc { "installs Wireshark (tshark), etl2pcapng, WinDbg + MS symbol server, frida (toolbox venv); detects and wraps only: cdb/kd/ntsd, poolmon (WDK), Ghidra, Npcap; reports deletion-forensics health (Sysmon + USN)" }
 
 function security_install {
+    # Failure count for the catalog-driven installs in this group. They were each
+    # piped to Out-Null, so "security group complete" printed even when all of them
+    # failed. $attempted rather than a literal 3, because TOOLBOX_SKIP_WIRESHARK
+    # legitimately removes one of them.
+    $failed = 0
+    $attempted = 0
     # Wireshark/tshark (catalog: winget-machine) - needs elevation, so it's
     # opt-out: set TOOLBOX_SKIP_WIRESHARK=1 (a User env var) to skip it
     # permanently without editing anything. Install-CatalogItem handles the
@@ -19,7 +31,11 @@ function security_install {
         Write-Skip "Wireshark/tshark skipped (TOOLBOX_SKIP_WIRESHARK set)"
     } else {
         # Note: installer may prompt to install Npcap; accept it for live capture.
-        Install-CatalogItem -Item (Get-CatalogItem -Name "tshark") | Out-Null
+        $attempted++
+        if (-not (Install-CatalogItem -Item (Get-CatalogItem -Name "tshark"))) {
+            $failed++
+            Write-Warn "install failed: tshark (Wireshark)"
+        }
         if (-not (Test-CommandAvailable "tshark")) {
             Write-Warn "Wireshark installed, but tshark.exe was not found on PATH"
         }
@@ -31,7 +47,11 @@ function security_install {
     # gives a channel-compliant, driver-free capture path (pktmon -> etl2pcapng
     # -> tshark).
     security_register_npcap
-    Install-CatalogItem -Item (Get-CatalogItem -Name "etl2pcapng") | Out-Null
+    $attempted++
+    if (-not (Install-CatalogItem -Item (Get-CatalogItem -Name "etl2pcapng"))) {
+        $failed++
+        Write-Warn "install failed: etl2pcapng"
+    }
     if (-not (Test-CommandAvailable "etl2pcapng")) {
         Write-Warn "etl2pcapng installed but not visible on PATH in this session"
     }
@@ -56,14 +76,24 @@ function security_install {
 
     # frida-tools (catalog: pip-toolbox) - dynamic instrumentation. Installed into
     # the toolbox venv because frida's Python binding must match the target Python.
-    Install-CatalogItem -Item (Get-CatalogItem -Name "frida") | Out-Null
+    $attempted++
+    if (-not (Install-CatalogItem -Item (Get-CatalogItem -Name "frida"))) {
+        $failed++
+        Write-Warn "install failed: frida (toolbox venv)"
+    }
 
     # Deletion forensics (Sysmon + a resized USN journal). Detect-and-report only, like
     # Ghidra: it installs a kernel driver and needs elevation, so it stays an explicit
     # opt-in helper rather than something a bootstrap run does to you.
     security_report_deletion_forensics
 
-    Write-Ok "security group complete"
+    # Only the three catalog installs above are counted. The detect-and-wrap helpers
+    # warn for themselves and a missing WDK/Ghidra/Npcap is not an install failure.
+    if ($failed -eq 0) {
+        Write-Ok "security group complete"
+    } else {
+        Write-Err "security group INCOMPLETE: $failed of $attempted catalog install(s) failed (see the warnings above)"
+    }
 }
 
 function security_report_deletion_forensics {
@@ -110,6 +140,35 @@ function security_report_deletion_forensics {
 function security_install_debugger {
     # WinDbg - Microsoft's crash-dump / live user- and kernel-mode debugger. Shipped
     # as an MSIX app in winget, so it installs at user scope without elevation.
+    #
+    # PROBE FIRST, because provenance cannot be recovered afterwards:
+    # Install-WingetTool returns $true for three different outcomes (binary already
+    # on PATH / winget already lists it / we really did install it). Getting this
+    # wrong has teeth - WinDbg is the only entry this module records with
+    # install_method 'winget', and uninstall-toolbox.ps1 -RemoveWingetTools
+    # winget-uninstalls exactly those when installed_by_toolbox is true. The
+    # detect-only registrations below (Ghidra, poolmon, npcap) are protected by
+    # install_method 'existing'; WinDbg is not, so a WinDbg the toolbox merely FOUND
+    # would be uninstalled out from under its owner.
+    #
+    # 'WinDbgX' or 'winget list' - never Test-CommandAvailable 'windbg': a previous
+    # bootstrap run wrote its own native\bin\windbg.cmd wrapper, and
+    # security_install_console_debuggers wraps the classic SDK windbg.exe under the
+    # same name, so 'windbg' answers for a package that is not installed. 'WinDbgX'
+    # is the MSIX alias and nothing in this repo ever creates it.
+    #
+    # On a re-run this probe necessarily says "pre-existing" about a WinDbg the
+    # toolbox installed last time; Add-WinManifest handles that by never downgrading
+    # a recorded true back to false.
+    $preexisting = $false
+    if (-not $script:DryRun) {
+        if (Test-CommandAvailable "WinDbgX") {
+            $preexisting = $true
+        } elseif (Test-CommandAvailable "winget") {
+            $listed = winget list --id Microsoft.WinDbg -e --accept-source-agreements 2>&1
+            $preexisting = ($LASTEXITCODE -eq 0) -and ($listed -match [regex]::Escape("Microsoft.WinDbg"))
+        }
+    }
     Install-WingetTool -Id "Microsoft.WinDbg" -Binary "WinDbgX" -Name "WinDbg" | Out-Null
 
     # Resolve the launcher the MSIX put on PATH (a WindowsApps alias) and wrap it as
@@ -134,7 +193,8 @@ function security_install_debugger {
         Sync-EnvPath
         Add-WinManifest -Name "WinDbg" -Binary "windbg" -Group "security" -Method "winget" `
             -Detect "winget list --id Microsoft.WinDbg -e" -WingetId "Microsoft.WinDbg" `
-            -Notes "Windows crash-dump/live debugger; e.g. windbg -z crash.dmp -c '!analyze -v'. Symbols via _NT_SYMBOL_PATH; capture dumps with procdump (Sysinternals)"
+            -Notes "Windows crash-dump/live debugger; e.g. windbg -z crash.dmp -c '!analyze -v'. Symbols via _NT_SYMBOL_PATH; capture dumps with procdump (Sysinternals)" `
+            -InstalledByToolbox:(-not $preexisting)
     } else {
         Write-Warn "WinDbg installed but its launcher is not on PATH yet - open a new shell and re-run '.\bootstrap.ps1 -Only security' to register it"
     }
@@ -223,10 +283,15 @@ function security_install_ghidra {
 
         # Version comes from the folder name (e.g. ghidra_12.1.2_PUBLIC); never launch
         # the GUI just to probe a version.
+        # -InstalledByToolbox:$false is the measurement, not a formality: this branch
+        # only runs when Find-GhidraInstall FOUND a copy. The parameter defaults to
+        # $true, so omitting it recorded every detected tool as toolbox-installed -
+        # an assertion the code had no basis for.
         Add-WinManifest -Name "Ghidra" -Binary "ghidraRun" -Group "security" -Method "existing" `
             -Scope "toolbox" `
             -Detect "'$($existing.Name)'" `
-            -Notes "NSA RE suite ($($existing.FullName)); ghidraRun = GUI, analyzeHeadless = headless"
+            -Notes "NSA RE suite ($($existing.FullName)); ghidraRun = GUI, analyzeHeadless = headless" `
+            -InstalledByToolbox:$false
         return
     }
     if ($script:DryRun) {
@@ -320,10 +385,13 @@ function security_wrap_poolmon {
         Write-Ok "poolmon -> $poolmonPath"
     }
     Sync-EnvPath
+    # Detected, not installed: this function only wraps a poolmon.exe the WDK already
+    # put on disk (install-machine-scope.ps1 does the installing, as SYSTEM).
     Add-WinManifest -Name "poolmon" -Binary "poolmon" -Group "security" -Method "existing" `
         -Scope "machine" `
         -Detect "'$poolmonPath'" `
-        -Notes "Windows pool-tag monitor (WDK); top pool consumers without a crash dump. Run elevated: poolmon /b (sort by bytes) /r (nonpaged) - see docs/tools-reference.md"
+        -Notes "Windows pool-tag monitor (WDK); top pool consumers without a crash dump. Run elevated: poolmon /b (sort by bytes) /r (nonpaged) - see docs/tools-reference.md" `
+        -InstalledByToolbox:$false
 }
 
 function Find-DebuggersInstall {
@@ -395,10 +463,16 @@ function security_install_console_debuggers {
     $env:WINDBG_DEBUGGERS_PATH = $dbgDir
 
     Sync-EnvPath
+    # Detect-and-wrap only (this function never installs the SDK), and the escaping in
+    # -Notes is load-bearing: `` in a double-quoted string emits a LITERAL backtick, so
+    # the manifest used to ship  -c '`.logopen ...'  - a command that dies on paste with
+    # "The term '`.logopen' is not recognized". Only the $$ needs escaping here.
+    # lib\common.ps1 has the same sentence, correctly, in its here-string.
     Add-WinManifest -Name "cdb" -Binary "cdb" -Group "security" -Method "existing" `
         -Scope "machine" `
         -Detect "cdb -version 2>&1 | Select-Object -First 1" `
-        -Notes "Console debuggers from Debugging Tools for Windows (Windows SDK): cdb=user-mode, kd=kernel-mode, ntsd=NT Symbolic Debugger. Also wrapped: windbg (classic GUI), gflags (Driver Verifier front-end), dumpchk. Scripted: cdb -z dump.dmp -c '``.logopen out.txt; `$`$><script.txt; q'. pooltag.txt at Debuggers\x64\triage\. _NT_SYMBOL_PATH auto-resolves OS symbols."
+        -Notes "Console debuggers from Debugging Tools for Windows (Windows SDK): cdb=user-mode, kd=kernel-mode, ntsd=NT Symbolic Debugger. Also wrapped: windbg (classic GUI), gflags (Driver Verifier front-end), dumpchk. Scripted: cdb -z dump.dmp -c '.logopen out.txt; `$`$><script.txt; q'. pooltag.txt at Debuggers\x64\triage\. _NT_SYMBOL_PATH auto-resolves OS symbols." `
+        -InstalledByToolbox:$false
 }
 
 function security_register_npcap {
@@ -417,7 +491,8 @@ function security_register_npcap {
         Add-WinManifest -Name "npcap" -Binary "npcap" -Group "security" -Method "existing" `
             -Scope "machine" `
             -Detect "(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\NpcapInst','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\NpcapInst' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty DisplayVersion)" `
-            -Notes "packet-capture driver (NDIS); enables 'tshark -i' live capture. No winget package - see docs/agent-rules.md"
+            -Notes "packet-capture driver (NDIS); enables 'tshark -i' live capture. No winget package - see docs/agent-rules.md" `
+            -InstalledByToolbox:$false
         return
     }
     Write-Warn "Npcap not installed: tshark can READ captures but 'tshark -i' live capture is unavailable"

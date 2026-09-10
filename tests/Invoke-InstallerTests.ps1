@@ -1,7 +1,14 @@
 #Requires -Version 5.1
 <#
     Tests for lib\SysmonConfig.ps1 - the rendering and validation behind the deletion-forensics
-    sensor.
+    sensor - and for lib\catalog.ps1 / lib\common.ps1, the installer plumbing that decides
+    whether a bootstrap run is allowed to call itself a success.
+
+    Both halves are here for the same reason: A REPORT THAT CANNOT SAY "NO" IS NOT A REPORT.
+    Install-CatalogGroup piped every per-item $true/$false to Out-Null, so a run in which
+    EVERY winget install failed still printed "cli-tools group complete" and then "bootstrap
+    complete". Get-Catalog read a schema_version and never compared it to anything. Both are
+    the same failure shape as the sensor below, one layer up.
 
     A VALIDATOR THAT HAS NEVER REJECTED ANYTHING IS NOT A VALIDATOR. These functions exist
     because for a year the shipped config named one specific profile in 24 rules, so on any
@@ -21,6 +28,17 @@ param()
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $repoRoot 'lib\SysmonConfig.ps1')
+# common.ps1 and catalog.ps1 define functions only - no side effects on dot-source - so they
+# are importable here. $script:MANIFEST, which common.ps1 points at the REAL manifest, is
+# redirected to a scratch file below before anything can write to it.
+. (Join-Path $repoRoot 'lib\common.ps1')
+. (Join-Path $repoRoot 'lib\catalog.ps1')
+. (Join-Path $repoRoot 'modules\cli-tools.ps1')
+
+$script:DryRun = $false
+$scratch = Join-Path ([IO.Path]::GetTempPath()) ("installer-tests-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $scratch -Force | Out-Null
+$script:MANIFEST = Join-Path $scratch 'tools.json'
 
 $script:Pass = 0; $script:Fail = 0
 function It {
@@ -104,6 +122,193 @@ It 'every problem is reported, not just the first' {
              -ProfilePath 'C:\Users\Nobody' -DirectoryExists $fakeFs
     $p.Count -ge 2
 }
+
+Write-Host "`n== a group install must not report success after failing ==" -ForegroundColor Cyan
+
+# Stubs live inside & { } so they cannot leak into the sections above or below. PowerShell
+# resolves function names up the CALL scope chain, so Install-CatalogGroup - defined in this
+# file's scope by the dot-source - still finds the Install-CatalogItem defined in here.
+& {
+    $items = @(
+        [pscustomobject]@{ name = 'alpha'; channel = 'winget-user'; id = 'Test.Alpha' },
+        [pscustomobject]@{ name = 'beta';  channel = 'winget-user'; id = 'Test.Beta'  },
+        [pscustomobject]@{ name = 'gamma'; channel = 'winget-user'; id = 'Test.Gamma' }
+    )
+    # A group the suite describes rather than whatever catalog.json happens to hold today.
+    function Get-CatalogTools    { param([string]$Group) return $items }
+    function Install-CatalogItem { param($Item) return (-not ($script:failing -contains $Item.name)) }
+    function Write-Warn          { param([string]$Msg) }   # keep the per-item noise out of the tally
+
+    It 'a group in which everything installs reports 0 failures' {
+        # The positive control. Without it, a function that returns the item count always
+        # looks like it is detecting failures.
+        $script:failing = @()
+        (Install-CatalogGroup -Group 'test') -eq 0
+    }
+    It 'a group in which EVERY install fails does NOT report success' {
+        # The original bug, exactly: all three fail, the caller prints "group complete".
+        $script:failing = @('alpha', 'beta', 'gamma')
+        (Install-CatalogGroup -Group 'test') -eq 3
+    }
+    It 'a group counts only the installs that actually failed' {
+        $script:failing = @('beta')
+        (Install-CatalogGroup -Group 'test') -eq 1
+    }
+    It 'the failure count is a plain number, not a pipeline of leftovers' {
+        # Install-CatalogItem is called for its return value; if anything else in the group
+        # loop leaks to the pipeline the caller gets an array and `-eq 0` starts lying.
+        $script:failing = @('alpha')
+        $r = Install-CatalogGroup -Group 'test'
+        (@($r).Count -eq 1) -and ($r -is [int])
+    }
+}
+
+Write-Host "`n== schema_version is validated, not merely stored ==" -ForegroundColor Cyan
+
+$realCatalogPath = Get-CatalogPath
+$script:CatalogOverride = $null
+function Get-CatalogPath {
+    if ($script:CatalogOverride) { return $script:CatalogOverride }
+    return $realCatalogPath
+}
+function New-TempCatalog {
+    param([string]$Json)
+    $p = Join-Path $scratch ("catalog-" + [guid]::NewGuid().ToString('N') + ".json")
+    Set-Content -LiteralPath $p -Value $Json -Encoding UTF8
+    return $p
+}
+
+It 'the shipped catalog.json is accepted' {
+    # Positive control: a validator that rejects everything is as useless as one that
+    # rejects nothing, and this one gates every install in the repo.
+    $script:CatalogOverride = $null
+    @((Get-Catalog).tools).Count -gt 0
+}
+It 'the shipped catalog.json declares the schema version this code implements' {
+    $script:CatalogOverride = $null
+    [int](Get-Catalog).schema_version -eq $script:CatalogSchemaVersion
+}
+It 'a catalog with an UNKNOWN schema_version is REJECTED' {
+    # A future reshape deserialises perfectly well: every field this installer asks for comes
+    # back $null and tools are silently skipped, with no error anywhere. That is why the
+    # version has to be compared and not just carried.
+    $script:CatalogOverride = New-TempCatalog '{ "schema_version": 99, "tools": [], "machine_scope_ids": ["x"] }'
+    $rejected = $false
+    try { Get-Catalog | Out-Null } catch { $rejected = $_.Exception.Message -match 'schema_version' }
+    $script:CatalogOverride = $null
+    $rejected
+}
+It 'a catalog with NO schema_version at all is REJECTED' {
+    $script:CatalogOverride = New-TempCatalog '{ "tools": [], "machine_scope_ids": ["x"] }'
+    $rejected = $false
+    try { Get-Catalog | Out-Null } catch { $rejected = $_.Exception.Message -match 'schema_version' }
+    $script:CatalogOverride = $null
+    $rejected
+}
+
+Write-Host "`n== consent-facing descriptions must match what is installed ==" -ForegroundColor Cyan
+
+It 'cli-tools_desc names every tool in the cli-tools catalog group' {
+    # This string is printed by 'bootstrap.ps1 -List' and by get.ps1, i.e. BEFORE the user
+    # agrees to anything. It listed 13 tools while the group held 15, hiding pwsh - a
+    # MACHINE-scope install that prompts for elevation - and curl-libressl.
+    $desc = cli-tools_desc
+    $script:CatalogOverride = $null
+    $missing = @()
+    foreach ($t in (Get-CatalogTools -Group 'cli-tools')) {
+        # A tool may be named in the description by catalog name or by binary (git-delta is
+        # listed as "delta", which is what the user actually types).
+        $names = @($t.name, $t.binary) | Where-Object { $_ }
+        if (-not (@($names | Where-Object { $desc -match ('(^|[\s,])' + [regex]::Escape($_) + '([\s,]|$)') }).Count)) {
+            $missing += $t.name
+        }
+    }
+    if ($missing.Count) { Write-Host ("       not named in cli-tools_desc: " + ($missing -join ', ')) -ForegroundColor DarkYellow }
+    $missing.Count -eq 0
+}
+
+Write-Host "`n== manifest provenance is measured, not assumed ==" -ForegroundColor Cyan
+
+$securityPs1 = Join-Path $repoRoot 'modules\security.ps1'
+$securityAst = [System.Management.Automation.Language.Parser]::ParseFile($securityPs1, [ref]$null, [ref]$null)
+$addCalls = @($securityAst.FindAll({
+    param($n)
+    ($n -is [System.Management.Automation.Language.CommandAst]) -and ($n.GetCommandName() -eq 'Add-WinManifest')
+}, $true))
+
+It 'every Add-WinManifest call in modules\security.ps1 states its provenance' {
+    # Add-WinManifest's -InstalledByToolbox DEFAULTS TO $true, so omitting it records a tool
+    # the toolbox merely DETECTED as one the toolbox installed. uninstall-toolbox.ps1
+    # -RemoveWingetTools then acts on that claim: install_method 'existing' protects
+    # Ghidra/poolmon/npcap, but WinDbg is recorded as 'winget' and would really be
+    # uninstalled. Install-CatalogItem gets this right by probing first; these did not.
+    $silent = @($addCalls | Where-Object {
+        -not ($_.CommandElements | Where-Object {
+            ($_ -is [System.Management.Automation.Language.CommandParameterAst]) -and
+            ($_.ParameterName -eq 'InstalledByToolbox')
+        })
+    })
+    if ($silent.Count) {
+        foreach ($c in $silent) { Write-Host ("       line {0}: {1}" -f $c.Extent.StartLineNumber, $c.GetCommandName()) -ForegroundColor DarkYellow }
+    }
+    ($addCalls.Count -ge 5) -and ($silent.Count -eq 0)
+}
+
+It 'no manifest note ships an escaped literal backtick' {
+    # `` inside a double-quoted PowerShell string emits ONE LITERAL BACKTICK, so the cdb
+    # entry used to put  -c '`.logopen out.txt; ...'  into the manifest: a command that dies
+    # on paste with "The term '`.logopen' is not recognized". lib\common.ps1 carries the same
+    # sentence in a here-string and gets it right.
+    $notes = @()
+    foreach ($c in $addCalls) {
+        for ($i = 0; $i -lt $c.CommandElements.Count - 1; $i++) {
+            $e = $c.CommandElements[$i]
+            if (($e -is [System.Management.Automation.Language.CommandParameterAst]) -and ($e.ParameterName -eq 'Notes')) {
+                $notes += $c.CommandElements[$i + 1].Extent.Text
+            }
+        }
+    }
+    $broken = @($notes | Where-Object { $_ -match '``' })
+    ($notes.Count -ge 5) -and ($broken.Count -eq 0)
+}
+
+It 'Add-WinManifest records provenance verbatim and does NOT execute the detect string' {
+    # Two things at once, because they were one line apart. The version-scraping block ran
+    # Invoke-Expression on every tool's detect string on every bootstrap - a process launch
+    # per tool - to fill an installed_version field that nothing has ever read.
+    $marker = Join-Path $scratch 'detect-ran.txt'
+    Remove-Item -LiteralPath $marker, $script:MANIFEST -Force -ErrorAction SilentlyContinue
+    $detect = "Set-Content -LiteralPath '$marker' -Value ran -Encoding ASCII"
+    Add-WinManifest -Name 'probe' -Binary 'probe' -Group 'test' -Method 'existing' `
+        -Detect $detect -InstalledByToolbox:$false
+    $entry = Get-Content -LiteralPath $script:MANIFEST -Raw -Encoding UTF8 | ConvertFrom-Json
+    (-not (Test-Path -LiteralPath $marker)) -and
+        ($entry.installed_by_toolbox -eq $false) -and
+        ($entry.detect -eq $detect)
+}
+
+It 'a re-run cannot disown a tool the toolbox installed' {
+    # Every caller establishes provenance by probing BEFORE installing, so on the
+    # second bootstrap run the tool is already there and the probe honestly reports
+    # "pre-existing" about something the toolbox itself installed. If that were
+    # written through, uninstall-toolbox.ps1 -RemoveWingetTools would stop removing
+    # it - the toolbox would leak every tool it had ever installed, one re-run later.
+    Remove-Item -LiteralPath $script:MANIFEST -Force -ErrorAction SilentlyContinue
+    Add-WinManifest -Name 'ours' -Binary 'ours' -Group 'test' -Method 'winget' -Detect '' -InstalledByToolbox:$true
+    Add-WinManifest -Name 'ours' -Binary 'ours' -Group 'test' -Method 'winget' -Detect '' -InstalledByToolbox:$false
+    $e = @(Get-Content -LiteralPath $script:MANIFEST -Raw -Encoding UTF8 | ConvertFrom-Json)
+    ($e.Count -eq 1) -and ($e[0].installed_by_toolbox -eq $true)
+}
+It 'a detected tool is still recorded as detected on a re-run' {
+    # The other direction has to keep working, or "sticky" just means "always true".
+    Remove-Item -LiteralPath $script:MANIFEST -Force -ErrorAction SilentlyContinue
+    Add-WinManifest -Name 'theirs' -Binary 'theirs' -Group 'test' -Method 'existing' -Detect '' -InstalledByToolbox:$false
+    Add-WinManifest -Name 'theirs' -Binary 'theirs' -Group 'test' -Method 'existing' -Detect '' -InstalledByToolbox:$false
+    $e = @(Get-Content -LiteralPath $script:MANIFEST -Raw -Encoding UTF8 | ConvertFrom-Json)
+    ($e.Count -eq 1) -and ($e[0].installed_by_toolbox -eq $false)
+}
+
+Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host ("`n{0} passed, {1} failed`n" -f $script:Pass, $script:Fail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
 exit $(if ($script:Fail) { 1 } else { 0 })

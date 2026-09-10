@@ -4,7 +4,6 @@
 if (-not (Get-Variable -Name DryRun -Scope Script -ErrorAction SilentlyContinue)) {
     $script:DryRun = $false
 }
-$script:TODAY    = (Get-Date -Format 'yyyy-MM-dd')
 $script:MANIFEST = Join-Path $PSScriptRoot "..\manifest\tools.json"
 
 # -- Logging -------------------------------------------------------------------
@@ -199,13 +198,6 @@ function Get-ToolboxPython {
     return $null
 }
 
-# Wrap the toolbox venv's console-script executables into native\bin so the venv
-# CLIs (frida, jupyter-lab, sqlite-utils, csvkit, playwright, ...) are callable by
-# name from any shell WITHOUT putting the venv Scripts dir on the persistent PATH.
-# That dir also holds python.exe, and exposing a 3.11 interpreter on PATH is what
-# trips corporate "old Python" compliance scanners - so the interpreter stays off
-# PATH (reachable via $env:TOOLBOX_PYTHON) and only the CLIs are wrapped. The
-# python*/pythonw*/pip* launchers are deliberately excluded.
 function Set-NodeSystemCaBundle {
     # Make node/npm trust the OS certificate store so 'npm install' works behind
     # corporate TLS interception. node ships its own CA bundle and ignores the
@@ -249,6 +241,13 @@ function Set-NodeSystemCaBundle {
     $env:NODE_EXTRA_CA_CERTS = $bundle
 }
 
+# Wrap the toolbox venv's console-script executables into native\bin so the venv
+# CLIs (frida, jupyter-lab, sqlite-utils, csvkit, playwright, ...) are callable by
+# name from any shell WITHOUT putting the venv Scripts dir on the persistent PATH.
+# That dir also holds python.exe, and exposing a 3.11 interpreter on PATH is what
+# trips corporate "old Python" compliance scanners - so the interpreter stays off
+# PATH (reachable via $env:TOOLBOX_PYTHON) and only the CLIs are wrapped. The
+# python*/pythonw*/pip* launchers are deliberately excluded.
 function New-VenvCliWrappers {
     $root = if ($env:CODEX_TOOLBOX) { $env:CODEX_TOOLBOX } else { "$env:LOCALAPPDATA\DevToolbox" }
     $venvScripts = Join-Path $root "python\.venv\Scripts"
@@ -352,7 +351,10 @@ function Add-WinManifest {
         [string]$Scope = "user",
         [string]$WingetId = "",
         [string]$Notes    = "",
-        [bool]$InstalledByToolbox = $true   # provenance: $false if it pre-existed
+        # Provenance: $false if the tool pre-existed. Every caller that can tell the
+        # difference MUST pass this - the default is the optimistic answer, and the
+        # uninstaller acts on it.
+        [bool]$InstalledByToolbox = $true
     )
     if ($script:DryRun) {
         Write-Info "[DRY-RUN] would manifest_add $Name"
@@ -369,16 +371,28 @@ function Add-WinManifest {
         }
     }
 
-    $version = ""
-    try {
-        $match = Invoke-Expression $Detect 2>&1 |
-            Select-String '[0-9]+\.[0-9]+[.0-9]*' |
-            Select-Object -First 1
-        if ($match -and $match.Matches.Count -gt 0) {
-            $version = $match.Matches[0].Value
-        }
-    } catch {}
+    # PROVENANCE IS STICKY: it is a fact about who installed the tool, not about what
+    # the machine looks like right now. Every caller establishes it by probing before
+    # installing - which means on the SECOND bootstrap run the tool is already there
+    # and the probe says "pre-existing" about something the toolbox itself installed.
+    # Left alone, a re-run would quietly disown every tool and uninstall-toolbox.ps1
+    # -RemoveWingetTools would then leave all of them behind. So false -> true is a
+    # measurement we accept, and true -> false is one we refuse.
+    $wasOurs = $false
+    foreach ($prev in $entries) {
+        if (($prev.name -eq $Name) -and
+            ($prev.PSObject.Properties.Name -contains 'installed_by_toolbox') -and
+            $prev.installed_by_toolbox) { $wasOurs = $true; break }
+    }
+    $ours = $InstalledByToolbox -or $wasOurs
 
+    # No version probe here. This used to Invoke-Expression $Detect for every tool
+    # just to scrape a version number into installed_version - which nothing in this
+    # repo, the smoke test, the uninstaller or the GUI has ever read. It cost a
+    # process launch per tool on every bootstrap (and it launched them under
+    # Invoke-Expression, from a string in catalog.json). The same is true of
+    # last_verified and of status, which was the literal "core" on every entry and so
+    # measured nothing. `detect` stays: it is the recipe, and it IS read.
     $entry = [ordered]@{
         name              = $Name
         binary            = $Binary
@@ -386,12 +400,9 @@ function Add-WinManifest {
         scope             = $Scope
         install_method    = $Method
         detect            = $Detect
-        status            = "core"
         notes             = $Notes
         winget_id         = $WingetId
-        last_verified     = $script:TODAY
-        installed_version = "$version"
-        installed_by_toolbox = $InstalledByToolbox
+        installed_by_toolbox = $ours
     }
 
     $list = [System.Collections.Generic.List[object]]::new()
@@ -439,7 +450,6 @@ function Write-AgentDiscovery {
     $toolboxRoot   = if ($env:CODEX_TOOLBOX) { $env:CODEX_TOOLBOX }
                      else { "$env:LOCALAPPDATA\DevToolbox" }
     $toolboxManifest = Join-Path $toolboxRoot "toolbox-manifest.json"
-    $activatePs1   = Join-Path $toolboxRoot "scripts\Activate-CodexToolbox.ps1"
 
     $body = @"
 ## Windows dev toolbox - scripts-utilities

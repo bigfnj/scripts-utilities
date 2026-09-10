@@ -4,9 +4,19 @@
 # installed via lib/catalog.ps1. Verify an ID with `winget search <name>` if an
 # install fails after a package rename, then fix it in catalog.json.
 
-function cli-tools_desc { "gh, fzf, bat, delta, just, hyperfine, sops, age, tokei, podman, docker-compose, yt-dlp, deno" }
+# Printed by 'bootstrap.ps1 -List' and by get.ps1 - i.e. BEFORE the user agrees to
+# anything - so it has to name what will actually be installed. It listed 13 tools
+# while the catalog group held 15, quietly omitting pwsh (a MACHINE-scope install
+# that needs elevation) and curl-libressl. Invoke-InstallerTests.ps1 now fails if
+# this string and the catalog group drift apart again.
+function cli-tools_desc { "gh, pwsh, fzf, bat, delta, just, hyperfine, sops, age, tokei, podman, docker-compose, curl-libressl, yt-dlp, deno" }
 
 function cli-tools_install {
-    Install-CatalogGroup -Group "cli-tools"
-    Write-Ok "cli-tools group complete"
+    $failed = Install-CatalogGroup -Group "cli-tools"
+    $total  = @(Get-CatalogTools -Group "cli-tools").Count
+    if ($failed -eq 0) {
+        Write-Ok "cli-tools group complete ($total tools)"
+    } else {
+        Write-Err "cli-tools group INCOMPLETE: $failed of $total failed to install (see the warnings above)"
+    }
 }

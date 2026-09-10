@@ -11,10 +11,29 @@ function Get-CatalogPath {
     Join-Path (Split-Path $PSScriptRoot) "catalog.json"
 }
 
+# The only catalog schema this code knows how to read. Bump it here and in
+# catalog.json together, in the same commit that changes the shape.
+$script:CatalogSchemaVersion = 1
+
 function Get-Catalog {
+    # Reject a catalog this code cannot read, rather than silently installing a
+    # subset of it. catalog.json carried a schema_version with zero readers, which
+    # is worse than not having one: a future reshape (renamed 'channel' values, a
+    # nested tools list) would deserialise fine, produce $null for every field the
+    # installer asks about, and skip tools without a single error. pc-maintenance
+    # enforces its own at PMManifest.ps1:25-26; this is the same check.
     $path = Get-CatalogPath
     if (-not (Test-Path -LiteralPath $path)) { throw "catalog not found: $path" }
-    return (Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json)
+    $catalog = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+    if (-not $catalog) { throw "catalog is empty or not valid JSON: $path" }
+    if (-not ($catalog.PSObject.Properties.Name -contains 'schema_version')) {
+        throw "catalog has no schema_version (expected $script:CatalogSchemaVersion): $path"
+    }
+    if ([int]$catalog.schema_version -ne $script:CatalogSchemaVersion) {
+        throw ("catalog schema_version {0} is not supported by this checkout (expected {1}): {2}" -f
+               $catalog.schema_version, $script:CatalogSchemaVersion, $path)
+    }
+    return $catalog
 }
 
 function Get-CatalogTools {
@@ -126,8 +145,21 @@ function Install-CatalogItem {
 }
 
 function Install-CatalogGroup {
+    # Install every item in a group and RETURN THE NUMBER THAT FAILED.
+    #
+    # Install-CatalogItem has always returned $true/$false, and this function threw
+    # every one of those away with `| Out-Null`. Callers then printed "<group> group
+    # complete" unconditionally and bootstrap finished with "bootstrap complete", so
+    # a run in which every single winget install failed was indistinguishable from a
+    # clean one. The count is the caller's evidence; a caller that ignores it is back
+    # where we started.
     param([Parameter(Mandatory)][string]$Group)
+    $failed = 0
     foreach ($item in (Get-CatalogTools -Group $Group)) {
-        Install-CatalogItem -Item $item | Out-Null
+        if (-not (Install-CatalogItem -Item $item)) {
+            $failed++
+            Write-Warn "install failed: $($item.name) [$($item.channel) $($item.id)]"
+        }
     }
+    return $failed
 }

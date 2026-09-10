@@ -11,11 +11,24 @@ function extras_install {
     # with no CLI, so it sets register_manifest=false there (the manifest's
     # Phase-1 binary check would otherwise fail); it is validated by the
     # toolbox-venv import check in scripts/smoke-test.ps1.
-    foreach ($item in (Get-CatalogTools -Group "extras")) {
+    $items  = @(Get-CatalogTools -Group "extras")
+    $failed = 0
+    foreach ($item in $items) {
         $ok = Install-CatalogItem -Item $item
-        if (-not $ok -and $item.name -eq "pytoshop") {
-            Write-Warn "pytoshop not installed - PSD authoring unavailable"
+        if (-not $ok) {
+            $failed++
+            if ($item.name -eq "pytoshop") {
+                Write-Warn "pytoshop not installed - PSD authoring unavailable"
+            } else {
+                Write-Warn "install failed: $($item.name) [$($item.channel) $($item.id)]"
+            }
         }
     }
-    Write-Ok "extras group complete"
+    # This loop already had the right per-item shape; what it did not do was
+    # AGGREGATE, so every item could fail and "extras group complete" still printed.
+    if ($failed -eq 0) {
+        Write-Ok "extras group complete ($($items.Count) tools)"
+    } else {
+        Write-Err "extras group INCOMPLETE: $failed of $($items.Count) failed to install (see the warnings above)"
+    }
 }

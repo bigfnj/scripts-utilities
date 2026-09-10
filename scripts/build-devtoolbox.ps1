@@ -470,7 +470,8 @@ function Install-PlaywrightBrowsers {
 }
 
 function Install-Sysinternals {
-    $dest = Join-Path $Root "sysinternals"
+    $dest    = Join-Path $Root "sysinternals"
+    $staging = Join-Path $Root "downloads\sysinternals-staging"
     Ensure-Directory $dest
     $zip = Join-Path $Root "downloads\SysinternalsSuite.zip"
     if ($DryRun) {
@@ -479,22 +480,62 @@ function Install-Sysinternals {
     }
     # Best-effort: the Sysinternals CDN can be flaky or blocked on some networks. A
     # failed download or signature check must not abort the whole toolbox build -
-    # warn and skip (rerun to retry). Unverified binaries are never kept.
+    # warn and skip (rerun to retry).
+    #
+    # Everything is unpacked into a STAGING directory and every executable is
+    # verified there, so nothing unverified is ever visible under $dest. The old
+    # shape expanded ~151 executables straight into $dest and then checked the
+    # Authenticode signature of exactly ONE of them (sigcheck64.exe); on failure it
+    # warned and returned without deleting anything. The binaries stayed, so
+    # Run-Smoke's `Test-Path sysinternals\sigcheck64.exe` gate went true and ran the
+    # readiness smoke against unverified files - and passed. The build reported a
+    # verification it had never done on 150 of the 151 files.
     try {
         Get-Download -Url "https://download.sysinternals.com/files/SysinternalsSuite.zip" -OutFile $zip -MinimumBytes 100MB
-        Expand-Archive -Path $zip -DestinationPath $dest -Force
-        $sigcheck = Join-Path $dest "sigcheck64.exe"
-        if (-not (Test-Path $sigcheck) -or (Get-AuthenticodeSignature $sigcheck).Status -ne "Valid") {
-            throw "signature verification failed for $sigcheck"
+        if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
+        New-Item -ItemType Directory -Path $staging -Force | Out-Null
+        Expand-Archive -Path $zip -DestinationPath $staging -Force
+
+        $staged = @(Get-ChildItem -LiteralPath $staging -Filter "*.exe" -File -ErrorAction SilentlyContinue)
+        if ($staged.Count -eq 0) { throw "archive expanded to no executables" }
+        # EVERY executable, not a sample. A tampered or corrupt file anywhere in the
+        # suite is exactly what a one-file check waves through, and these are tools
+        # people run elevated against a compromised machine.
+        $bad = @($staged | Where-Object { (Get-AuthenticodeSignature -LiteralPath $_.FullName).Status -ne "Valid" })
+        if ($bad.Count) {
+            throw ("Authenticode verification failed for {0} of {1} executables ({2}{3})" -f
+                   $bad.Count, $staged.Count,
+                   (($bad | Select-Object -First 5 | ForEach-Object { $_.Name }) -join ', '),
+                   $(if ($bad.Count -gt 5) { ", ..." } else { "" }))
         }
+        # The downstream gate in Run-Smoke is Test-Path on this one file, so if the
+        # suite ever stops shipping it the gate would silently skip forever.
+        if (-not (Test-Path -LiteralPath (Join-Path $staging "sigcheck64.exe"))) {
+            throw "sigcheck64.exe is not in the suite (Run-Smoke gates the readiness smoke on it)"
+        }
+
+        # Only verified files reach $dest. Rename-into-place on the same volume, so
+        # there is no window in which $dest holds a half-copied suite.
+        Remove-Item -LiteralPath $dest -Recurse -Force
+        Move-Item -LiteralPath $staging -Destination $dest -Force
     } catch {
+        # Leave nothing half-verified behind. If the move itself failed, $dest may be
+        # gone or partial; either way the gate must read "absent" rather than run the
+        # readiness smoke against whatever survived.
+        Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path -LiteralPath (Join-Path $dest "sigcheck64.exe"))) {
+            Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue
+        }
         Write-Warn "Sysinternals unavailable (non-fatal): $($_.Exception.Message). Rerun to retry."
         return
     }
+    Write-Ok ("Sysinternals: {0} executables, all Authenticode-valid" -f $staged.Count)
+
     New-Item -Path "HKCU:\Software\Sysinternals" -Force | Out-Null
     New-ItemProperty -Path "HKCU:\Software\Sysinternals" -Name "EulaAccepted" -Value 1 -PropertyType DWord -Force | Out-Null
-    $executables = Get-ChildItem -Path $dest -Filter "*.exe" -File -ErrorAction SilentlyContinue
-    foreach ($exe in $executables) {
+    # Reuse the verified set: the registry keys are named after the file stems, which
+    # the move did not change, so re-enumerating $dest would only re-read the disk.
+    foreach ($exe in $staged) {
         $stems = @(
             $exe.BaseName,
             ($exe.BaseName -replace "64a?$", "")
@@ -735,7 +776,6 @@ function Write-Manifest {
             path = $target
             wrapper = $wrapper.FullName
             exists = [bool]($target -and (Test-Path -LiteralPath $target))
-            wrapper_exists = $true
         }
     }
     $manifest = [ordered]@{
