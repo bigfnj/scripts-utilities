@@ -31,10 +31,19 @@ re-sizes the journal rather than erroring. Nothing is downloaded; Sysmon comes f
 [CmdletBinding()]
 param(
     [string]$Root = $(if ($env:CODEX_TOOLBOX) { $env:CODEX_TOOLBOX } else { "$env:LOCALAPPDATA\DevToolbox" }),
-    # 1.5 GB. Measured on this volume at ~18 MB/hour during heavy use (full test suites, an
-    # 80 MB journal dump, recursive drive scans), so ~85h worst case and considerably more on a
-    # normal day. The journal is capped by SIZE, not time: quiet days simply hold more history.
-    [long]$UsnMaxBytes = 1610612736,
+    # 2 GB, and the reboot burst is why it is not 1.5.
+    #
+    # Measured on this volume: 9 MB/hour sustained, which alone would make 1.5 GB good for ~164
+    # hours. But a RESTART writes ~300 MB in its first minutes - Windows startup and every
+    # autostart app touch an enormous number of files - and that cost is per reboot, not per
+    # hour. At one reboot a day the real figure is 216 MB/day sustained + 300 MB burst, so
+    # 1.5 GB held ~70 hours: just under the 72 the journal is sized for. 2 GB gives ~93 hours
+    # with a daily reboot and ~218 without.
+    #
+    # The general lesson, if this is ever retuned: measure the SUSTAINED rate separately from
+    # bursts. Sampling right after a reboot showed 258 MB/hour and would have sized this ~14x
+    # too small.
+    [long]$UsnMaxBytes = 2147483648,
     [long]$UsnDeltaBytes = 33554432,
     # 1 GB. Measured at 67 events/min after tuning -> ~178h. A heavy build day runs several
     # times that, which is what the headroom is for; the target is 72h.
@@ -55,6 +64,36 @@ $ConfigSource  = Join-Path $REPO_ROOT 'config\sysmon-filedelete.xml'
 # to investigate, so the forensics config must not live inside its own subject.
 $ConfigDeployed = Join-Path $env:ProgramData 'Sysmon\filedelete-forensics.xml'
 
+function Invoke-Native {
+    <#
+        Run a native command without letting its STDERR abort the script.
+
+        This file sets $ErrorActionPreference = 'Stop', and under Stop a native command that
+        writes to stderr while its output is merged with 2>&1 raises a TERMINATING error - even
+        when the command succeeded. Sysmon prints its banner and licence text to stderr on every
+        invocation, so `& sysmon -c config 2>&1` applied the config correctly and then threw,
+        and the script exited 1 several lines before its own `exit 0`.
+
+        That is the worst shape a bug can take here: the work is done, and the caller is told it
+        failed. Anything automated would retry or halt on a healthy install.
+
+        Returns the exit code; output is captured and discarded unless -PassThru.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [switch]$PassThru
+    )
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $FilePath @Arguments 2>&1
+        $code = $LASTEXITCODE
+        if ($PassThru) { return [pscustomobject]@{ ExitCode = $code; Output = ($out | Out-String) } }
+        return $code
+    } finally { $ErrorActionPreference = $prev }
+}
+
 function Test-Elevated {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -71,8 +110,9 @@ function Find-Sysmon {
 
 function Get-UsnState {
     param([string]$Vol)
-    $out = & fsutil usn queryjournal $Vol 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) { return $null }
+    $r = Invoke-Native -FilePath 'fsutil' -Arguments @('usn', 'queryjournal', $Vol) -PassThru
+    if ($r.ExitCode -ne 0) { return $null }
+    $out = $r.Output
     $max = [regex]::Match($out, '(?im)^\s*Maximum Size\s*:\s*0x([0-9a-f]+)')
     if (-not $max.Success) { return $null }
     return [Convert]::ToInt64($max.Groups[1].Value, 16)
@@ -157,13 +197,13 @@ if ($Uninstall) {
     Write-Group 'removing deletion forensics'
     if ($sysmon) {
         if ($DryRun) { Write-Info "[DRY-RUN] $sysmon -u force" }
-        else { & $sysmon -u force 2>&1 | Out-Null; Write-Ok 'Sysmon uninstalled' }
+        else { $null = Invoke-Native -FilePath $sysmon -Arguments @('-u', 'force'); Write-Ok 'Sysmon uninstalled' }
     } else { Write-Skip 'Sysmon binary not found; nothing to uninstall' }
     # Back to the Windows default rather than deleting the journal: deletejournal would discard
     # history that is still the only record of anything recent.
     if ($DryRun) { Write-Info "[DRY-RUN] shrink USN journal on $Volume to 32 MB" }
     else {
-        & fsutil usn createjournal m=33554432 a=8388608 $Volume 2>&1 | Out-Null
+        $null = Invoke-Native -FilePath 'fsutil' -Arguments @('usn', 'createjournal', 'm=33554432', 'a=8388608', $Volume)
         Write-Ok "USN journal on $Volume returned to 32 MB"
     }
     exit 0
@@ -182,7 +222,7 @@ if ($null -eq $before) {
 } else {
     # createjournal on an EXISTING journal resizes it in place. It does not discard history;
     # that is deletejournal, which is deliberately not used here.
-    & fsutil usn createjournal m=$UsnMaxBytes a=$UsnDeltaBytes $Volume 2>&1 | Out-Null
+    $null = Invoke-Native -FilePath 'fsutil' -Arguments @('usn', 'createjournal', "m=$UsnMaxBytes", "a=$UsnDeltaBytes", $Volume)
     $after = Get-UsnState -Vol $Volume
     if ($after -ge $UsnMaxBytes) { Write-Ok ("USN journal {0:N0} MB -> {1:N2} GB on {2}" -f ($before / 1MB), ($after / 1GB), $Volume) }
     else { Write-Err ("USN resize did not take (still {0:N0} MB)" -f ($after / 1MB)) }
@@ -210,11 +250,11 @@ Write-Ok "config deployed to $ConfigDeployed"
 $existing = Get-Service -Name 'Sysmon64', 'Sysmon' -ErrorAction SilentlyContinue | Select-Object -First 1
 # Sysmon writes its banner to stderr even on success, so decide by re-querying state below
 # rather than by parsing this output.
-if ($existing) { & $sysmon -c $ConfigDeployed 2>&1 | Out-Null; Write-Ok 'Sysmon config updated' }
-else { & $sysmon -accepteula -i $ConfigDeployed 2>&1 | Out-Null; Write-Ok 'Sysmon installed' }
+if ($existing) { $null = Invoke-Native -FilePath $sysmon -Arguments @('-c', $ConfigDeployed); Write-Ok 'Sysmon config updated' }
+else { $null = Invoke-Native -FilePath $sysmon -Arguments @('-accepteula', '-i', $ConfigDeployed); Write-Ok 'Sysmon installed' }
 
 # Circular (/rt:false) is what gives the natural roll-off; nothing is archived.
-& wevtutil sl $SysmonLog /ms:$LogMaxBytes /rt:false 2>&1 | Out-Null
+$null = Invoke-Native -FilePath 'wevtutil' -Arguments @('sl', $SysmonLog, "/ms:$LogMaxBytes", '/rt:false')
 Write-Ok ("Sysmon log sized to {0:N0} MB, circular" -f ($LogMaxBytes / 1MB))
 
 # -- 3. prove it, rather than assume ------------------------------------------------------------
