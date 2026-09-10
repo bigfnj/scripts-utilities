@@ -37,7 +37,11 @@ param(
     # the insights above is computed over ALL events in the window, and the reader says so when
     # it is showing a subset.
     [int]$MaxRows = 4000,
-    [int]$KeepReports = 3,
+    # 2, matching pc-maintenance's reportsToKeep and for the same stated reason: this run and
+    # the one before it is what makes a week-over-week comparison possible without Downloads
+    # filling up with dashboards nobody opens. A third copy is a month-old snapshot that the
+    # novelty baseline already answers better than an old HTML file does.
+    [int]$KeepReports = 2,
     # A process deleting this many files inside BurstWindowSeconds is called out as a burst.
     [int]$BurstThreshold = 50,
     [int]$BurstWindowSeconds = 300,

@@ -406,7 +406,7 @@ Every parameter it takes:
 | `-Days` | `7` | how much Sysmon history to read |
 | `-OutDir` | the interactive user's Downloads | resolved from that user's own shell-folder registration, not `<profile>\Downloads`, which is commonly redirected |
 | `-MaxRows` | `4000` | rows embedded in the log reader. A file-size cap, not a limit on the analysis: every count above the table is computed over all events in the window |
-| `-KeepReports` | `3` | how many previous reports survive the prune |
+| `-KeepReports` | `2` | how many reports survive the prune, counting the one just written - so the default keeps this week's and last week's, which is what makes a week-over-week comparison possible. Matches pc-maintenance's `reportsToKeep`. |
 | `-NoPrune` | off | keep every report; skips the prune entirely |
 | `-BurstThreshold` | `50` | files one process must delete inside the window below before it is called a burst |
 | `-BurstWindowSeconds` | `300` | that window |
