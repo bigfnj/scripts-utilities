@@ -252,6 +252,12 @@ try {
             [pscustomobject]@{
                 Time  = $_.TimeCreated
                 Pid   = [string]$_.Properties[3].Value
+                # ProcessGuid, not ProcessId, is what the command-line join uses. Sysmon mints a
+                # GUID per process; pids are recycled within minutes on a busy box. Keying on pid
+                # attributed 955 deletions to "cmd.exe /c ping -n 1 1.1.1.1" on the first real
+                # report - a ping deletes nothing, it had simply inherited the pid of something
+                # that did, and last-writer-wins then overwrote the true command line.
+                Guid  = [string]$_.Properties[2].Value
                 User  = [string]$_.Properties[4].Value
                 Image = [string]$_.Properties[5].Value
                 Path  = $p
@@ -273,7 +279,9 @@ try {
         ForEach-Object {
             # Event 1: [4] Image, [10] CommandLine. Keyed by pid; last writer wins, which is
             # right - a reused pid should resolve to the most recent process that held it.
-            $procs[[string]$_.Properties[3].Value] = [string]$_.Properties[10].Value
+            # Keyed by ProcessGuid [2], which is unique per process, NOT ProcessId [3], which is
+            # recycled. See the Guid field on the delete records for what pid keying produced.
+            $procs[[string]$_.Properties[2].Value] = [string]$_.Properties[10].Value
         }
 } catch { }
 

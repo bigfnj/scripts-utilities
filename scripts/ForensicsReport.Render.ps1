@@ -269,8 +269,8 @@ mark{background:rgba(210,153,34,.32);color:inherit;border-radius:2px}
         $cmdCounts = @{}
         $matched = 0
         foreach ($d in $Deletes) {
-            if ($d.Pid -and $Procs.ContainsKey([string]$d.Pid)) {
-                $k = [string]$Procs[[string]$d.Pid]
+            if ($d.Guid -and $Procs.ContainsKey([string]$d.Guid)) {
+                $k = [string]$Procs[[string]$d.Guid]
                 if ($k) {
                     if ($cmdCounts.ContainsKey($k)) { $cmdCounts[$k]++ } else { $cmdCounts[$k] = 1 }
                     $matched++
@@ -279,8 +279,11 @@ mark{background:rgba(210,153,34,.32);color:inherit;border-radius:2px}
         }
         if ($cmdCounts.Count) {
             & $add '<div class="panel"><h2>Command lines behind the deletions</h2>'
-            & $add ('<p class="blurb">Joined to the deletions by process id. A reused pid resolves to the most ' +
-                    'recent process that held it, so treat a surprising pairing as a lead rather than a fact.</p>')
+            & $add ('<p class="blurb">Joined to the deletions by Sysmon ProcessGuid, which is unique per ' +
+                    'process. An earlier version joined on process id and attributed 955 deletions to a ping, ' +
+                    'because pids are recycled within minutes and the later process overwrote the real command ' +
+                    'line. A row missing here means the process started before this window, not that it had no ' +
+                    'command line.</p>')
             & $add '<table><thead><tr><th>Deletions</th><th>Command line</th></tr></thead><tbody>'
             foreach ($e in ($cmdCounts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 15)) {
                 & $add ('<tr><td class="t">' + ('{0:N0}' -f $e.Value) + '</td><td class="p">' +
@@ -347,7 +350,7 @@ mark{background:rgba(210,153,34,.32);color:inherit;border-radius:2px}
         # console and handed to this function, and then never rendered - so the report showed
         # that rm.exe deleted something while silently holding the argv that says what was asked
         # for. "rm.exe" and "rm -rf /c/Users/Admin/.ollama" are not the same finding.
-        $cmd = if ($Procs -and $r.Pid -and $Procs.ContainsKey([string]$r.Pid)) { [string]$Procs[[string]$r.Pid] } else { '' }
+        $cmd = if ($Procs -and $r.Guid -and $Procs.ContainsKey([string]$r.Guid)) { [string]$Procs[[string]$r.Guid] } else { '' }
         $ttl = if ($cmd) { ' title="' + (ConvertTo-FxHtml $cmd) + '"' } else { '' }
         & $add ('<tr' + $cls + ' data-i="' + (ConvertTo-FxHtml $r.Image) + '" data-s="' + $(if ($isSent) { '1' } else { '0' }) + '">' +
                 '<td class="t">' + (ConvertTo-FxHtml ('{0:MM-dd HH:mm:ss}' -f $r.Time)) + '</td>' +

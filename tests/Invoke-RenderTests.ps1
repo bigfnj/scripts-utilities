@@ -38,10 +38,13 @@ $evil = 'C:\Users\Admin\<script>alert(1)</script>\"quoted" & ampersand'
 $now = Get-Date
 
 $deletes = @(
-    [pscustomobject]@{ Time = $now; Pid = '4242'; User = 'X'; Image = 'C:\bin\rm.exe'; Path = $evil },
-    [pscustomobject]@{ Time = $now; Pid = '4242'; User = 'X'; Image = 'C:\bin\rm.exe'; Path = 'C:\Users\Admin\.ssh\id_rsa' },
-    # A pid with no matching process-start event: the process began before the window did.
-    [pscustomobject]@{ Time = $now; Pid = '9999'; User = 'X'; Image = 'C:\bin\rm.exe'; Path = 'C:\Users\Admin\.cache\x' }
+    [pscustomobject]@{ Time = $now; Pid = '4242'; Guid = 'g-real'; User = 'X'; Image = 'C:\bin\rm.exe'; Path = $evil },
+    [pscustomobject]@{ Time = $now; Pid = '4242'; Guid = 'g-real'; User = 'X'; Image = 'C:\bin\rm.exe'; Path = 'C:\Users\Admin\.ssh\id_rsa' },
+    # Same PID, different process. This is the pid-reuse case: on a real box a short-lived
+    # process inherits a recycled pid, and a pid-keyed join hands it the other one's argv.
+    [pscustomobject]@{ Time = $now; Pid = '4242'; Guid = 'g-reused'; User = 'X'; Image = 'C:\Windows\system32\cmd.exe'; Path = 'C:\Users\Admin\.cache\y' },
+    # No matching process-start event at all: the process began before the window did.
+    [pscustomobject]@{ Time = $now; Pid = '9999'; Guid = 'g-absent'; User = 'X'; Image = 'C:\bin\rm.exe'; Path = 'C:\Users\Admin\.cache\x' }
 )
 $byImage  = @([pscustomobject]@{ Name = 'C:\bin\rm.exe'; Count = 2 })
 $byDir    = @([pscustomobject]@{ Name = $evil; Count = 1 })
@@ -55,9 +58,12 @@ $triage = @{ Findings = @([pscustomobject]@{ Process = 'rm.exe'; Directory = $ev
                                              Concern = 'a <b>concern</b>'; Confidence = 'high' })
              Model = 'test-model'; Rejected = 1; Reason = $null }
 
+# Keyed by ProcessGuid. 'g-reused' is a DIFFERENT process that happened to get pid 4242.
+$procsFixture = @{ 'g-real' = 'rm -rf /c/Users'; 'g-reused' = 'cmd.exe /c ping -n 1 1.1.1.1' }
+
 function New-Html {
     New-ForensicsHtml -Deletes $deletes -ByImage $byImage -ByDir $byDir -Bursts $bursts `
-        -Sentinels $deletes -Coverage $coverage -UsnMax 2GB -Procs @{ '4242' = 'rm -rf /c/Users' } `
+        -Sentinels $deletes -Coverage $coverage -UsnMax 2GB -Procs $procsFixture `
         -StateChanges $stateChanges -Days 7 -MaxRows 100 -SentinelPatterns @('\.ssh') `
         -BurstThreshold 50 -Novel $novel -Baseline $baseline -DistinctPairs 9 -Triage $triage
 }
@@ -117,12 +123,24 @@ It 'deletions with no matching process-start are reported, not silently dropped'
     $html -match '1 deletion\(s\) have no matching process-start event'
 }
 It 'and a command line is escaped like any other untrusted text' {
-    $procs = @{ '4242' = 'rm <script>alert(2)</script>' }
+    $procs = @{ 'g-real' = 'rm <script>alert(2)</script>' }
     $html = New-ForensicsHtml -Deletes $deletes -ByImage $byImage -ByDir $byDir -Bursts $bursts `
         -Sentinels $deletes -Coverage $coverage -UsnMax 2GB -Procs $procs `
         -StateChanges $stateChanges -Days 7 -MaxRows 100 -SentinelPatterns @('\.ssh') `
         -BurstThreshold 50 -Novel $novel -Baseline $baseline -DistinctPairs 9 -Triage $triage
     ($html -notmatch '<script>alert\(2\)</script>') -and ($html -match '&lt;script&gt;alert\(2\)&lt;/script&gt;')
+}
+
+It 'two processes sharing a recycled pid do not share a command line' {
+    # The bug this replaced: the join keyed on ProcessId with last-writer-wins, so a ping that
+    # inherited a recycled pid was credited with 955 deletions on the first real report. Both
+    # fixture processes use pid 4242; only the one that actually deleted may be credited.
+    $html = New-Html
+    # The real deleter's argv appears...
+    ($html -match 'rm -rf /c/Users') -and
+    # ...and the ping is credited with exactly its own single deletion, not the other three.
+    ($html -match '<td class="t">1</td><td class="p">cmd\.exe /c ping') -and
+    ($html -notmatch '<td class="t">[34]</td><td class="p">cmd\.exe /c ping')
 }
 
 Write-Host "`n== entities must render as entities, not as their own source text ==" -ForegroundColor Cyan
