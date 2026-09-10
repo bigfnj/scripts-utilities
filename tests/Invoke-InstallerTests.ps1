@@ -310,5 +310,49 @@ It 'a detected tool is still recorded as detected on a re-run' {
 
 Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
 
+Write-Host "`n== a failure has to reach the LAST line, not just the group's line ==" -ForegroundColor Cyan
+# Install-CatalogGroup was made to return a count, and the three modules were made to print
+# "INCOMPLETE" - and the count then died there. Write-Err is Write-Host, so it produces no
+# error record; bootstrap.ps1 discarded the (absent) return value and printed "bootstrap
+# complete" unconditionally, having no exit statement on any path at all. A run in which every
+# single winget install failed still ended "OK bootstrap complete".
+#
+# Source-level assertions on purpose: the behavioural version would have to make real installs
+# fail, and these pin exactly the two links that were missing.
+
+It 'every <group>_install returns its failure count' {
+    $bad = @()
+    foreach ($m in @('cli-tools', 'extras', 'security')) {
+        $f = Join-Path $repoRoot ('modules\' + $m + '.ps1')
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($f, [ref]$null, [ref]$null)
+        $fn = $ast.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $n.Name -eq ($m + '_install') }, $true) | Select-Object -First 1
+        if (-not $fn) { $bad += "$m has no ${m}_install"; continue }
+        $ret = $fn.Body.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.ReturnStatementAst] }, $true)
+        if (-not $ret -or $ret.Count -eq 0) { $bad += "$m never returns" }
+    }
+    if ($bad.Count) { Write-Host ("       " + ($bad -join '; ')) -ForegroundColor DarkGray }
+    $bad.Count -eq 0
+}
+It 'bootstrap.ps1 exits explicitly, on BOTH the success and failure paths' {
+    # It previously fell off the end with no exit at all, so it inherited the exit code of
+    # whatever native command it last happened to run - which is precisely why
+    # fresh-toolbox-setup-runner.ps1 had to stop trusting it.
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+        (Join-Path $repoRoot 'bootstrap.ps1'), [ref]$null, [ref]$null)
+    $exits = $ast.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.GetCommandName() -eq 'exit' }, $true)
+    # PowerShell parses `exit N` as a statement, not a command, so match the source instead.
+    $src = Get-Content (Join-Path $repoRoot 'bootstrap.ps1') -Raw
+    ($src -match '(?m)^\s*exit 0\s*$') -and ($src -match '(?m)^\s*exit 1\s*$')
+}
+It 'and it accumulates what the groups return' {
+    $src = Get-Content (Join-Path $repoRoot 'bootstrap.ps1') -Raw
+    ($src -match 'GROUP_FAILURES') -and ($src -match 'GROUP_FAILURES\s*\+=')
+}
+
 Write-Host ("`n{0} passed, {1} failed`n" -f $script:Pass, $script:Fail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
 exit $(if ($script:Fail) { 1 } else { 0 })

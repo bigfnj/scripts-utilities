@@ -168,7 +168,6 @@
     "models_base": ["moondream", "qwen2.5:3b", "qwen3-embedding:0.6b", "mistral:7b"],
     "models_24gb": ["mistral-small"],
     "tier_24gb_min_vram_mb": 20000,
-    "embedding_model": "qwen3-embedding:0.6b",
     "reranker": {
       "name": "bge-reranker-base",
       "hf_repo": "Xenova/bge-reranker-base",

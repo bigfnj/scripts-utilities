@@ -94,6 +94,11 @@ function security_install {
     } else {
         Write-Err "security group INCOMPLETE: $failed of $attempted catalog install(s) failed (see the warnings above)"
     }
+    # RETURNED, not just printed. Write-Err is Write-Host - it produces no error
+    # record - so a caller has no way to know this group failed unless the count
+    # travels. Without this, bootstrap.ps1 printed "bootstrap complete" after a run
+    # in which every single install failed.
+    return $failed
 }
 
 function security_report_deletion_forensics {

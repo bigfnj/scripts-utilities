@@ -19,4 +19,9 @@ function cli-tools_install {
     } else {
         Write-Err "cli-tools group INCOMPLETE: $failed of $total failed to install (see the warnings above)"
     }
+    # RETURNED, not just printed. Write-Err is Write-Host - it produces no error
+    # record - so a caller has no way to know this group failed unless the count
+    # travels. Without this, bootstrap.ps1 printed "bootstrap complete" after a run
+    # in which every single install failed.
+    return $failed
 }

@@ -143,6 +143,36 @@ It 'two processes sharing a recycled pid do not share a command line' {
     ($html -notmatch '<td class="t">[34]</td><td class="p">cmd\.exe /c ping')
 }
 
+Write-Host "`n== a baseline that could not be read is not a baseline with nothing in it ==" -ForegroundColor Cyan
+
+function New-HtmlWithBaselineState {
+    param([switch]$Unreadable, $BaselineObj, $NovelRows)
+    New-ForensicsHtml -Deletes $deletes -ByImage $byImage -ByDir $byDir -Bursts $bursts `
+        -Sentinels $deletes -Coverage $coverage -UsnMax 2GB -Procs $procsFixture `
+        -StateChanges $stateChanges -Days 7 -MaxRows 100 -SentinelPatterns @('\.ssh') `
+        -BurstThreshold 50 -Novel $NovelRows -Baseline $BaselineObj -DistinctPairs 9 `
+        -Triage $triage -BaselineUnreadable:$Unreadable
+}
+
+It 'an unreadable baseline says so at the top of the page' {
+    # Fixing "a lost history reads as a clean slate" halfway turned it into "a lost history
+    # reads as a SUSPICIOUS WEEK": Pairs is empty, so every pairing comes back novel and the
+    # operator gets a full false-positive list with no explanation. Worse than what it replaced.
+    $html = New-HtmlWithBaselineState -Unreadable -BaselineObj @{ Runs = 0; Pairs = @{} } -NovelRows $novel
+    $html -match 'BASELINE UNREADABLE'
+}
+It 'and does NOT present the resulting false-positive list' {
+    $html = New-HtmlWithBaselineState -Unreadable -BaselineObj @{ Runs = 0; Pairs = @{} } -NovelRows $novel
+    # $novel here is the everything-looks-new list an empty Pairs set produces.
+    $html -notmatch [regex]::Escape($novel[0].Dir)
+}
+It 'a healthy baseline still shows its novelty list, so the guard is not just suppression' {
+    # The positive control. A tile that never shows anything is as useless as one that shows
+    # everything.
+    $html = New-HtmlWithBaselineState -BaselineObj $baseline -NovelRows $novel
+    ($html -notmatch 'BASELINE UNREADABLE') -and ($html -match [regex]::Escape($novel[0].Image))
+}
+
 Write-Host "`n== the hot loop's shortcut must not change what is rendered ==" -ForegroundColor Cyan
 
 It 'using the precomputed IsSentinel flag produces the same page as re-matching the patterns' {

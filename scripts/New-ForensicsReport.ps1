@@ -194,7 +194,16 @@ foreach ($d in $deletes) {
     if ($seen.ContainsKey($k)) { $seen[$k]++ } else { $seen[$k] = 1 }
 }
 $novel = @()
-if ($baseline) {
+# $baseline.Unreadable means the file existed and could not be parsed. It must NOT be treated
+# as a baseline with no pairings in it: Pairs is empty, so EVERY pairing in this window would
+# come back novel and the report would hand the operator a full false-positive list with no
+# explanation. The previous bug was that a lost history read as a clean slate; fixing it
+# halfway turned that into a lost history reading as a SUSPICIOUS WEEK, which is worse.
+$baselineUnreadable = [bool]($baseline -and $baseline.Unreadable)
+if ($baselineUnreadable) {
+    Write-Host ("  baseline: UNREADABLE at $baselinePath - {0}" -f $baseline.Error) -ForegroundColor Yellow
+    Write-Host '  baseline: novelty suppressed for this run; the damaged file has been set aside' -ForegroundColor Yellow
+} elseif ($baseline) {
     foreach ($k in $seen.Keys) {
         if (-not $baseline.Pairs.ContainsKey($k)) {
             $parts = $k -split '\|', 2
@@ -224,7 +233,8 @@ if ($NoBaseline) {
     }
 }
 Write-Host ("  {0} distinct pairing(s); {1}" -f $seen.Count,
-    $(if ($baseline) { "$($novel.Count) never seen before (baseline: $($baseline.Runs) run(s))" }
+    $(if ($baselineUnreadable) { 'novelty unavailable - the baseline could not be read' }
+      elseif ($baseline) { "$($novel.Count) never seen before (baseline: $($baseline.Runs) run(s))" }
       else { 'no baseline yet - first run establishes it' })) -ForegroundColor DarkGray
 
 $usnMax = $null
@@ -294,6 +304,7 @@ $html = New-ForensicsHtml -Deletes $deletes -ByImage $byImage -ByDir $byDir -Bur
     -Sentinels $sentinelHits -Coverage $coverage -UsnMax $usnMax -Procs $procs `
     -StateChanges $stateChanges -Days $Days -MaxRows $MaxRows -SentinelPatterns $SentinelPatterns `
     -BurstThreshold $BurstThreshold -Novel $novel -Baseline $baseline -DistinctPairs $seen.Count `
+    -BaselineUnreadable $baselineUnreadable `
     -Triage $triage -User $user
 
 [IO.File]::WriteAllText($outPath, $html, (New-Object Text.UTF8Encoding($false)))

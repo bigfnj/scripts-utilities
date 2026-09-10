@@ -47,7 +47,11 @@ function New-ForensicsHtml {
         $Novel, $Baseline, [int]$DistinctPairs = 0,
         $Triage,
         # Who this report is FOR, and - the part that matters - HOW that was decided.
-        $User
+        $User,
+        # A baseline that EXISTS but could not be parsed. Distinct from no baseline at all:
+        # with an empty Pairs set every pairing looks novel, so the tile must say the check
+        # could not run rather than present a full false-positive list.
+        [bool]$BaselineUnreadable = $false
     )
 
     $css = @'
@@ -139,6 +143,13 @@ border-left:4px solid var(--warn);border-radius:8px;padding:12px 14px;margin:0 0
     # else. The numbers below are still real deletions; what may be wrong is whose machine
     # activity they describe and whose Downloads this landed in. Said at the top, with an icon
     # as well as a colour, because a reader who misses this misreads everything under it.
+    if ($BaselineUnreadable) {
+        & $add ('<div class="notice"><span class="tag">BASELINE UNREADABLE</span><span>' +
+                'The novelty baseline exists but could not be parsed, so "never seen before" could not be ' +
+                'computed for this run and is not shown. The damaged file has been set aside rather than ' +
+                'overwritten. Every other number on this page is unaffected.</span></div>')
+    }
+
     if ($User -and $User.Inferred) {
         & $add ('<div class="notice"><span class="tag">INFERRED USER</span><span>' +
                 'Nobody was observed signed in, so the profile this report describes was taken from the ' +
@@ -164,7 +175,12 @@ border-left:4px solid var(--warn);border-radius:8px;padding:12px 14px;margin:0 0
     }
 
     # ---- tiles ----
-    $sentinelDirs = @($Sentinels | ForEach-Object { Split-Path $_.Path -Parent } | Group-Object | Sort-Object Count -Descending)
+    # $_.Dir, not Split-Path. Every record already carries the parent, computed once at gather
+    # time precisely so this would not happen - and $Sentinels is UNBOUNDED, largest in exactly
+    # the incident this tool exists for. Measured: 13,740 ms vs 1,208 ms at 100,000 hits, 11.4x,
+    # grouped output byte-identical. This was the fifth site of a "four sites" fix; the caller
+    # side was done and this one was missed.
+    $sentinelDirs = @($Sentinels | ForEach-Object { $_.Dir } | Group-Object | Sort-Object Count -Descending)
     $tiles = @(
         @{ Label = 'Deletions'; Value = ('{0:N0}' -f $Deletes.Count); Cls = ''
            Blurb = 'Files deleted in watched locations during the window. Package caches, Temp and browser caches are excluded by the Sysmon config, so this is not every deletion on the machine - it is every deletion worth looking at.'
@@ -175,15 +191,21 @@ border-left:4px solid var(--warn);border-radius:8px;padding:12px 14px;margin:0 0
         @{ Label = 'Bursts'; Value = ('{0:N0}' -f $Bursts.Count); Cls = $(if ($Bursts.Count) { 'bad' } else { 'ok' })
            Blurb = 'A burst is one process deleting many files in a short window - the shape of a mass deletion, as opposed to a machine steadily working. Detail below.'
            Rows = @($Bursts | ForEach-Object { @{ K = (Split-Path $_.Image -Leaf); V = ('{0:N0} in {1}s' -f $_.Count, $_.Seconds) } }) }
-        @{ Label = 'New pairings'; Value = $(if ($Baseline) { '{0:N0}' -f @($Novel).Count } else { 'n/a' })
-           Cls = $(if (-not $Baseline) { '' } elseif (@($Novel).Count) { 'warn' } else { 'ok' })
-           Blurb = $(if ($Baseline) {
+        @{ Label = 'New pairings'
+           # THREE states, not two. "0 new" and "could not look" are different answers and the
+           # tile must not render the second as the first - nor as a list of everything, which
+           # is what an empty-Pairs baseline would produce.
+           Value = $(if ($BaselineUnreadable) { 'n/a' } elseif ($Baseline) { '{0:N0}' -f @($Novel).Count } else { 'n/a' })
+           Cls = $(if ($BaselineUnreadable) { 'warn' } elseif (-not $Baseline) { '' } elseif (@($Novel).Count) { 'warn' } else { 'ok' })
+           Blurb = $(if ($BaselineUnreadable) {
+                       'The baseline file exists but could not be parsed, so this check could not run. It has been set aside rather than overwritten, and the next run will start a fresh one. No conclusion should be drawn from this tile today.'
+                     } elseif ($Baseline) {
                        'A program deleting somewhere it has never deleted before, across ' + $Baseline.Runs +
                        ' previous run(s). This is the signal a WEEKLY report is actually for: the counts say what happened, this says what does not usually happen.'
                      } else {
                        'No baseline yet - this run establishes one. Nothing can be called new until there is something to be new against, and flagging all of it would say nothing.'
                      })
-           Rows = @($Novel | Select-Object -First 12 | ForEach-Object { @{ K = ('{0}  ->  {1}' -f $_.Image, $_.Dir); V = ('{0:N0}' -f $_.Count) } }) }
+           Rows = @($(if ($BaselineUnreadable) { @() } else { $Novel }) | Select-Object -First 12 | ForEach-Object { @{ K = ('{0}  ->  {1}' -f $_.Image, $_.Dir); V = ('{0:N0}' -f $_.Count) } }) }
         @{ Label = 'Sentinel paths'; Value = ('{0:N0}' -f $Sentinels.Count); Cls = $(if ($Sentinels.Count) { 'warn' } else { 'ok' })
            Blurb = 'Deletions in quiet, valuable directories - credentials, agent configs, the toolbox, Documents. Any activity here is unusual by construction, which is why these make better sentinels than a cache.'
            Rows = @($sentinelDirs | Select-Object -First 12 | ForEach-Object { @{ K = $_.Name; V = ('{0:N0}' -f $_.Count) } }) }

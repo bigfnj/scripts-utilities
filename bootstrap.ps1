@@ -53,6 +53,12 @@ Sync-EnvPath
 $KNOWN_OLD_REPO_ROOTS = @(
     (Join-Path $env:USERPROFILE "Documents\scripts-utilities")
 )
+
+# Summed across every group, so the last line of this script can tell the truth. Each
+# <group>_install returns its failure count; printing "INCOMPLETE" inside the group was only
+# half the fix, because Write-Err is Write-Host and produces no error record for anything
+# upstream to notice.
+$script:GROUP_FAILURES = 0
 $AGENT_TARGETS = @(
     (Join-Path $env:USERPROFILE ".codex\AGENTS.md"),
     (Join-Path $env:USERPROFILE ".claude\CLAUDE.md"),
@@ -389,7 +395,13 @@ function Invoke-Group {
     . $f
     $fn = "${Group}_install"
     if (Get-Command $fn -ErrorAction SilentlyContinue) {
-        & $fn
+        # A group that installs nothing successfully must not be indistinguishable from one
+        # that installs everything. The modules return a failure count; anything else they
+        # emit is output to be discarded.
+        $r = @(& $fn)
+        $n = 0
+        foreach ($x in $r) { if ($x -is [int]) { $n = [int]$x } }
+        $script:GROUP_FAILURES += $n
     } else {
         Write-Warn "module '$Group' defines no ${fn}() - skipping"
     }
@@ -474,4 +486,14 @@ if (-not $script:DryRun) {
 }
 
 Write-Group "done"
+# An EXPLICIT exit on both paths. bootstrap.ps1 previously fell off the end with no exit at
+# all, so it inherited the exit code of whatever native command it happened to run last - which
+# is why fresh-toolbox-setup-runner.ps1 had to stop trusting it. Now the code means something,
+# and the runner can go back to reading it.
+if ($script:GROUP_FAILURES -gt 0) {
+    Write-Err ("bootstrap INCOMPLETE - {0} tool(s) failed to install. Fix those, then re-run; " -f $script:GROUP_FAILURES)
+    Write-Err "this script is idempotent, so a re-run only retries what is missing."
+    exit 1
+}
 Write-Ok "bootstrap complete - run '.\scripts\smoke-test.ps1' to verify"
+exit 0
