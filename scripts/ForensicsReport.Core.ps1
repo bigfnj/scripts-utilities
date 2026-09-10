@@ -131,14 +131,34 @@ function Read-FxBaseline {
         $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json
         $h = @{}
         foreach ($p in $raw.pairs) { $h[[string]$p.key] = $p }
-        return @{ Pairs = $h; FirstRun = [string]$raw.firstRun; Runs = [int]$raw.runs }
-    } catch { return $null }
+        return @{ Pairs = $h; FirstRun = [string]$raw.firstRun; Runs = [int]$raw.runs; Unreadable = $false }
+    } catch {
+        # ABSENT and CORRUPT both used to return $null, and the consequence was self-erasing:
+        # the caller saw no baseline, announced "no baseline yet - first run establishes it",
+        # and then OVERWROTE the damaged file with runs = 1. The run that noticed the history
+        # was broken is the run that destroyed it, and the next week reported every pairing as
+        # never-seen-before. A lost history read as a clean slate.
+        return @{ Pairs = @{}; FirstRun = $null; Runs = 0; Unreadable = $true
+                  Error = $_.Exception.Message }
+    }
 }
 
 function Write-FxBaseline {
-    param([string]$Path, [hashtable]$Seen, $Existing)
-    # Bounded. A pairing not seen for a long time is dropped so the file cannot grow forever;
-    # 5,000 is far above the ~100 distinct pairings this machine actually produces.
+    <#
+        Merge this run's pairings into the baseline.
+
+        REFUSES to write over an unreadable baseline. Overwriting is how a corrupt file became a
+        silent history reset; a damaged one is moved aside instead, so the evidence survives and
+        the next run legitimately starts over.
+    #>
+    param([string]$Path, [hashtable]$Seen, $Existing, [int]$MaxAgeDays = 120)
+    if ($Existing -and $Existing.Unreadable) {
+        try {
+            $aside = "$Path.corrupt-" + (Get-Date -Format 'yyyyMMdd-HHmmss')
+            Move-Item -LiteralPath $Path -Destination $aside -Force -ErrorAction Stop
+        } catch { return $false }
+        return $false
+    }
     $now = (Get-Date).ToString('o')
     $merged = @{}
     if ($Existing) { foreach ($k in $Existing.Pairs.Keys) { $merged[$k] = $Existing.Pairs[$k] } }
@@ -150,7 +170,25 @@ function Write-FxBaseline {
             $merged[$k] = [pscustomobject]@{ key = $k; firstSeen = $now; lastSeen = $now; count = [int]$Seen[$k] }
         }
     }
-    $keep = @($merged.Values | Sort-Object { [datetime]$_.lastSeen } -Descending | Select-Object -First 5000)
+    # Age FIRST, then count. The docstring used to claim "a pairing not seen for a long time is
+    # dropped"; it was not - only rank beyond 5,000 dropped anything, and this machine produces
+    # about 100 distinct pairings, so the set was effectively append-only. The consequence is
+    # that the "New pairings" tile - which the renderer calls the signal a WEEKLY report exists
+    # for - trends monotonically to zero and stays there.
+    #
+    # TryParse, not a [datetime] cast. This Sort sat OUTSIDE the try/catch below under a
+    # file-level $ErrorActionPreference = 'Stop', so ONE entry with a missing or malformed
+    # lastSeen killed report generation outright - at 04:00 on a Sunday, under SYSTEM, with
+    # nobody watching. An unparseable date now sorts oldest and ages out rather than throwing.
+    $cutoff = (Get-Date).AddDays(-$MaxAgeDays)
+    $dated = @($merged.Values | ForEach-Object {
+        $when = [datetime]::MinValue
+        $null = [datetime]::TryParse([string]$_.lastSeen, [ref]$when)
+        [pscustomobject]@{ Entry = $_; When = $when }
+    })
+    $keep = @($dated | Where-Object { $_.When -ge $cutoff } |
+              Sort-Object When -Descending | Select-Object -First 5000 |
+              ForEach-Object { $_.Entry })
     $obj = [ordered]@{
         firstRun = $(if ($Existing -and $Existing.FirstRun) { $Existing.FirstRun } else { $now })
         runs     = $(if ($Existing) { [int]$Existing.Runs + 1 } else { 1 })
@@ -165,24 +203,81 @@ function Write-FxBaseline {
 }
 
 function Get-FxInteractiveUser {
-    # SYSTEM runs the scheduled task, so "the user" is whoever owns the console session, not the
-    # process. Same problem pc-maintenance solves; same approach.
-    $sid = $null; $profilePath = $null
-    try {
-        $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
-        if ($cs.UserName) {
-            $acct = New-Object Security.Principal.NTAccount($cs.UserName)
-            $sid = $acct.Translate([Security.Principal.SecurityIdentifier]).Value
-        }
-    } catch { }
-    if (-not $sid) { try { $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value } catch { } }
+    <#
+        Who is this report FOR? SYSTEM runs the scheduled task, so it is never the process
+        owner - and the old answer to that was to fall back to the process owner anyway.
+
+        WHAT THAT COST. Under the SYSTEM task with nobody signed in, Win32_ComputerSystem.UserName
+        is null and the fallback returned S-1-5-18. ProfileList HAS a key for S-1-5-18, so the
+        result LOOKED successful: a non-null SID with a non-null profile pointing at
+        C:\Windows\system32\config\systemprofile. Get-FxDownloadsPath then failed to find a
+        Downloads folder there and quietly returned $env:TEMP, so the weekly report was written
+        to C:\Windows\TEMP - and the retention prune ran there too, in a directory nobody chose.
+        The task is registered -StartWhenAvailable, so a machine that was off at Sunday 04:00
+        runs at boot BEFORE anyone logs in. That is the likely case, not the edge case.
+
+        Three sources, in descending confidence, ported from pc-maintenance's
+        Get-PMInteractiveUserSid. The first two OBSERVE a session and set LoggedIn. The third
+        GUESSES from the registry and is MARKED as a guess rather than hidden.
+
+        The process identity is not a source at all any more. The registry fallback filters on
+        S-1-12-1- / S-1-5-21- and on a path under \Users\, which makes S-1-5-18 structurally
+        impossible to return - it matches neither prefix and its profile is not under \Users\.
+    #>
+    $sid = $null; $loggedIn = $false; $account = $null
+
+    try { $account = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName } catch { }
+    if ($account) {
+        try {
+            $sid = (New-Object System.Security.Principal.NTAccount($account)).Translate(
+                       [System.Security.Principal.SecurityIdentifier]).Value
+            $loggedIn = $true
+        } catch { }
+    }
+
+    # The source this script was missing entirely, and the one that fixes the common case: a
+    # machine where somebody IS logged in but Win32_ComputerSystem.UserName came back null -
+    # RDP, fast user switching, or a session the CIM class simply does not report.
+    if (-not $sid) {
+        try {
+            $exp = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop | Select-Object -First 1
+            if ($exp) {
+                $o = Invoke-CimMethod -InputObject $exp -MethodName GetOwnerSid -ErrorAction Stop
+                if ($o.Sid) { $sid = $o.Sid; $loggedIn = $true }
+            }
+        } catch { }
+    }
+
+    # A guess, and recorded as one. On a multi-profile machine with nobody signed in this can
+    # be a stranger's profile - which is fine for REPORTING, where a wrong number is visible
+    # and harmless, and is why nothing destructive may key off it.
+    if (-not $sid) {
+        $pl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+        $cand = Get-ChildItem $pl -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSChildName -match '^(S-1-12-1-|S-1-5-21-)' } |
+            ForEach-Object {
+                $pr = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+                [pscustomobject]@{ Sid = $_.PSChildName; Path = $pr.ProfileImagePath }
+            } | Where-Object { $_.Path -match '\\Users\\' } | Select-Object -First 1
+        if ($cand) { $sid = $cand.Sid }
+    }
+
+    $profilePath = $null
     if ($sid) {
         $k = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
         if (Test-Path -LiteralPath $k) {
             $profilePath = (Get-ItemProperty -LiteralPath $k -Name ProfileImagePath -ErrorAction SilentlyContinue).ProfileImagePath
         }
     }
-    [pscustomobject]@{ Sid = $sid; Profile = $profilePath }
+
+    # Inferred means: there is a SID, but nothing observed a session for it. Only the registry
+    # fallback can produce that combination, and the report says so on its own front page.
+    [pscustomobject]@{
+        Sid      = $sid
+        Profile  = $profilePath
+        LoggedIn = $loggedIn
+        Inferred = [bool]($sid -and -not $loggedIn)
+    }
 }
 
 function Get-FxDownloadsPath {
@@ -204,5 +299,9 @@ function Get-FxDownloadsPath {
         $p = Join-Path $User.Profile 'Downloads'
         if (Test-Path -LiteralPath $p) { return $p }
     }
-    return $env:TEMP
+    # $null, never $env:TEMP. Falling back to the process temp directory under SYSTEM wrote the
+    # report to C:\Windows\TEMP and then PRUNED old reports there - a retention sweep in a
+    # directory nobody chose. Returning nothing lets the caller say "I could not work out where
+    # this belongs" and stop, which is the honest answer and the safe one.
+    return $null
 }

@@ -193,16 +193,103 @@ It 'writing into a directory that does not exist yet creates it' {
     } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
-Write-Host "`n== resolving the interactive user ==" -ForegroundColor Cyan
+Write-Host "`n== a damaged baseline must not read as a clean slate ==" -ForegroundColor Cyan
 
-It 'Get-FxInteractiveUser returns the documented shape' {
+It 'a CORRUPT baseline is distinguishable from an absent one' {
+    # Both used to return $null, and the consequence was self-erasing: the caller announced
+    # "first run establishes it" and overwrote the damaged file with runs = 1. The run that
+    # noticed the history was broken destroyed it.
+    $d = New-TempDir
+    try {
+        $p = Join-Path $d 'baseline.json'
+        Set-Content -LiteralPath $p -Value '{"pairs":[{"key":"a|b"' -Encoding UTF8   # truncated
+        $b = Read-FxBaseline -Path $p
+        ($null -ne $b) -and $b.Unreadable -and ($null -eq (Read-FxBaseline -Path (Join-Path $d 'absent.json')))
+    } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'and Write-FxBaseline REFUSES to overwrite it, moving it aside instead' {
+    $d = New-TempDir
+    try {
+        $p = Join-Path $d 'baseline.json'
+        Set-Content -LiteralPath $p -Value '{"pairs":[{"key":"a|b"' -Encoding UTF8
+        $b = Read-FxBaseline -Path $p
+        $wrote = Write-FxBaseline -Path $p -Seen @{ 'x|y' = 1 } -Existing $b
+        # Refused, the damaged file preserved under a new name, nothing written in its place.
+        (-not $wrote) -and (-not (Test-Path -LiteralPath $p)) -and
+        (@(Get-ChildItem -LiteralPath $d -Filter '*.corrupt-*').Count -eq 1)
+    } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'a pairing older than the horizon is forgotten' {
+    # The tile the renderer calls "the signal a WEEKLY report is actually for" trends to zero
+    # if the baseline never forgets. Pruning by count alone never fired: the cap is 5,000 and
+    # this machine produces about 100 distinct pairings.
+    $d = New-TempDir
+    try {
+        $p = Join-Path $d 'baseline.json'
+        $old = (Get-Date).AddDays(-400).ToString('o')
+        $existing = @{ Pairs = @{ 'ancient|dir' = [pscustomobject]@{ key = 'ancient|dir'; firstSeen = $old; lastSeen = $old; count = 1 } }
+                       FirstRun = $old; Runs = 1; Unreadable = $false }
+        $null = Write-FxBaseline -Path $p -Seen @{ 'fresh|dir' = 1 } -Existing $existing
+        $b = Read-FxBaseline -Path $p
+        $b.Pairs.ContainsKey('fresh|dir') -and (-not $b.Pairs.ContainsKey('ancient|dir'))
+    } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'one unparseable lastSeen ages out instead of killing the report' {
+    # $ErrorActionPreference = 'Stop' is NOT decoration here - it is the production condition.
+    # New-ForensicsReport.ps1 sets it at file level, and the offending Sort sat OUTSIDE the
+    # try/catch, so one malformed date took down report generation at 04:00 on a Sunday under
+    # SYSTEM. Without this line the test runs under the default 'Continue', the failed cast is
+    # non-terminating, and the test passes against the BROKEN code - which is exactly what it
+    # did on the first attempt. A test that does not reproduce the production condition
+    # proves nothing about production.
+    $d = New-TempDir
+    $prev = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Stop'
+        $p = Join-Path $d 'baseline.json'
+        $existing = @{ Pairs = @{ 'bad|row' = [pscustomobject]@{ key = 'bad|row'; firstSeen = 'not-a-date'; lastSeen = 'not-a-date'; count = 1 } }
+                       FirstRun = $null; Runs = 1; Unreadable = $false }
+        $ok = Write-FxBaseline -Path $p -Seen @{ 'good|row' = 1 } -Existing $existing
+        $b = Read-FxBaseline -Path $p
+        $ok -and $b.Pairs.ContainsKey('good|row')
+    } finally {
+        $ErrorActionPreference = $prev
+        Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Write-Host "`n== resolving the interactive user, without guessing ==" -ForegroundColor Cyan
+
+It 'Get-FxInteractiveUser reports HOW it resolved, not just what' {
     $u = Get-FxInteractiveUser
-    ($null -ne $u) -and ($u.PSObject.Properties.Name -contains 'Sid') -and
-    ($u.PSObject.Properties.Name -contains 'Profile')
+    $n = $u.PSObject.Properties.Name
+    ($n -contains 'Sid') -and ($n -contains 'Profile') -and ($n -contains 'LoggedIn') -and ($n -contains 'Inferred')
+}
+It 'it can never return the SYSTEM SID' {
+    # The whole defect: under the SYSTEM task with nobody signed in it returned S-1-5-18, whose
+    # ProfileList key EXISTS, so the result looked successful and the report went to
+    # C:\Windows\TEMP. The registry fallback now filters on S-1-12-1-/S-1-5-21- and a path
+    # under \Users\, which S-1-5-18 satisfies neither of.
+    (Get-FxInteractiveUser).Sid -ne 'S-1-5-18'
+}
+It 'the process identity is not a source at all' {
+    # A source-level assertion, because the failure only appears when running as SYSTEM with
+    # nobody logged in - a state this suite cannot enter. What CAN be checked is that the line
+    # responsible no longer exists.
+    (Get-Content (Join-Path $repoRoot 'scripts\ForensicsReport.Core.ps1') -Raw) -notmatch 'WindowsIdentity\]::GetCurrent'
+}
+It 'Inferred and LoggedIn are consistent with each other' {
+    $u = Get-FxInteractiveUser
+    if ($u.Sid) { $u.Inferred -eq (-not $u.LoggedIn) } else { -not $u.Inferred }
 }
 It 'Get-FxDownloadsPath returns an existing directory for a real user' {
     $p = Get-FxDownloadsPath -User (Get-FxInteractiveUser)
     $p -and (Test-Path -LiteralPath $p)
+}
+It 'and returns NOTHING rather than $env:TEMP when the user cannot be resolved' {
+    # Returning $env:TEMP under SYSTEM put the report in C:\Windows\TEMP and then ran the
+    # retention prune there. "I do not know where this belongs" has to be sayable.
+    $null -eq (Get-FxDownloadsPath -User ([pscustomobject]@{ Sid = $null; Profile = $null }))
 }
 
 Write-Host ("`n{0} passed, {1} failed`n" -f $script:Pass, $script:Fail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })

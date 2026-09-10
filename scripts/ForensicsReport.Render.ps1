@@ -45,7 +45,9 @@ function New-ForensicsHtml {
         $Procs, $StateChanges, [int]$Days, [int]$MaxRows, $SentinelPatterns,
         [int]$BurstThreshold = 50,
         $Novel, $Baseline, [int]$DistinctPairs = 0,
-        $Triage
+        $Triage,
+        # Who this report is FOR, and - the part that matters - HOW that was decided.
+        $User
     )
 
     $css = @'
@@ -101,6 +103,9 @@ tr.sent td.p{color:var(--warn)}
 .count{color:var(--dim);font-size:12.5px;margin-top:10px}
 .foot{color:var(--dim);font-size:12px;margin-top:26px;border-top:1px solid var(--line);padding-top:14px}
 mark{background:rgba(210,153,34,.32);color:inherit;border-radius:2px}
+.notice{display:flex;gap:10px;align-items:flex-start;background:var(--panel);border:1px solid var(--warn);
+border-left:4px solid var(--warn);border-radius:8px;padding:12px 14px;margin:0 0 18px;font-size:13px}
+.notice .tag{font-size:11px;font-weight:700;letter-spacing:.05em;color:var(--warn);white-space:nowrap;padding-top:1px}
 .llm{border:1px dashed var(--accent);background:transparent}
 .llm h2{color:var(--accent)}
 .llm .warn-note{color:var(--dim);font-size:12.5px;border-left:3px solid var(--accent);padding:6px 0 6px 10px;margin:0 0 12px}
@@ -128,6 +133,18 @@ mark{background:rgba(210,153,34,.32);color:inherit;border-radius:2px}
     & $add ('<div class="sub">' + (ConvertTo-FxHtml ('{0:yyyy-MM-dd HH:mm}' -f $now)) +
             ' &middot; last ' + (ConvertTo-FxHtml ([string]$Days)) + ' day(s) &middot; ' +
             (ConvertTo-FxHtml ([string]$env:COMPUTERNAME)) + '</div>')
+
+    # An INFERRED user means nothing observed a session - the profile came out of the registry
+    # in whatever order the keys enumerate, and on a multi-profile machine that can be somebody
+    # else. The numbers below are still real deletions; what may be wrong is whose machine
+    # activity they describe and whose Downloads this landed in. Said at the top, with an icon
+    # as well as a colour, because a reader who misses this misreads everything under it.
+    if ($User -and $User.Inferred) {
+        & $add ('<div class="notice"><span class="tag">INFERRED USER</span><span>' +
+                'Nobody was observed signed in, so the profile this report describes was taken from the ' +
+                'registry rather than from a live session. It may be the wrong user. Old reports were ' +
+                'NOT pruned for the same reason.</span></div>')
+    }
 
     # ---- hero: the one number that matters ----
     $topBurst = if ($Bursts.Count) { $Bursts[0] } else { $null }
@@ -241,6 +258,12 @@ mark{background:rgba(210,153,34,.32);color:inherit;border-radius:2px}
         & $add ('<li><span class="k">Log spans</span><span class="v">' +
                 (ConvertTo-FxHtml ('{0:yyyy-MM-dd HH:mm}' -f $Coverage.Oldest)) + ' &rarr; now (' +
                 (ConvertTo-FxHtml ('{0:N1} h' -f $Coverage.SpanHours)) + ')</span></li>')
+        & $add ('<li><span class="k">Report is for</span><span class="v">' +
+                (ConvertTo-FxHtml $(
+                    if (-not $User) { 'unknown' }
+                    elseif ($User.Inferred) { "$($User.Profile) (inferred, not observed)" }
+                    elseif ($User.Profile) { "$($User.Profile) (signed in)" }
+                    else { 'unknown' })) + '</span></li>')
         & $add ('<li><span class="k">Log size</span><span class="v">' +
                 (ConvertTo-FxHtml ((Format-FxBytes $Coverage.FileSize) + ' of ' + (Format-FxBytes $Coverage.MaxSize))) + '</span></li>')
         if ($Coverage.Full) {

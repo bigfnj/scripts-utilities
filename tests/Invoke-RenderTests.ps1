@@ -143,6 +143,37 @@ It 'two processes sharing a recycled pid do not share a command line' {
     ($html -notmatch '<td class="t">[34]</td><td class="p">cmd\.exe /c ping')
 }
 
+Write-Host "`n== the report says whose machine it is describing ==" -ForegroundColor Cyan
+
+It 'an INFERRED user produces a warning banner at the top of the page' {
+    # Under the SYSTEM task with nobody signed in, the profile is a registry guess and can be a
+    # stranger's on a multi-profile machine. A reader who misses that misreads everything under
+    # it, so it is stated before the first number rather than in a footnote.
+    $html = New-ForensicsHtml -Deletes $deletes -ByImage $byImage -ByDir $byDir -Bursts $bursts `
+        -Sentinels $deletes -Coverage $coverage -UsnMax 2GB -Procs $procsFixture `
+        -StateChanges $stateChanges -Days 7 -MaxRows 100 -SentinelPatterns @('\.ssh') `
+        -BurstThreshold 50 -Novel $novel -Baseline $baseline -DistinctPairs 9 -Triage $triage `
+        -User ([pscustomobject]@{ Sid = 'S-1-5-21-x'; Profile = 'C:\Users\Someone'; LoggedIn = $false; Inferred = $true })
+    ($html -match 'INFERRED USER') -and ($html -match 'inferred, not observed')
+}
+It 'a CONFIRMED user produces no banner - or the warning becomes wallpaper' {
+    # The positive control. A banner shown every week is one nobody reads.
+    $html = New-ForensicsHtml -Deletes $deletes -ByImage $byImage -ByDir $byDir -Bursts $bursts `
+        -Sentinels $deletes -Coverage $coverage -UsnMax 2GB -Procs $procsFixture `
+        -StateChanges $stateChanges -Days 7 -MaxRows 100 -SentinelPatterns @('\.ssh') `
+        -BurstThreshold 50 -Novel $novel -Baseline $baseline -DistinctPairs 9 -Triage $triage `
+        -User ([pscustomobject]@{ Sid = 'S-1-5-21-x'; Profile = 'C:\Users\Someone'; LoggedIn = $true; Inferred = $false })
+    ($html -notmatch 'INFERRED USER') -and ($html -match 'C:\\Users\\Someone \(signed in\)')
+}
+It 'and the profile name is escaped like any other untrusted text' {
+    $html = New-ForensicsHtml -Deletes $deletes -ByImage $byImage -ByDir $byDir -Bursts $bursts `
+        -Sentinels $deletes -Coverage $coverage -UsnMax 2GB -Procs $procsFixture `
+        -StateChanges $stateChanges -Days 7 -MaxRows 100 -SentinelPatterns @('\.ssh') `
+        -BurstThreshold 50 -Novel $novel -Baseline $baseline -DistinctPairs 9 -Triage $triage `
+        -User ([pscustomobject]@{ Sid = 'x'; Profile = 'C:\Users\<script>alert(3)</script>'; LoggedIn = $true; Inferred = $false })
+    ($html -notmatch '<script>alert\(3\)</script>') -and ($html -match '&lt;script&gt;alert\(3\)&lt;/script&gt;')
+}
+
 Write-Host "`n== entities must render as entities, not as their own source text ==" -ForegroundColor Cyan
 
 It 'the header separator is a real entity, not the literal text &middot;' {

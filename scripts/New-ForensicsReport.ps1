@@ -270,7 +270,23 @@ if ($NoTriage) {
 
 # ---- write ---------------------------------------------------------------------------------
 $user = Get-FxInteractiveUser
-if (-not $OutDir) { $OutDir = Get-FxDownloadsPath -User $user }
+if ($user.Inferred) {
+    # Say it on the console AND on the page. The profile below came out of the registry in
+    # whatever order the keys enumerate; on a multi-profile machine with nobody signed in it
+    # can be a stranger's.
+    Write-Host ("  user: {0} was INFERRED from the registry, not observed signed in" -f $user.Sid) -ForegroundColor Yellow
+}
+if (-not $OutDir) {
+    $OutDir = Get-FxDownloadsPath -User $user
+    if (-not $OutDir) {
+        # Refusing beats guessing. This path used to fall through to $env:TEMP, which under the
+        # SYSTEM task means C:\Windows\TEMP - a directory nobody chose, that nobody looks in,
+        # and that the retention prune below would then have swept.
+        Write-Host 'cannot resolve a Downloads folder for the interactive user - refusing to guess.' -ForegroundColor Red
+        Write-Host 'Pass -OutDir explicitly to write the report somewhere deliberate.' -ForegroundColor Red
+        exit 1
+    }
+}
 $stamp = Get-Date -Format 'yyyy-MM-dd HHmmss'
 $outPath = Join-Path $OutDir "Deletion Forensics Report - $stamp.html"
 
@@ -278,14 +294,21 @@ $html = New-ForensicsHtml -Deletes $deletes -ByImage $byImage -ByDir $byDir -Bur
     -Sentinels $sentinelHits -Coverage $coverage -UsnMax $usnMax -Procs $procs `
     -StateChanges $stateChanges -Days $Days -MaxRows $MaxRows -SentinelPatterns $SentinelPatterns `
     -BurstThreshold $BurstThreshold -Novel $novel -Baseline $baseline -DistinctPairs $seen.Count `
-    -Triage $triage
+    -Triage $triage -User $user
 
 [IO.File]::WriteAllText($outPath, $html, (New-Object Text.UTF8Encoding($false)))
 Write-Host "report: $outPath" -ForegroundColor Green
 
 # Keep the last few, ordered by the timestamp in the NAME rather than mtime, so a touched file
 # cannot promote itself past a newer one. Strictly name-matched, files only, no recursion.
-if (-not $NoPrune) {
+if ($NoPrune) {
+    # nothing to do
+} elseif ($user.Inferred -and -not $PSBoundParameters.ContainsKey('OutDir')) {
+    # The report is still written - a wrong report is visible and harmless - but nothing is
+    # DELETED on the strength of a profile nobody observed. pc-maintenance draws the same line:
+    # an inferred user may be reported on and never acted for.
+    Write-Host '  retention: skipped - the interactive user was inferred, so this folder was not deliberately chosen' -ForegroundColor Yellow
+} else {
     $pattern = '^Deletion Forensics Report - (\d{4}-\d{2}-\d{2}) (\d{6})\.html$'
     $existing = @(Get-ChildItem -LiteralPath $OutDir -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match $pattern } |
