@@ -23,7 +23,12 @@ function Test-Fail { param([string]$Msg) Write-Host "FAIL $Msg" -ForegroundColor
 function Test-Warn { param([string]$Msg) Write-Host "WARN $Msg" -ForegroundColor Yellow; $script:Warn++ }
 function Test-Hdr  { param([string]$Msg) Write-Host "`n== $Msg ==" -ForegroundColor White }
 
-$tmp = New-TemporaryFile | ForEach-Object { $_.DirectoryName + "\" + $_.BaseName + "_smoketest" }
+# GetRandomFileName, not New-TemporaryFile. New-TemporaryFile CREATES a real zero-byte
+# tmpXXXX.tmp and returns it; only its NAME was ever used here, to derive a sibling directory -
+# and the cleanup at the bottom removes that DIRECTORY, so the file itself was left behind on
+# every single run. Measured: 138 orphaned tmp*.tmp in %TEMP% and climbing. GetRandomFileName
+# returns a name without touching the disk, which is all this ever needed.
+$tmp = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetFileNameWithoutExtension([IO.Path]::GetRandomFileName()) + '_smoketest')
 New-Item -ItemType Directory -Path $tmp -Force | Out-Null
 
 try {
