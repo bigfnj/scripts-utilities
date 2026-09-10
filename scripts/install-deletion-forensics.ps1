@@ -26,7 +26,14 @@ re-sizes the journal rather than erroring. Nothing is downloaded; Sysmon comes f
   .\scripts\install-deletion-forensics.ps1            # install or update
   .\scripts\install-deletion-forensics.ps1 -Verify    # report health, change nothing
   .\scripts\install-deletion-forensics.ps1 -DryRun    # show what would happen
-  .\scripts\install-deletion-forensics.ps1 -Uninstall # remove Sysmon, restore a 32 MB journal
+  .\scripts\install-deletion-forensics.ps1 -Uninstall # remove Sysmon; journal is LEFT sized
+  .\scripts\install-deletion-forensics.ps1 -Uninstall -ShrinkJournal   # also destroy the journal
+
+-Uninstall deliberately leaves the USN journal at its current size. NTFS cannot shrink one in
+place - `createjournal` with a smaller size is a silent no-op - so the only way down is to
+delete it, discarding every record. An oversized journal costs disk and nothing else, and
+destroying recent filesystem history as a side effect of removing a monitoring tool is a
+surprise nobody wants. -ShrinkJournal opts into it explicitly.
 #>
 [CmdletBinding()]
 param(
@@ -51,7 +58,10 @@ param(
     [string]$Volume = 'C:',
     [switch]$Verify,
     [switch]$DryRun,
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    # Only meaningful with -Uninstall. Shrinking a USN journal is impossible in place, so this
+    # DELETES it and recreates it small, discarding every record. Opt-in for that reason.
+    [switch]$ShrinkJournal
 )
 $ErrorActionPreference = 'Stop'
 
@@ -187,6 +197,7 @@ if (-not (Test-Elevated) -and -not $DryRun) {
                  '-Root', "`"$Root`"", '-Volume', $Volume,
                  '-UsnMaxBytes', $UsnMaxBytes, '-UsnDeltaBytes', $UsnDeltaBytes, '-LogMaxBytes', $LogMaxBytes)
     if ($Uninstall) { $argList += '-Uninstall' }
+    if ($ShrinkJournal) { $argList += '-ShrinkJournal' }
     $p = Start-Process powershell.exe -Verb RunAs -ArgumentList $argList -PassThru -Wait
     exit $p.ExitCode
 }
@@ -199,12 +210,36 @@ if ($Uninstall) {
         if ($DryRun) { Write-Info "[DRY-RUN] $sysmon -u force" }
         else { $null = Invoke-Native -FilePath $sysmon -Arguments @('-u', 'force'); Write-Ok 'Sysmon uninstalled' }
     } else { Write-Skip 'Sysmon binary not found; nothing to uninstall' }
-    # Back to the Windows default rather than deleting the journal: deletejournal would discard
-    # history that is still the only record of anything recent.
-    if ($DryRun) { Write-Info "[DRY-RUN] shrink USN journal on $Volume to 32 MB" }
-    else {
+    # The journal is NOT shrunk by default, and the reason is worth stating plainly because an
+    # earlier version of this block claimed it was.
+    #
+    # `fsutil usn createjournal` with a SMALLER m than the current one is a silent no-op: NTFS
+    # will grow a journal in place but not shrink it. The only way down is `deletejournal /d`,
+    # which discards every record it holds. This script used to run createjournal and then print
+    # "USN journal returned to 32 MB" unconditionally - measured during a lifecycle test, the
+    # journal was still 2,048 MB while the line said 32. Asserting instead of measuring, which
+    # is the same defect this whole capability exists to catch.
+    #
+    # Leaving it large is also the better default: an oversized journal costs disk and nothing
+    # else, whereas destroying the record of recent filesystem activity as a SIDE EFFECT of
+    # uninstalling a monitoring tool is exactly the kind of surprise nobody wants. -ShrinkJournal
+    # makes it opt-in and says what it costs.
+    if ($DryRun) {
+        if ($ShrinkJournal) { Write-Info "[DRY-RUN] DELETE and recreate the USN journal on $Volume at 32 MB (discards all history)" }
+        else { Write-Info "[DRY-RUN] leave the USN journal on $Volume at its current size" }
+    }
+    elseif ($ShrinkJournal) {
+        $null = Invoke-Native -FilePath 'fsutil' -Arguments @('usn', 'deletejournal', '/d', $Volume)
         $null = Invoke-Native -FilePath 'fsutil' -Arguments @('usn', 'createjournal', 'm=33554432', 'a=8388608', $Volume)
-        Write-Ok "USN journal on $Volume returned to 32 MB"
+        $now = Get-UsnState -Vol $Volume
+        if ($null -ne $now -and $now -le 33554432) { Write-Ok ("USN journal on {0} recreated at {1:N0} MB (history discarded)" -f $Volume, ($now / 1MB)) }
+        else { Write-Err ("USN journal on {0} is still {1:N0} MB - the shrink did not take" -f $Volume, ($now / 1MB)) }
+    }
+    else {
+        $now = Get-UsnState -Vol $Volume
+        Write-Skip ("USN journal left at {0:N2} GB on {1}" -f ($now / 1GB), $Volume)
+        Write-Info "it costs disk only, and shrinking it means discarding its history."
+        Write-Info "pass -ShrinkJournal to delete and recreate it at 32 MB."
     }
     exit 0
 }
