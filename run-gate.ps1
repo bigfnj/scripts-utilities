@@ -24,7 +24,7 @@
        parser IN-PROCESS, so running it from pwsh silently checked 7's grammar instead - the
        one check whose entire purpose was catching 7-only syntax quietly stopped doing it.
 
-    smoke-test.ps1 already chains the triage and render suites and fails when either does, so
+    smoke-test.ps1 already chains the core, triage and render suites and fails when either does, so
     it is invoked as one unit rather than duplicating that list here - two places naming the
     same suites is how they drift apart.
 
@@ -46,7 +46,7 @@ if (-not (Test-Path -LiteralPath $ps51)) { Write-Host "FATAL: Windows PowerShell
 $suites = @(
     @{ Name = 'smoke'
        Path = 'scripts\smoke-test.ps1'
-       What = 'toolbox, PATH, forensics sensors + the triage and render suites' }
+       What = 'toolbox, PATH, forensics sensors + the core, triage and render suites' }
 )
 
 $isAdmin = ([Security.Principal.WindowsPrincipal] `
@@ -92,7 +92,7 @@ foreach ($s in $suites) {
 
     # The sub-suite tallies are worth surfacing: smoke-test prints them as single OK lines, and
     # a silent drop from 31 to 3 would otherwise still read as green.
-    foreach ($line in ($out -split "`r?`n" | Where-Object { $_ -match '(triage|render) suite: \d+ passed' })) {
+    foreach ($line in ($out -split "`r?`n" | Where-Object { $_ -match '(core|triage|render) suite: \d+ passed' })) {
         Write-Host ("         {0}" -f $line.Trim()) -ForegroundColor DarkGray
     }
 

@@ -62,174 +62,12 @@ param(
 $ErrorActionPreference = 'Stop'
 $SysmonLog = 'Microsoft-Windows-Sysmon/Operational'
 
-# Sentinels: directories where ANY deletion is unusual. The tile is only worth reading if that
-# stays true, so membership is decided by measured quietness, not by how much the directory
-# matters. All of these were valuable in the 2026-09-09 loss; only these are silent in normal
-# operation.
-#
-# Measured over the first week and REMOVED for being loud - each was diluting the signal:
-#   AppData\Local\Programs   992 hits (VS Code and friends rewriting themselves)
-#   .claude                   78 hits (agent transcripts and state, written continuously)
-#   .codex                    52 hits (same)
-# They are still fully tracked - they appear in the deletion counts, the log reader and burst
-# detection, and a mass deletion of any of them would show up as a burst. They just cannot be
-# sentinels, because a sentinel that fires 992 times a week is a sentinel nobody reads.
-$SentinelPatterns = @(
-    '\\\.ssh($|\\)', '\\\.aws($|\\)', '\\\.azure($|\\)', '\\\.kube($|\\)', '\\\.gnupg($|\\)',
-    '\\\.ollama($|\\)', '\\\.gemini($|\\)', '\\\.agents($|\\)', '\\\.antigravity($|\\)',
-    '\\\.continue($|\\)', '\\\.config($|\\)', '\\\.cargo\\bin($|\\)', '\\\.dotnet\\tools($|\\)',
-    '\\AppData\\Local\\DevToolbox($|\\)', '\\Documents($|\\)'
-)
+# Everything pure lives in Core so a test can import it. This script cannot be imported: its
+# top-level code starts reading the event log immediately and exits on the unelevated path.
+. (Join-Path $PSScriptRoot 'ForensicsReport.Core.ps1')
 
-# One compiled alternation, built once. Classification used to be a nested Where-Object - a
-# fresh pipeline per event over all 15 patterns, with no short-circuit - and it ran twice, once
-# over every deletion and again over the rows the reader embeds. Measured on 100,000 paths:
-# 28,129 ms for the nested pipeline, 1,770 ms for foreach+break, 1,145 ms for this. All three
-# produced identical match counts, which is the part that had to be true before changing it.
-$sentinelRx = New-Object System.Text.RegularExpressions.Regex(
-    ($SentinelPatterns -join '|'),
-    ([System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
-     [System.Text.RegularExpressions.RegexOptions]::Compiled))
-
-# ---- novelty ------------------------------------------------------------------------------
-# What a WEEKLY report should surface is not "what happened" - the counts already say that -
-# but "what happened that does not usually happen". The strongest available signal for that is
-# a process/directory pairing appearing for the FIRST time.
-#
-# Deliberately statistics and not a model. An earlier plan for this used embeddings; looking at
-# the actual data shape - (process, directory, count) - that is the wrong tool. Embeddings
-# measure semantic similarity between path strings, while the thing that makes a deletion
-# suspicious here is that this program has never deleted in this place before. That is a
-# frequency question, it is exactly reproducible run to run, it needs no model to be running,
-# and every row can state its own reason in one sentence. None of those are true of a model.
-
-function Get-FxPairKey {
-    <#
-        A stable key for "this program deleting in this place".
-
-        The directory is generalised to a bounded prefix, because the full path is too specific
-        to ever repeat: .cargo\registry\src\<hash>\<crate>-1.2.3 is a different string every
-        release, so a raw-path baseline would report everything as novel forever and mean
-        nothing. Four segments below the profile is deep enough to separate .ollama\models from
-        .cargo\registry and shallow enough to be stable across versions.
-    #>
-    param([string]$Image, [string]$Path, [string]$Dir)
-    # This runs once per deletion event and was the single most expensive thing in the report:
-    # 49,312 ms per 100,000 events. Two lines were 78% of that - the segment pipeline at 29,060
-    # ms and Split-Path at 9,434 ms. Rewritten with String.Split and GetDirectoryName, and with
-    # -Dir so the gather loop can hand over the parent it already computed.
-    #
-    # The rewrite was checked against the old implementation over 68 cases spanning profile and
-    # non-profile paths, depths either side of the four-segment cut, trailing separators, UNC,
-    # drive roots, unicode, relative paths and a bare filename, with and without -Dir: 0 differ.
-    # Two real divergences were found and fixed that way rather than shipped - an invented
-    # fallback for empty results, and GetDirectoryName disagreeing with Split-Path on a
-    # trailing separator.
-    $dir = if ($Dir) { $Dir }
-           else { try { [IO.Path]::GetDirectoryName($Path.TrimEnd('\', '/')) } catch { $Path } }
-    $m = [regex]::Match($dir, '(?i)^([A-Za-z]:\\Users\\[^\\]+)\\(.*)$')
-    if ($m.Success) {
-        $parts = $m.Groups[2].Value.Split([char]'\', [StringSplitOptions]::RemoveEmptyEntries)
-        if ($parts.Length -eq 0) { $dir = $m.Groups[1].Value }
-        else {
-            $n = [Math]::Min(4, $parts.Length)
-            $dir = $m.Groups[1].Value + '\' + ($parts[0..($n - 1)] -join '\')
-        }
-    }
-    return ('{0}|{1}' -f [IO.Path]::GetFileName($Image), $dir)
-}
-
-function Read-FxBaseline {
-    <#
-        Pairings seen in previous runs. Absent on the first run, which is not an error - it just
-        means nothing can be called novel yet, and the report says so rather than flagging all
-        4,000 events as new.
-
-        Kept beside the Sysmon config in ProgramData rather than in the toolbox, for the same
-        reason the config is: DevToolbox was destroyed in the incident this tooling exists to
-        investigate, so nothing it depends on should live inside its own subject.
-    #>
-    param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return $null }
-    try {
-        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json
-        $h = @{}
-        foreach ($p in $raw.pairs) { $h[[string]$p.key] = $p }
-        return @{ Pairs = $h; FirstRun = [string]$raw.firstRun; Runs = [int]$raw.runs }
-    } catch { return $null }
-}
-
-function Write-FxBaseline {
-    param([string]$Path, [hashtable]$Seen, $Existing)
-    # Bounded. A pairing not seen for a long time is dropped so the file cannot grow forever;
-    # 5,000 is far above the ~100 distinct pairings this machine actually produces.
-    $now = (Get-Date).ToString('o')
-    $merged = @{}
-    if ($Existing) { foreach ($k in $Existing.Pairs.Keys) { $merged[$k] = $Existing.Pairs[$k] } }
-    foreach ($k in $Seen.Keys) {
-        if ($merged.ContainsKey($k)) {
-            $merged[$k].lastSeen = $now
-            $merged[$k].count = [int]$merged[$k].count + [int]$Seen[$k]
-        } else {
-            $merged[$k] = [pscustomobject]@{ key = $k; firstSeen = $now; lastSeen = $now; count = [int]$Seen[$k] }
-        }
-    }
-    $keep = @($merged.Values | Sort-Object { [datetime]$_.lastSeen } -Descending | Select-Object -First 5000)
-    $obj = [ordered]@{
-        firstRun = $(if ($Existing -and $Existing.FirstRun) { $Existing.FirstRun } else { $now })
-        runs     = $(if ($Existing) { [int]$Existing.Runs + 1 } else { 1 })
-        updated  = $now
-        pairs    = $keep
-    }
-    try {
-        New-Item -ItemType Directory -Path (Split-Path $Path -Parent) -Force | Out-Null
-        $obj | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Path -Encoding UTF8
-        return $true
-    } catch { return $false }
-}
-
-function Get-InteractiveUser {
-    # SYSTEM runs the scheduled task, so "the user" is whoever owns the console session, not the
-    # process. Same problem pc-maintenance solves; same approach.
-    $sid = $null; $profilePath = $null
-    try {
-        $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
-        if ($cs.UserName) {
-            $acct = New-Object Security.Principal.NTAccount($cs.UserName)
-            $sid = $acct.Translate([Security.Principal.SecurityIdentifier]).Value
-        }
-    } catch { }
-    if (-not $sid) { try { $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value } catch { } }
-    if ($sid) {
-        $k = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
-        if (Test-Path -LiteralPath $k) {
-            $profilePath = (Get-ItemProperty -LiteralPath $k -Name ProfileImagePath -ErrorAction SilentlyContinue).ProfileImagePath
-        }
-    }
-    [pscustomobject]@{ Sid = $sid; Profile = $profilePath }
-}
-
-function Get-DownloadsPath {
-    param($User)
-    $guid = '{374DE290-123F-4565-9164-39C4925E467B}'   # FOLDERID_Downloads
-    if ($User.Sid) {
-        $key = "Registry::HKEY_USERS\$($User.Sid)\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
-        try {
-            $raw = (Get-ItemProperty -LiteralPath $key -Name $guid -ErrorAction Stop).$guid
-            if ($raw) {
-                $ex = [Environment]::ExpandEnvironmentVariables($raw)
-                # Under SYSTEM, %USERPROFILE% in that value expands to SYSTEM's own profile.
-                if ($User.Profile -and $ex -match '^[A-Za-z]:\\Windows\\system32') { $ex = Join-Path $User.Profile 'Downloads' }
-                if ($ex -and (Test-Path -LiteralPath $ex)) { return $ex }
-            }
-        } catch { }
-    }
-    if ($User.Profile) {
-        $p = Join-Path $User.Profile 'Downloads'
-        if (Test-Path -LiteralPath $p) { return $p }
-    }
-    return $env:TEMP
-}
+$SentinelPatterns = Get-FxSentinelPattern
+$sentinelRx = New-FxSentinelRegex -Pattern $SentinelPatterns
 
 # ---- gather --------------------------------------------------------------------------------
 $since = (Get-Date).AddDays(-$Days)
@@ -277,10 +115,9 @@ $procs = @{}
 try {
     Get-WinEvent -FilterHashtable @{LogName=$SysmonLog; Id=1; StartTime=$since} -ErrorAction Stop |
         ForEach-Object {
-            # Event 1: [4] Image, [10] CommandLine. Keyed by pid; last writer wins, which is
-            # right - a reused pid should resolve to the most recent process that held it.
-            # Keyed by ProcessGuid [2], which is unique per process, NOT ProcessId [3], which is
-            # recycled. See the Guid field on the delete records for what pid keying produced.
+            # Event 1: [2] ProcessGuid, [10] CommandLine. Keyed by ProcessGuid, which is unique
+            # per process, NOT ProcessId, which Windows recycles within minutes. See the Guid
+            # field on the delete records above for what pid keying produced in practice.
             $procs[[string]$_.Properties[2].Value] = [string]$_.Properties[10].Value
         }
 } catch { }
@@ -432,8 +269,8 @@ if ($NoTriage) {
 }
 
 # ---- write ---------------------------------------------------------------------------------
-$user = Get-InteractiveUser
-if (-not $OutDir) { $OutDir = Get-DownloadsPath -User $user }
+$user = Get-FxInteractiveUser
+if (-not $OutDir) { $OutDir = Get-FxDownloadsPath -User $user }
 $stamp = Get-Date -Format 'yyyy-MM-dd HHmmss'
 $outPath = Join-Path $OutDir "Deletion Forensics Report - $stamp.html"
 

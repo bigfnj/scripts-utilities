@@ -394,7 +394,8 @@ $parseProbe = {
     $bad -join "`n"
 }
 $fxFiles = @()
-foreach ($fxScript in 'New-ForensicsReport.ps1', 'ForensicsReport.Render.ps1', 'ForensicsReport.Triage.ps1') {
+foreach ($fxScript in 'New-ForensicsReport.ps1', 'ForensicsReport.Core.ps1',
+                      'ForensicsReport.Render.ps1', 'ForensicsReport.Triage.ps1') {
     $fxPath = Join-Path $PSScriptRoot $fxScript
     if (-not (Test-Path $fxPath)) { Test-Fail "missing $fxScript" } else { $fxFiles += $fxPath }
 }
@@ -457,6 +458,7 @@ if ($lintOut) {
 # nothing for as long as that went unnoticed. A gate that passes when its tests have vanished is
 # not a gate.
 foreach ($suite in @(
+    @{ Name = 'core';   File = 'tests\Invoke-CoreTests.ps1' },
     @{ Name = 'triage'; File = 'tests\Invoke-TriageTests.ps1' },
     @{ Name = 'render'; File = 'tests\Invoke-RenderTests.ps1' }
 )) {
