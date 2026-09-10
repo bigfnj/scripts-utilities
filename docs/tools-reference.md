@@ -275,8 +275,22 @@ structure — not something a general toolbox run should do to you unasked.
 .\scripts\install-deletion-forensics.ps1            # install or update (self-elevates)
 .\scripts\install-deletion-forensics.ps1 -Verify    # health only, changes nothing
 .\scripts\install-deletion-forensics.ps1 -DryRun    # show the plan
-.\scripts\install-deletion-forensics.ps1 -Uninstall # remove Sysmon, restore a 32 MB journal
+.\scripts\install-deletion-forensics.ps1 -Uninstall # remove Sysmon; the journal is LEFT sized
+.\scripts\install-deletion-forensics.ps1 -Uninstall -ShrinkJournal   # also destroy the journal
 ```
+
+**`-Uninstall` deliberately leaves the USN journal at its current size.** NTFS grows a journal in
+place but will not shrink one — `fsutil usn createjournal` with a smaller `m` is a silent no-op —
+so the only way down is `deletejournal /d`, which discards every record it holds. An oversized
+journal costs disk and nothing else, whereas destroying the record of recent filesystem activity
+as a side effect of removing a *monitoring* tool is a surprise nobody wants. `-ShrinkJournal`
+opts into precisely that: delete, recreate at 32 MB, lose the history. It is meaningful only
+alongside `-Uninstall`.
+
+An earlier version of the script ran `createjournal` and then printed "USN journal returned to
+32 MB" unconditionally. Measured during a lifecycle test, the journal was still 2,048 MB while
+the line said 32 — asserting instead of measuring, the same defect this whole capability exists
+to catch. The uninstall path now re-reads the size and reports what it actually found.
 
 **Why it exists.** On 2026-09-09 this workstation lost ~16 profile dotdirs,
 `%LOCALAPPDATA%\DevToolbox`, `.dotnet\tools` and ~70 GB of Ollama models inside a 97-minute
@@ -314,9 +328,17 @@ Sysmon fires **per file, not per directory**, so a recursive tree delete appears
 event 26 sharing one `Image` and `ProcessGuid`*. That burst is the signature; pair it with event 1
 for the command line.
 
-**Scope is deliberate.** `config\sysmon-filedelete.xml` watches `C:\Users\<user>\.*`,
-`AppData\Local` and `Documents`. The reasoning: a mass deletion is defined by *breadth*, so quiet
-valuable paths make better sentinels than noisy caches where deletions are normal.
+**Scope is deliberate.** `config\sysmon-filedelete.xml` includes three prefixes — the profile
+dotdirs, `AppData\Local` and `Documents`. The reasoning: a mass deletion is defined by *breadth*,
+so quiet valuable paths make better sentinels than noisy caches where deletions are normal.
+
+**Those prefixes are hardcoded to one profile.** The literal path `C:\Users\Admin` appears 25
+times in the file - 24 of them `<TargetFilename>` rules, in the include and exclude groups alike,
+and one in a comment explaining the choice. There is no wildcard and nothing substitutes the
+current user at deploy time, so on any other machine, or under any other account on this one, the
+config installs without complaint and then matches nothing. Edit it before installing it
+elsewhere. Both `-Verify` and `smoke-test.ps1` compare the deployed copy to the repo copy by hash,
+so an edit made only on the machine shows up as a mismatch rather than passing quietly.
 
 **Retention target is 48 hours** of deletion history — two days is the useful window for "what
 happened to my files". Every exclusion was measured before being added, over four rounds:
@@ -368,6 +390,7 @@ any of this was measured, which is why the dashboard reports retention from the 
 ```powershell
 .\scripts\New-ForensicsReport.ps1              # now, last 7 days
 .\scripts\New-ForensicsReport.ps1 -Days 30     # wider window
+.\scripts\New-ForensicsReport.ps1 -NoTriage    # measured facts only, no model
 ```
 
 A SYSTEM scheduled task (`DeletionForensicsReport`, Sunday 04:00 - an hour after pc-maintenance's
@@ -376,10 +399,39 @@ real Downloads. Registered by the installer; `-NoSchedule` opts out. Only the th
 are kept, ordered by the timestamp in the *name* rather than mtime, so a touched file cannot
 promote itself past a newer one.
 
+Every parameter it takes:
+
+| parameter | default | effect |
+|---|---|---|
+| `-Days` | `7` | how much Sysmon history to read |
+| `-OutDir` | the interactive user's Downloads | resolved from that user's own shell-folder registration, not `<profile>\Downloads`, which is commonly redirected |
+| `-MaxRows` | `4000` | rows embedded in the log reader. A file-size cap, not a limit on the analysis: every count above the table is computed over all events in the window |
+| `-KeepReports` | `3` | how many previous reports survive the prune |
+| `-NoPrune` | off | keep every report; skips the prune entirely |
+| `-BurstThreshold` | `50` | files one process must delete inside the window below before it is called a burst |
+| `-BurstWindowSeconds` | `300` | that window |
+| `-NoTriage` | off | omit the model-assisted panel |
+| `-TriageModel` | `mistral-small3.2:24b` | which local model to ask |
+| `-TriageUri` | `http://127.0.0.1:11434` | where to look for it |
+
+**Triage asks a local model by default, and nothing leaves the machine.** If an Ollama answers at
+`-TriageUri` the report gains one fenced panel of hypotheses about what a cluster of events might
+mean. It is on by default because a feature nobody opts into is a feature nobody gets. The
+default URI is loopback, the liveness probe is `/api/tags` on that same host, and the report
+makes no other network call of any kind - a test asserts the HTML fetches nothing from anywhere.
+`-NoTriage` disables it; so does an absent server, a slow one or a nonsensical answer. All four
+produce the identical report minus that one panel.
+
+The model is shown aggregates - top processes, bursts, new pairings, sentinel hits - never the
+raw log, and every finding it returns has to cite a process and a directory that were in that
+input. Anything citing something it was never shown is discarded before the page is written, and
+the run prints how many were kept and how many rejected. It cannot gate, filter, reorder or
+change a single measured number.
+
 It answers two different needs.
 
-**Insights.** Four openable stat tiles (deletions, processes, bursts, sentinel paths), a burst
-panel and a coverage panel. The headline is the largest **burst** - one process deleting many
+**Insights.** Five openable stat tiles (deletions, processes, bursts, new pairings, sentinel
+paths), a burst panel and a coverage panel. The headline is the largest **burst** - one process deleting many
 files in a short window - because that, not raw volume, is the shape of a mass deletion. A
 machine steadily deleting build output all week is not interesting; 1,566 files in 159 seconds is.
 
@@ -393,6 +445,23 @@ reading if any hit is unusual, so `AppData\Local\Programs` (992 hits in the firs
 rewriting itself), `.claude` (78) and `.codex` (52) were removed after measurement. They are
 still fully tracked in the counts, the reader and burst detection; they just cannot be sentinels.
 A healthy week reads **0**.
+
+**New pairings need a baseline, and the baseline is a file on disk.** A pairing is one program
+deleting in one place, with the directory generalised to four segments below the profile -
+a raw path like `.cargo\registry\src\<hash>\<crate>-1.2.3` is a different string every release
+and would report everything as novel forever. Each run compares what it saw against
+`%ProgramData%\Sysmon\forensics-baseline.json`, reports the pairings that were not already in it,
+and only *then* merges its own in. That order is the whole trick: written first, this run's
+pairings would be in the baseline it is checked against and nothing could ever be new. The file
+is bounded at 5,000 entries, least-recently-seen dropped first, against the ~100 distinct
+pairings this machine actually produces.
+
+Without that file the tile reads **n/a** and says why: a first run establishes the baseline and
+can honestly call nothing novel, which is better than flagging all 4,000 events. It lives beside
+the Sysmon config in `%ProgramData%\Sysmon` rather than in the toolbox, for the same reason the
+config does - the toolbox was destroyed in the incident this tooling exists to investigate.
+Deleting it is not damaging but it is not free either: the next run starts a fresh baseline, and
+the tile only becomes meaningful again once a few runs have accumulated.
 
 **Coverage is measured, not estimated.** The panel reports the log's actual span and projects
 retention from observed size and rate. An earlier hand estimate was out by an order of magnitude

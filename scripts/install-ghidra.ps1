@@ -85,8 +85,32 @@ function Get-Json {
     } catch {
         $python = Join-Path $Root "python\.venv\Scripts\python.exe"
         if (-not (Test-Path $python)) { throw }
-        $tokenArg = [string]$token
-        $json = & $python -c "import requests,sys; h={'User-Agent':'scripts-utilities'}; h.update({'Authorization':'Bearer '+sys.argv[2]} if sys.argv[2] else {}); r=requests.get(sys.argv[1],headers=h,timeout=60); r.raise_for_status(); print(r.text)" $Url $tokenArg
+        # NEVER put the token on the command line. A Windows command line is world-readable for
+        # the lifetime of the process through Win32_Process/CIM (any user, no privilege needed),
+        # and it also outlives the process: this repo's own Sysmon config,
+        # config\sysmon-filedelete.xml, includes '<Image condition="end with">\python.exe</Image>'
+        # in its ProcessCreate capture, so a token passed as argv[2] was copied verbatim into a
+        # 2 GB event log holding days of history. Pass it in the child's environment instead -
+        # a process environment block is readable only by the same user or an admin, is not
+        # captured by ProcessCreate, and dies with the process. Nothing here echoes the value.
+        $pyGet = "import os,requests,sys; h={'User-Agent':'scripts-utilities'}; t=os.environ.get('GH_API_TOKEN'); h.update({'Authorization':'Bearer '+t} if t else {}); r=requests.get(sys.argv[1],headers=h,timeout=60); r.raise_for_status(); print(r.text)"
+        # Same host test as the header above: Get-Json also fetches api.adoptium.net, and a
+        # GitHub token must never travel there. Clearing the variable when we are not sending
+        # one also stops an unrelated GH_API_TOKEN already in this shell from leaking out.
+        $sendToken = ($token -and ($Url -like "https://api.github.com/*"))
+        $hadToken = Test-Path Env:\GH_API_TOKEN
+        $prevToken = if ($hadToken) { $env:GH_API_TOKEN } else { $null }
+        try {
+            if ($sendToken) { $env:GH_API_TOKEN = $token }
+            else { Remove-Item Env:\GH_API_TOKEN -ErrorAction SilentlyContinue }
+            $json = & $python -c $pyGet $Url
+        } finally {
+            # Restore exactly what was there, and REMOVE rather than blank it if it was absent:
+            # $env:X = '' leaves an empty variable behind in Windows PowerShell 5.1, which a
+            # later reader cannot tell apart from a real (empty) token.
+            if ($hadToken) { $env:GH_API_TOKEN = $prevToken }
+            else { Remove-Item Env:\GH_API_TOKEN -ErrorAction SilentlyContinue }
+        }
         if ($LASTEXITCODE -ne 0) { throw "JSON request failed: $Url" }
         return ($json | ConvertFrom-Json)
     }
@@ -109,11 +133,12 @@ if (-not $SkipGhidra) {
         $digest = if ($asset.digest -match '^sha256:(.+)$') { $Matches[1] } else { "" }
         if (-not $digest) { throw "latest Ghidra release does not publish a SHA-256 digest" }
         Get-Download -Url $asset.browser_download_url -OutFile $zip -Sha256 $digest -MinimumBytes 100MB
-        if (-not $DryRun) {
-            Expand-ZipTo $zip $native
-            Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
-            Write-Ok "Ghidra -> $native"
-        }
+        # No -DryRun guard here: this is the else of 'elseif ($DryRun)', so $DryRun is already
+        # known false. The guard that used to wrap these three lines could never be anything but
+        # true, and reading it suggested a dry run reached this far - it cannot.
+        Expand-ZipTo $zip $native
+        Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+        Write-Ok "Ghidra -> $native"
     }
 }
 
@@ -131,11 +156,10 @@ if (-not $SkipJdk) {
         if (-not $package.link -or -not $package.checksum) { throw "Adoptium API returned no JDK package/checksum" }
         $zip = Join-Path $dl $package.name
         Get-Download -Url $package.link -OutFile $zip -Sha256 $package.checksum -MinimumBytes 100MB
-        if (-not $DryRun) {
-            Expand-ZipTo $zip $native
-            Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
-            Write-Ok "JDK -> $native"
-        }
+        # Same dead guard as the Ghidra branch above: unreachable unless $DryRun is false.
+        Expand-ZipTo $zip $native
+        Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+        Write-Ok "JDK -> $native"
     }
 }
 

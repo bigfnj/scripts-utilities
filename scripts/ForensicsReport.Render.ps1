@@ -10,6 +10,35 @@
     script disabled.
 #>
 
+# These live in the file that USES them, deliberately.
+#
+# The escaper used to be called ConvertTo-Html - the name of a real PowerShell cmdlet - and was
+# defined in the CALLER. Dot-source this file on its own, as the first line of any render test
+# would, and every call silently resolved to Microsoft.PowerShell.Utility\ConvertTo-Html: the
+# user data is dropped, a full XHTML document is returned instead of an escaped fragment, and
+# two w3.org URLs are injected into a report whose header promises it fetches nothing. Nothing
+# would have thrown. The sibling project avoids this by prefixing (ConvertTo-PMHtml) and by
+# keeping the helper next to the renderer; both halves of that are copied here.
+function ConvertTo-FxHtml {
+    param([AllowNull()][string]$Text)
+    if ($null -eq $Text) { return '' }
+    # & first, or the escapes escape each other.
+    $Text.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;').Replace('"', '&quot;')
+}
+
+function Format-FxBytes {
+    param([double]$B)
+    if ($B -lt 1KB) { return ('{0:N0} B' -f $B) }
+    if ($B -lt 1MB) { return ('{0:N1} KB' -f ($B / 1KB)) }
+    if ($B -lt 1GB) { return ('{0:N1} MB' -f ($B / 1MB)) }
+    # The TB tier is not hypothetical padding: this formats the USN journal and the Sysmon log,
+    # both of which are sized in GB today and both of which an operator can raise. Without it a
+    # 2 TB journal renders as "2,048.00 GB". The sibling project pinned exactly this with a test
+    # called "a terabyte is not four figures of GB"; this copy had drifted without it.
+    if ($B -lt 1TB) { return ('{0:N2} GB' -f ($B / 1GB)) }
+    return ('{0:N2} TB' -f ($B / 1TB))
+}
+
 function New-ForensicsHtml {
     param(
         $Deletes, $ByImage, $ByDir, $Bursts, $Sentinels, $Coverage, $UsnMax,
@@ -93,15 +122,20 @@ mark{background:rgba(210,153,34,.32);color:inherit;border-radius:2px}
     & $add ('<style>' + $css + '</style></head><body><div class="wrap">')
 
     & $add ('<h1>Deletion forensics</h1>')
-    & $add ('<div class="sub">' + (ConvertTo-Html ("{0:yyyy-MM-dd HH:mm} &middot; last {1} day(s) &middot; {2}" -f $now, $Days, $env:COMPUTERNAME)) + '</div>')
+    # Entities are built OUTSIDE the escaper. Passing "&middot;" through it turns the & into
+    # &amp; and the page renders the literal text "&middot;". Every other site in this file
+    # already gets this right; these two did not.
+    & $add ('<div class="sub">' + (ConvertTo-FxHtml ('{0:yyyy-MM-dd HH:mm}' -f $now)) +
+            ' &middot; last ' + (ConvertTo-FxHtml ([string]$Days)) + ' day(s) &middot; ' +
+            (ConvertTo-FxHtml ([string]$env:COMPUTERNAME)) + '</div>')
 
     # ---- hero: the one number that matters ----
     $topBurst = if ($Bursts.Count) { $Bursts[0] } else { $null }
     if ($topBurst) {
         & $add '<div class="hero">'
         & $add ('<div class="big" style="color:var(--bad)">' + ('{0:N0} files in {1}s' -f $topBurst.Count, $topBurst.Seconds) + '</div>')
-        & $add ('<div class="note">Largest burst: ' + (ConvertTo-Html (Split-Path $topBurst.Image -Leaf)) +
-                ' at ' + (ConvertTo-Html ('{0:yyyy-MM-dd HH:mm:ss}' -f $topBurst.Start)) +
+        & $add ('<div class="note">Largest burst: ' + (ConvertTo-FxHtml (Split-Path $topBurst.Image -Leaf)) +
+                ' at ' + (ConvertTo-FxHtml ('{0:yyyy-MM-dd HH:mm:ss}' -f $topBurst.Start)) +
                 '. A mass deletion looks like this - one process, many files, a short window.</div>')
         & $add '</div>'
     } else {
@@ -141,13 +175,13 @@ mark{background:rgba(210,153,34,.32);color:inherit;border-radius:2px}
     foreach ($t in $tiles) {
         $n = @($t.Rows).Count
         $cls = 'tile ' + $t.Cls + $(if (-not $n) { ' empty' } else { '' })
-        & $add ('<details class="' + $cls.Trim() + '"><summary><span class="label">' + (ConvertTo-Html $t.Label) +
-                '</span><span class="value">' + (ConvertTo-Html $t.Value) + '</span></summary>')
-        & $add ('<div class="drawer"><p class="blurb">' + (ConvertTo-Html $t.Blurb) + '</p>')
+        & $add ('<details class="' + $cls.Trim() + '"><summary><span class="label">' + (ConvertTo-FxHtml $t.Label) +
+                '</span><span class="value">' + (ConvertTo-FxHtml $t.Value) + '</span></summary>')
+        & $add ('<div class="drawer"><p class="blurb">' + (ConvertTo-FxHtml $t.Blurb) + '</p>')
         if ($n) {
             & $add '<ul class="rows">'
             foreach ($r in $t.Rows) {
-                & $add ('<li><span class="k">' + (ConvertTo-Html $r.K) + '</span><span class="v">' + (ConvertTo-Html $r.V) + '</span></li>')
+                & $add ('<li><span class="k">' + (ConvertTo-FxHtml $r.K) + '</span><span class="v">' + (ConvertTo-FxHtml $r.V) + '</span></li>')
             }
             & $add '</ul>'
         } else { & $add '<p class="none">None this period.</p>' }
@@ -161,14 +195,14 @@ mark{background:rgba(210,153,34,.32);color:inherit;border-radius:2px}
         foreach ($b in $Bursts) {
             $rate = if ($b.Seconds -gt 0) { [math]::Round($b.Count / [double]$b.Seconds, 1) } else { $b.Count }
             & $add '<div class="burst"><div class="hdr">'
-            & $add ('<span class="img">' + (ConvertTo-Html $b.Image) + '</span>')
+            & $add ('<span class="img">' + (ConvertTo-FxHtml $b.Image) + '</span>')
             & $add ('<span class="rate">' + ('{0:N0} files / {1}s ({2}/s)' -f $b.Count, $b.Seconds, $rate) + '</span>')
             & $add '</div>'
-            & $add ('<div class="meta">' + (ConvertTo-Html ('{0:yyyy-MM-dd HH:mm:ss} to {1:HH:mm:ss}' -f $b.Start, $b.End)) +
+            & $add ('<div class="meta">' + (ConvertTo-FxHtml ('{0:yyyy-MM-dd HH:mm:ss} to {1:HH:mm:ss}' -f $b.Start, $b.End)) +
                     ' &middot; ' + ('{0:N0}' -f $b.Total) + ' deletions from this process in the whole window</div>')
             if (@($b.Dirs).Count) {
                 & $add '<ul>'
-                foreach ($d in $b.Dirs) { & $add ('<li>' + (ConvertTo-Html $d.Name) + ' &mdash; ' + ('{0:N0}' -f $d.Count) + '</li>') }
+                foreach ($d in $b.Dirs) { & $add ('<li>' + (ConvertTo-FxHtml $d.Name) + ' &mdash; ' + ('{0:N0}' -f $d.Count) + '</li>') }
                 & $add '</ul>'
             }
             & $add '</div>'
@@ -186,7 +220,7 @@ mark{background:rgba(210,153,34,.32);color:inherit;border-radius:2px}
                 ('{0:N0}' -f $DistinctPairs) + ' pairing(s) this window. Each row is a program deleting somewhere it has not deleted before - which is not by itself wrong, only unusual, and the reason it is worth a look rather than an alarm.</p>')
         & $add '<ul class="rows">'
         foreach ($n in @($Novel | Select-Object -First 25)) {
-            & $add ('<li><span class="k">' + (ConvertTo-Html ('{0}  ->  {1}' -f $n.Image, $n.Dir)) +
+            & $add ('<li><span class="k">' + (ConvertTo-FxHtml ('{0}  ->  {1}' -f $n.Image, $n.Dir)) +
                     '</span><span class="v">' + ('{0:N0}' -f $n.Count) + ' deletion(s)</span></li>')
         }
         & $add '</ul>'
@@ -205,9 +239,10 @@ mark{background:rgba(210,153,34,.32);color:inherit;border-radius:2px}
     & $add '<ul class="rows">'
     if ($Coverage) {
         & $add ('<li><span class="k">Log spans</span><span class="v">' +
-                (ConvertTo-Html ('{0:yyyy-MM-dd HH:mm} &rarr; now ({1:N1} h)' -f $Coverage.Oldest, $Coverage.SpanHours)) + '</span></li>')
+                (ConvertTo-FxHtml ('{0:yyyy-MM-dd HH:mm}' -f $Coverage.Oldest)) + ' &rarr; now (' +
+                (ConvertTo-FxHtml ('{0:N1} h' -f $Coverage.SpanHours)) + ')</span></li>')
         & $add ('<li><span class="k">Log size</span><span class="v">' +
-                (ConvertTo-Html ((Format-Bytes $Coverage.FileSize) + ' of ' + (Format-Bytes $Coverage.MaxSize))) + '</span></li>')
+                (ConvertTo-FxHtml ((Format-FxBytes $Coverage.FileSize) + ' of ' + (Format-FxBytes $Coverage.MaxSize))) + '</span></li>')
         if ($Coverage.Full) {
             & $add ('<li><span class="k">Retention (measured, log has wrapped)</span><span class="v">' +
                     ('{0:N0} h' -f $Coverage.SpanHours) + '</span></li>')
@@ -216,14 +251,50 @@ mark{background:rgba(210,153,34,.32);color:inherit;border-radius:2px}
                     ('{0:N0} h' -f $Coverage.ProjectedHours) + '</span></li>')
         }
     }
-    if ($UsnMax) { & $add ('<li><span class="k">USN journal</span><span class="v">' + (Format-Bytes $UsnMax) + '</span></li>') }
+    if ($UsnMax) { & $add ('<li><span class="k">USN journal</span><span class="v">' + (Format-FxBytes $UsnMax) + '</span></li>') }
     foreach ($s in $StateChanges) {
-        & $add ('<li><span class="k">Sensor ' + (ConvertTo-Html $s.State) + '</span><span class="v">' +
-                (ConvertTo-Html ('{0:yyyy-MM-dd HH:mm:ss}' -f $s.Time)) + '</span></li>')
+        & $add ('<li><span class="k">Sensor ' + (ConvertTo-FxHtml $s.State) + '</span><span class="v">' +
+                (ConvertTo-FxHtml ('{0:yyyy-MM-dd HH:mm:ss}' -f $s.Time)) + '</span></li>')
     }
     & $add '</ul>'
     & $add '<p class="blurb">Sysmon stopping and starting is normal at boot and on reconfiguration, but each pair is a window this log cannot describe. Retention is measured from the log itself rather than estimated: it is capped by bytes, so hours of coverage move with event size and rate.</p>'
     & $add '</div>'
+
+    # ---- what was actually run ----
+    # Event 26 says a file went. Event 1 says what was invoked. Joined by pid, the pair is the
+    # difference between "rm.exe deleted 400 files" and "rm -rf /c/Users/Admin/.ollama" - and
+    # the second one is the sentence an investigation actually needs. Counted over every
+    # deletion in the window, not only the rows the log reader shows.
+    if ($Procs -and $Procs.Count) {
+        $cmdCounts = @{}
+        $matched = 0
+        foreach ($d in $Deletes) {
+            if ($d.Pid -and $Procs.ContainsKey([string]$d.Pid)) {
+                $k = [string]$Procs[[string]$d.Pid]
+                if ($k) {
+                    if ($cmdCounts.ContainsKey($k)) { $cmdCounts[$k]++ } else { $cmdCounts[$k] = 1 }
+                    $matched++
+                }
+            }
+        }
+        if ($cmdCounts.Count) {
+            & $add '<div class="panel"><h2>Command lines behind the deletions</h2>'
+            & $add ('<p class="blurb">Joined to the deletions by process id. A reused pid resolves to the most ' +
+                    'recent process that held it, so treat a surprising pairing as a lead rather than a fact.</p>')
+            & $add '<table><thead><tr><th>Deletions</th><th>Command line</th></tr></thead><tbody>'
+            foreach ($e in ($cmdCounts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 15)) {
+                & $add ('<tr><td class="t">' + ('{0:N0}' -f $e.Value) + '</td><td class="p">' +
+                        (ConvertTo-FxHtml ([string]$e.Key)) + '</td></tr>')
+            }
+            & $add '</tbody></table>'
+            # Say how much of the picture is missing rather than presenting a partial join as whole.
+            $unmatched = @($Deletes).Count - $matched
+            if ($unmatched -gt 0) {
+                & $add ('<p class="blurb">' + (ConvertTo-FxHtml ('{0:N0} deletion(s) have no matching process-start event in this window, usually because the process started before it began.' -f $unmatched)) + '</p>')
+            }
+            & $add '</div>'
+        }
+    }
 
     # ---- model-assisted triage: fenced, last, and never a fact ----
     # Rendered AFTER everything measured, inside a visually distinct dashed border, and labelled
@@ -235,21 +306,21 @@ mark{background:rgba(210,153,34,.32);color:inherit;border-radius:2px}
                 'reading of those measurements, kept because a machine can notice a shape in the data that a ' +
                 'threshold cannot - and fenced because it can also be confidently wrong. Every claim here was ' +
                 'checked to name a process and directory that appear in the data it was shown; ' +
-                (ConvertTo-Html ([string]$Triage.Rejected)) + ' claim(s) were discarded for failing that check. ' +
+                (ConvertTo-FxHtml ([string]$Triage.Rejected)) + ' claim(s) were discarded for failing that check. ' +
                 'Treat these as leads to confirm against the facts above, never as findings.</p>')
         if (@($Triage.Findings).Count) {
             foreach ($f in @($Triage.Findings)) {
                 & $add '<div class="f">'
-                & $add ('<div class="hd">' + (ConvertTo-Html $f.Process) + '  &rarr;  ' + (ConvertTo-Html $f.Directory) +
-                        '<span class="cf">' + (ConvertTo-Html $f.Confidence) + ' confidence</span></div>')
-                & $add ('<div class="cn">' + (ConvertTo-Html $f.Concern) + '</div>')
+                & $add ('<div class="hd">' + (ConvertTo-FxHtml $f.Process) + '  &rarr;  ' + (ConvertTo-FxHtml $f.Directory) +
+                        '<span class="cf">' + (ConvertTo-FxHtml $f.Confidence) + ' confidence</span></div>')
+                & $add ('<div class="cn">' + (ConvertTo-FxHtml $f.Concern) + '</div>')
                 & $add '</div>'
             }
         } else {
             $why = if ($Triage.Reason) { $Triage.Reason } else { 'nothing it considered worth attention' }
-            & $add ('<p class="none">No leads: ' + (ConvertTo-Html $why) + '.</p>')
+            & $add ('<p class="none">No leads: ' + (ConvertTo-FxHtml $why) + '.</p>')
         }
-        & $add ('<p class="blurb">Model: ' + (ConvertTo-Html $Triage.Model) +
+        & $add ('<p class="blurb">Model: ' + (ConvertTo-FxHtml $Triage.Model) +
                 '. Shown the aggregates only, never the raw log. Absent entirely when no local model is reachable.</p>')
         & $add '</div>'
     }
@@ -262,7 +333,7 @@ mark{background:rgba(210,153,34,.32);color:inherit;border-radius:2px}
     & $add '<div class="controls">'
     & $add '<input type="search" id="q" placeholder="filter by path or process - try .ollama, or a process name" autocomplete="off">'
     & $add '<select id="img"><option value="">every process</option>'
-    foreach ($i in $imgList) { & $add ('<option value="' + (ConvertTo-Html $i) + '">' + (ConvertTo-Html (Split-Path $i -Leaf)) + '</option>') }
+    foreach ($i in $imgList) { & $add ('<option value="' + (ConvertTo-FxHtml $i) + '">' + (ConvertTo-FxHtml (Split-Path $i -Leaf)) + '</option>') }
     & $add '</select>'
     & $add '<select id="sent"><option value="">all paths</option><option value="1">sentinel paths only</option></select>'
     & $add '</div>'
@@ -272,17 +343,23 @@ mark{background:rgba(210,153,34,.32);color:inherit;border-radius:2px}
         $isSent = $false
         foreach ($p in $SentinelPatterns) { if ($r.Path -match $p) { $isSent = $true; break } }
         $cls = if ($isSent) { ' class="sent"' } else { '' }
-        & $add ('<tr' + $cls + ' data-i="' + (ConvertTo-Html $r.Image) + '" data-s="' + $(if ($isSent) { '1' } else { '0' }) + '">' +
-                '<td class="t">' + (ConvertTo-Html ('{0:MM-dd HH:mm:ss}' -f $r.Time)) + '</td>' +
-                '<td class="p">' + (ConvertTo-Html (Split-Path $r.Image -Leaf)) + '</td>' +
-                '<td class="p">' + (ConvertTo-Html $r.Path) + '</td></tr>')
+        # The COMMAND LINE, joined from Sysmon event 1 by pid. This was gathered, counted on the
+        # console and handed to this function, and then never rendered - so the report showed
+        # that rm.exe deleted something while silently holding the argv that says what was asked
+        # for. "rm.exe" and "rm -rf /c/Users/Admin/.ollama" are not the same finding.
+        $cmd = if ($Procs -and $r.Pid -and $Procs.ContainsKey([string]$r.Pid)) { [string]$Procs[[string]$r.Pid] } else { '' }
+        $ttl = if ($cmd) { ' title="' + (ConvertTo-FxHtml $cmd) + '"' } else { '' }
+        & $add ('<tr' + $cls + ' data-i="' + (ConvertTo-FxHtml $r.Image) + '" data-s="' + $(if ($isSent) { '1' } else { '0' }) + '">' +
+                '<td class="t">' + (ConvertTo-FxHtml ('{0:MM-dd HH:mm:ss}' -f $r.Time)) + '</td>' +
+                '<td class="p"' + $ttl + '>' + (ConvertTo-FxHtml (Split-Path $r.Image -Leaf)) + '</td>' +
+                '<td class="p">' + (ConvertTo-FxHtml $r.Path) + '</td></tr>')
     }
     & $add '</tbody></table></div>'
     $shown = @($rows).Count
     $note = if ($Deletes.Count -gt $shown) {
         'Showing the most recent {0:N0} of {1:N0} deletions. Every count above is over all {1:N0}.' -f $shown, $Deletes.Count
     } else { 'Showing all {0:N0} deletions in the window.' -f $shown }
-    & $add ('<div class="count" id="cnt">' + (ConvertTo-Html $note) + '</div>')
+    & $add ('<div class="count" id="cnt">' + (ConvertTo-FxHtml $note) + '</div>')
     & $add '</div>'
 
     & $add ('<div class="foot">Generated by scripts\New-ForensicsReport.ps1 (scripts-utilities). Self-contained: nothing in this file is fetched from the network. Sysmon event 26 records deletions per FILE, so a recursive tree removal appears as many rows sharing one process.</div>')

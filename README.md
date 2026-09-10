@@ -153,10 +153,15 @@ prompt. To avoid per-package prompts, pre-install the machine-scope set in one e
 .\fresh-toolbox-setup-runner.ps1 -SkipHeavy                          # no GPU/ML stack
 .\fresh-toolbox-setup-runner.ps1 -SkipHeavy -SkipPlaywrightBrowsers  # ...and no browsers
 .\fresh-toolbox-setup-runner.ps1 -SkipWireshark                      # no packet capture
-.\fresh-toolbox-setup-runner.ps1 -SkipWDK                            # no poolmon/cdb/kd
+.\fresh-toolbox-setup-runner.ps1 -SkipWDK                            # no poolmon wrapper
 .\fresh-toolbox-setup-runner.ps1 -InstallGhidra                      # + Ghidra and a private JDK 21
 .\fresh-toolbox-setup-runner.ps1 -InstallLlm                         # + local Ollama stack
 ```
+
+`-SkipWDK` here only sets `TOOLBOX_SKIP_WDK=1`, which stops the security group wrapping
+`poolmon` — including a poolmon already on disk. It does not skip a WDK install, because the
+runner never installs the WDK; that is `install-machine-scope.ps1`, which has its own `-SkipWDK`.
+`cdb`/`kd`/`ntsd` come from the SDK's debuggers directory and are wrapped either way.
 
 Prefer clicking? `.\gui\Start-ToolboxGui.cmd` renders the catalog as grouped checkboxes with live
 status and shells out to the same scripts. It installs nothing itself.
@@ -186,7 +191,7 @@ anything.
 
 | Group | Tools |
 |---|---|
-| **cli-tools** (14) | `gh` GitHub CLI · `fzf` fuzzy finder · `bat` syntax-highlighted cat · `delta` git diff pager · `just` task runner · `hyperfine` benchmarking · `sops` encrypted secrets · `age` file encryption · `tokei` LOC stats · `podman` per-user containers, no elevation · `docker-compose` · `trurl` URL parsing · `yt-dlp` media downloader · `deno` secure JS/TS runtime, also yt-dlp's JS challenge runtime |
+| **cli-tools** (15) | `gh` GitHub CLI · `pwsh` PowerShell 7, machine-scope MSI beside 5.1 · `fzf` fuzzy finder · `bat` syntax-highlighted cat · `delta` git diff pager · `just` task runner · `hyperfine` benchmarking · `sops` encrypted secrets · `age` file encryption · `tokei` LOC stats · `podman` per-user containers, no elevation · `docker-compose` · `curl-libressl` curl built on LibreSSL, for the agent sandboxes where the bundled Schannel curl fails · `yt-dlp` media downloader · `deno` secure JS/TS runtime, also yt-dlp's JS challenge runtime |
 | **security** (3+) | `tshark` Wireshark CLI · `etl2pcapng` driver-free capture conversion · `frida` dynamic instrumentation · plus WinDbg, `cdb`/`kd`/`ntsd`, `gflags`, `dumpchk` and `poolmon` from the WDK when present, and optional Ghidra |
 | **extras** (5) | `markdownlint` · `jupyter-lab` · `sqlite-utils` · `csvkit` (`csvlook`) · `pytoshop` |
 
@@ -206,6 +211,29 @@ gets `moondream` (vision), `qwen2.5:3b` + `mistral:7b` (text) and `qwen3-embeddi
 the toolbox `onnxruntime` (`-SkipReranker` to omit). The model set is defined in `catalog.json`
 under `llm`.
 
+### Optional — deletion forensics (`scripts/install-deletion-forensics.ps1`)
+
+Answers "which process deleted this?". Two sensors: Sysmon recording event 26
+`FileDeleteDetected` over a reviewed set of profile paths, and the `C:` USN journal resized from
+32 MB to 2 GB. Deliberately not part of `bootstrap.ps1` — it loads a `BOOT_START` kernel driver
+and resizes an NTFS structure, which is not something a general toolbox run should do to you
+unasked.
+
+```powershell
+.\scripts\install-deletion-forensics.ps1            # install or update (self-elevates)
+.\scripts\install-deletion-forensics.ps1 -Verify    # health only, changes nothing
+.\scripts\install-deletion-forensics.ps1 -Uninstall # remove Sysmon; the journal is left sized
+```
+
+It exists because on 2026-09-09 this workstation lost ~16 profile dotdirs,
+`%LOCALAPPDATA%\DevToolbox`, `.dotnet\tools` and ~70 GB of Ollama models inside 97 minutes, and
+the cause could not be established: Sysmon was absent, File System auditing was off, and a 32 MB
+journal held under two hours of history on this volume. A weekly SYSTEM task writes a
+self-contained HTML dashboard into your Downloads. The path list, the measured exclusions and the
+dashboard are documented in [docs/tools-reference.md](docs/tools-reference.md); the Sysmon config
+in `config/sysmon-filedelete.xml` is hardcoded to one profile name and needs editing for any other
+machine.
+
 ---
 
 ## Day-to-day
@@ -219,6 +247,14 @@ under `llm`.
 ```
 
 Set `CODEX_TOOLBOX` before running to relocate the toolbox root.
+
+The gate exercises the toolbox tools, PATH readiness, the agent-discovery blocks, and the
+deletion-forensics sensors. On the sensors it fails only on *degradation*, never on absence: a
+Sysmon service that is not running, a Sysmon or driver start type that will not survive a reboot,
+a deployed config that no longer matches `config/sysmon-filedelete.xml`, or a report script that
+does not parse under Windows PowerShell 5.1 — which is what the scheduled task runs. Not having
+the sensors installed is a warning. A sensor that is installed and quietly capturing nothing is
+worse than one that was never there, because it is the one you will rely on.
 
 ### Uninstall
 

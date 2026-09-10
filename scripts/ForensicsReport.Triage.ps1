@@ -48,6 +48,59 @@ function Test-FxLlmAvailable {
     }
 }
 
+function Resolve-FxTriageModel {
+    <#
+        Pick a model that is actually INSTALLED, rather than trusting a hardcoded tag.
+
+        Ollama resolves tags exactly. The default here was 'mistral-small3.2:24b' - correct on
+        the machine this was written on, and a 404 anywhere else, including a box provisioned by
+        this repo's own install-llm.ps1, which pulls 'mistral-small'. Because triage is on by
+        default and degrades silently, a wrong default does not produce an error: it produces a
+        report that quietly never has a triage panel, forever, and looks exactly like a machine
+        with no model at all.
+
+        Returns $null when nothing usable is installed, which the caller treats as "no model".
+    #>
+    param(
+        [string]$Preferred = 'mistral-small3.2:24b',
+        [string]$BaseUri = 'http://127.0.0.1:11434',
+        [int]$TimeoutSec = 5,
+        [string[]]$Installed          # test seam; skips the HTTP call entirely
+    )
+    $names = $Installed
+    if ($null -eq $names) {
+        try {
+            $r = Invoke-RestMethod -Uri "$BaseUri/api/tags" -TimeoutSec $TimeoutSec -ErrorAction Stop
+            $names = @($r.models | ForEach-Object { [string]$_.name })
+        } catch { return $null }
+    }
+    $names = @($names | Where-Object { $_ })
+    if (-not $names.Count) { return $null }
+
+    if ($names -contains $Preferred) { return $Preferred }
+
+    # Same family, any tag. Compared both ways on the part before the colon, because the drift
+    # runs in both directions: preferred 'mistral-small3.2:24b' should accept an installed
+    # 'mistral-small:latest', and preferred 'mistral-small' should accept 'mistral-small3.2:24b'.
+    $pBase = ($Preferred -split ':')[0]
+    foreach ($n in $names) {
+        $nBase = ($n -split ':')[0]
+        if ($nBase -eq $pBase -or $nBase.StartsWith($pBase) -or $pBase.StartsWith($nBase)) { return $n }
+    }
+
+    # Anything that can hold a conversation. Embedding, reranker and vision-only models cannot
+    # answer this prompt at all, so naming one is worse than returning nothing.
+    #
+    # This is a NAME heuristic and it is only as good as the list - 'bge-m3' is an embedding
+    # model with no "embed" anywhere in its name, which is exactly how this list was found to be
+    # too short. It is acceptable because the downstream cost of a bad pick is bounded: a model
+    # that cannot answer produces unparseable output or uncited claims, and both are already
+    # discarded, so the failure mode is "no triage panel" rather than a wrong one.
+    $notChat = 'embed|rerank|moondream|^bge|^gte|^e5|^nomic|^mxbai|^snowflake-arctic|^all-minilm|^paraphrase'
+    foreach ($n in $names) { if ($n -notmatch $notChat) { return $n } }
+    return $null
+}
+
 function ConvertTo-FxTriagePrompt {
     <#
         The model sees AGGREGATES, never the raw log.
@@ -150,7 +203,7 @@ function Get-FxTriage {
         foreach ($x in @($set)) {
             $n = if ($x.Name) { $x.Name } elseif ($x.Image) { $x.Image } else { $null }
             if ($n) { $okProc[([IO.Path]::GetFileName([string]$n)).ToLowerInvariant()] = $true }
-            if ($x.Dir) { $okDir.Add(([string]$x.Dir).ToLowerInvariant()) }
+            if ($x.Dir) { $okDir.Add(([string]$x.Dir).TrimEnd('\', '/').ToLowerInvariant()) }
         }
     }
 
@@ -181,13 +234,35 @@ function Get-FxTriage {
         if (-not $proc -or -not $dir -or -not $f.concern) { $out.Rejected++; continue }
         $leaf = ([IO.Path]::GetFileName($proc)).ToLowerInvariant()
         if (-not $okProc.ContainsKey($leaf)) { $out.Rejected++; continue }
-        # The directory must be one we showed it, or a prefix of one. A model quoting a parent
+        # The directory must be one we showed it, or an ANCESTOR of one. A model quoting a parent
         # is being imprecise; a model quoting somewhere never mentioned is making it up.
-        $dl = $dir.ToLowerInvariant()
+        #
+        # This was a bare bidirectional prefix test, and an audit demonstrated it accepted two
+        # things it is the entire point of this function to reject:
+        #   - "C" and "C:" - a one-character citation is a prefix of every path we ever show, so
+        #     any concern at all rendered as a lead while the panel truthfully reported
+        #     "0 claim(s) discarded". The fence was open and said it was shut.
+        #   - a CHILD of a shown directory, e.g. shown "...\.ssh", claimed
+        #     "...\.ssh\exfiltrated-to-attacker". That is not imprecision in either direction;
+        #     it is a specific invented location, which is the most dangerous shape here because
+        #     it reads as the most authoritative.
+        # So: exact match always passes; anything else must be a strict ancestor, must break on a
+        # SEGMENT boundary, and must itself be specific enough to mean something.
+        $dl = $dir.TrimEnd('\', '/').ToLowerInvariant()
+        $dlSegments = @($dl -split '[\\/]' | Where-Object { $_ }).Count
         $dirOk = $false
-        foreach ($d in $okDir) { if ($d -eq $dl -or $d.StartsWith($dl) -or $dl.StartsWith($d)) { $dirOk = $true; break } }
+        foreach ($d in $okDir) {
+            if ($d -eq $dl) { $dirOk = $true; break }
+            # Strict ancestor, on a separator boundary so "C:\Users\Ad" cannot match
+            # "C:\Users\Admin", and at least three segments so a drive or "C:\Users" cannot
+            # stand in as a citation for everything beneath it.
+            if ($dlSegments -ge 3 -and $d.StartsWith($dl + '\')) { $dirOk = $true; break }
+        }
         if (-not $dirOk) { $out.Rejected++; continue }
-        $conf = [string]$f.confidence
+        # Normalise the CASE rather than discarding it: "HIGH" is a valid answer typed loudly,
+        # not an invalid one. -notin is case-insensitive, so the old form let "HIGH" through
+        # unnormalised and rendered it verbatim into the page.
+        $conf = ([string]$f.confidence).Trim().ToLowerInvariant()
         if ($conf -notin @('low', 'medium', 'high')) { $conf = 'low' }
         $kept += [pscustomobject]@{ Process = $proc; Directory = $dir; Concern = [string]$f.concern; Confidence = $conf }
     }

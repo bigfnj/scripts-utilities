@@ -46,12 +46,52 @@ function Test-IsElevated {
         [System.Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-# -- Confirmation --------------------------------------------------------------
+# Anything that could not be reversed. Non-empty at the end means the uninstall is INCOMPLETE
+# and the exit code says so; "toolbox uninstall complete" is reserved for a clean run.
+$problems = @()
+
+# -- Banner ---------------------------------------------------------------------
 Write-Group "uninstall toolbox"
 Write-Info "toolbox root:      $toolboxRoot"
 Write-Info "remove winget tools: $([bool]$RemoveWingetTools)"
 Write-Info "mode:              $(if ($DryRun) { 'DRY-RUN (no changes)' } else { 'LIVE' })"
 
+# -- 0. Validate the toolbox root BEFORE touching anything ----------------------
+# This check used to live in step 5, next to the Remove-Item it guards. By the time it fired,
+# steps 1-4 had already stripped the user PATH entries, cleared the toolbox env vars, deleted
+# HKCU:\Software\Sysinternals and removed manifest\tools.json - and the script still finished
+# with "toolbox uninstall complete" and exit 0. A shallow CODEX_TOOLBOX such as C:\DevToolbox
+# (three components, so Split('\').Count is 2) therefore produced a half-uninstalled machine
+# reported as a clean one: the toolbox directory intact, and everything that made it reachable
+# gone. Refusing the path is only safe if nothing has happened yet, so decide here and abort.
+$rootExists = Test-Path -LiteralPath $toolboxRoot
+$rootResolved = $null
+if ($rootExists) {
+    # Safety: only delete a directory that (a) is not a drive root or a known protected
+    # system/profile path, and (b) actually contains toolbox structure. Requiring a toolbox
+    # marker means even a mis-set CODEX_TOOLBOX cannot point us at, say, C:\Windows - there is
+    # no marker there, so we refuse.
+    $rootResolved = (Resolve-Path -LiteralPath $toolboxRoot).Path.TrimEnd('\')
+    $protected = @(
+        $env:WINDIR, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:USERPROFILE,
+        $env:LOCALAPPDATA, $env:APPDATA, $env:SystemDrive, $env:ProgramData
+    ) | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') }
+    $tooShort = ($rootResolved -match '^[A-Za-z]:\\?$') -or ($rootResolved.Split('\').Count -lt 3)
+    $isProtected = $tooShort -or ($protected -contains $rootResolved)
+    $hasMarker = (Test-Path (Join-Path $rootResolved 'toolbox-manifest.json')) -or
+                 (Test-Path (Join-Path $rootResolved 'native\bin')) -or
+                 (Test-Path (Join-Path $rootResolved 'python\.venv'))
+    if ($isProtected -or -not $hasMarker) {
+        Write-Err "Refusing to uninstall: '$rootResolved' is a protected path, or has no toolbox marker (toolbox-manifest.json / native\bin / python\.venv)."
+        Write-Err "Nothing was changed - the PATH entries, env vars and registry keys are all still in place."
+        Write-Err "Point CODEX_TOOLBOX at the real toolbox root and run this again."
+        exit 1
+    }
+}
+
+# -- Confirmation ---------------------------------------------------------------
+# After the validation above, so nobody is asked to type REMOVE for a run we are going to
+# refuse anyway.
 if (-not $DryRun -and -not $Yes) {
     $answer = Read-Host "This permanently removes the toolbox. Type REMOVE to continue"
     if ($answer -ne "REMOVE") { Write-Warn "aborted - confirmation not given"; exit 1 }
@@ -79,17 +119,33 @@ if ($RemoveWingetTools) {
                     if (-not $t.winget_id) { Write-Warn "no winget_id for $($t.name) - skipping"; continue }
                     if ($t.scope -eq 'machine' -and -not (Test-IsElevated)) {
                         Write-Warn "skip $($t.name): machine-scope uninstall needs elevation (re-run elevated)"
+                        $problems += "$($t.name): machine-scope uninstall skipped (not elevated)"
                         continue
                     }
                     if ($DryRun) { Write-Info "[DRY-RUN] would: winget uninstall --id $($t.winget_id)"; continue }
                     Write-Info "winget uninstall $($t.winget_id)"
+                    # Out-Null hides the output, not the outcome. Without this check a package
+                    # that refused to uninstall (in use, needs elevation, no matching install)
+                    # left no trace at all and the run still ended in "uninstall complete".
                     winget uninstall --id $t.winget_id -e --silent --accept-source-agreements | Out-Null
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Err "winget uninstall failed for $($t.name) [$($t.winget_id)]: exit $LASTEXITCODE"
+                        $problems += "$($t.name): winget uninstall exit $LASTEXITCODE"
+                    } else {
+                        Write-Ok "uninstalled $($t.name)"
+                    }
                 }
                 'npm-global' {
                     if (-not (Test-CommandAvailable 'npm')) { Write-Warn "npm not found - skipping $($t.name)"; continue }
                     if ($DryRun) { Write-Info "[DRY-RUN] would: npm uninstall -g $($t.name)"; continue }
                     Write-Info "npm uninstall -g $($t.name)"
                     npm uninstall -g $t.name | Out-Null
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Err "npm uninstall -g failed for $($t.name): exit $LASTEXITCODE"
+                        $problems += "$($t.name): npm uninstall exit $LASTEXITCODE"
+                    } else {
+                        Write-Ok "uninstalled $($t.name)"
+                    }
                 }
                 'pip-toolbox' {
                     Write-Skip "$($t.name): lives in the venv, removed with the toolbox directory"
@@ -137,35 +193,28 @@ if (Test-Path -LiteralPath $MANIFEST_PATH) {
     else { Remove-Item -LiteralPath $MANIFEST_PATH -Force; Write-Ok "removed generated manifest" }
 }
 
-# -- 5. Delete the toolbox directory (guarded) ---------------------------------
+# -- 5. Delete the toolbox directory -------------------------------------------
+# Already validated in step 0, which aborts the whole run rather than letting us arrive here
+# with a path we are going to refuse.
 Write-Group "remove toolbox directory"
-if (Test-Path -LiteralPath $toolboxRoot) {
-    # Safety: only delete a directory that (a) is not a drive root or a known
-    # protected system/profile path, and (b) actually contains toolbox structure.
-    # Requiring a toolbox marker means even a mis-set CODEX_TOOLBOX cannot point us
-    # at, say, C:\Windows - there is no marker there, so we refuse and skip.
-    $resolved = (Resolve-Path -LiteralPath $toolboxRoot).Path.TrimEnd('\')
-    $protected = @(
-        $env:WINDIR, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:USERPROFILE,
-        $env:LOCALAPPDATA, $env:APPDATA, $env:SystemDrive, $env:ProgramData
-    ) | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') }
-    $tooShort = ($resolved -match '^[A-Za-z]:\\?$') -or ($resolved.Split('\').Count -lt 3)
-    $isProtected = $tooShort -or ($protected -contains $resolved)
-    $hasMarker = (Test-Path (Join-Path $resolved 'toolbox-manifest.json')) -or
-                 (Test-Path (Join-Path $resolved 'native\bin')) -or
-                 (Test-Path (Join-Path $resolved 'python\.venv'))
-    if ($isProtected -or -not $hasMarker) {
-        Write-Err "Refusing to delete '$resolved': protected path, or no toolbox marker (toolbox-manifest.json / native\bin / python\.venv). Skipped."
-    } elseif ($DryRun) {
-        Write-Info "[DRY-RUN] would delete toolbox directory: $resolved"
-    } else {
-        Remove-Item -LiteralPath $resolved -Recurse -Force
-        Write-Ok "deleted toolbox directory: $resolved"
-    }
-} else {
+if (-not $rootExists) {
     Write-Skip "toolbox directory not present: $toolboxRoot"
+} elseif ($DryRun) {
+    Write-Info "[DRY-RUN] would delete toolbox directory: $rootResolved"
+} else {
+    Remove-Item -LiteralPath $rootResolved -Recurse -Force
+    Write-Ok "deleted toolbox directory: $rootResolved"
 }
 
 Write-Group "done"
-if ($DryRun) { Write-Info "[DRY-RUN] complete - no changes were made" }
-else { Write-Ok "toolbox uninstall complete" }
+if ($DryRun) {
+    Write-Info "[DRY-RUN] complete - no changes were made"
+} elseif ($problems.Count -gt 0) {
+    # Say INCOMPLETE and exit non-zero. A partly-reversed uninstall reported as a clean one is
+    # worse than a loud failure: the next person believes the machine is back to baseline.
+    Write-Err "toolbox uninstall INCOMPLETE - $($problems.Count) step(s) did not succeed:"
+    foreach ($p in $problems) { Write-Err "  - $p" }
+    exit 1
+} else {
+    Write-Ok "toolbox uninstall complete"
+}

@@ -332,27 +332,60 @@ if (-not $fxElevated) {
 
 # The generator and its renderer must at least parse under 5.1 - the scheduled task runs
 # powershell.exe, not pwsh, and a parse error there fails silently at 04:00 on a Sunday.
+#
+# The parse MUST be delegated to powershell.exe rather than called in-process. [Parser] uses the
+# grammar of the HOST it runs in, so this gate checked 5.1 only when the gate itself happened to
+# be run under 5.1 - run the smoke test from pwsh, which the repo's own docs suggest for CI
+# parity, and the one check whose entire purpose is catching 7-only syntax silently started
+# accepting it. `$x ?? 'y'` gives 1 error under 5.1 and 0 under 7; that difference is the check.
+$parseProbe = {
+    param($Files)
+    $bad = @()
+    foreach ($f in $Files) {
+        $e = $null
+        [void][System.Management.Automation.Language.Parser]::ParseFile($f, [ref]$null, [ref]$e)
+        if ($e -and $e.Count) { $bad += ('{0}|{1}' -f (Split-Path $f -Leaf), $e[0].Message) }
+    }
+    $bad -join "`n"
+}
+$fxFiles = @()
 foreach ($fxScript in 'New-ForensicsReport.ps1', 'ForensicsReport.Render.ps1', 'ForensicsReport.Triage.ps1') {
     $fxPath = Join-Path $PSScriptRoot $fxScript
-    if (-not (Test-Path $fxPath)) { Test-Fail "missing $fxScript"; continue }
-    $fxErr = $null
-    [void][System.Management.Automation.Language.Parser]::ParseFile($fxPath, [ref]$null, [ref]$fxErr)
-    if ($fxErr -and $fxErr.Count) { Test-Fail "$fxScript does not parse: $($fxErr[0].Message)" }
-    else { Test-Ok "$fxScript parses" }
+    if (-not (Test-Path $fxPath)) { Test-Fail "missing $fxScript" } else { $fxFiles += $fxPath }
+}
+if ($fxFiles.Count) {
+    $parseOut = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -Command $parseProbe -Args (,$fxFiles) 2>&1 | Out-String).Trim()
+    if ($parseOut) {
+        foreach ($line in ($parseOut -split "`r?`n")) {
+            $p = $line -split '\|', 2
+            Test-Fail ("{0} does not parse under 5.1: {1}" -f $p[0], $p[1])
+        }
+    } else { Test-Ok ("{0} forensics script(s) parse under Windows PowerShell 5.1" -f $fxFiles.Count) }
 }
 
-# The triage layer's own suite. Runs WITHOUT Ollama by design - what is worth testing is that
-# a model claim citing something it was never shown gets discarded, and a test whose result
-# depends on what a model says today fails for reasons unrelated to the code.
-$fxTri = Join-Path $REPO_ROOT 'tests\Invoke-TriageTests.ps1'
-if (-not (Test-Path $fxTri)) { Test-Warn 'triage test suite not found' }
-else {
-    $tOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $fxTri 2>&1 | Out-String
+# The forensics report's own suites. Both run WITHOUT Ollama and without reading the real
+# Sysmon log, by design: what is worth pinning is that a model claim citing something it was
+# never shown gets discarded, and that the rendered page fetches nothing and escapes everything.
+# A test whose result depends on what a model says today, or on what happens to be in the event
+# log this hour, fails for reasons unrelated to the code.
+#
+# A MISSING suite is a FAILURE, not a warning. This block previously warned, and separately held
+# a path with a literal TAB in it - so it reported "suite not found", stayed green, and verified
+# nothing for as long as that went unnoticed. A gate that passes when its tests have vanished is
+# not a gate.
+foreach ($suite in @(
+    @{ Name = 'triage'; File = 'tests\Invoke-TriageTests.ps1' },
+    @{ Name = 'render'; File = 'tests\Invoke-RenderTests.ps1' }
+)) {
+    $sPath = Join-Path $REPO_ROOT $suite.File
+    if (-not (Test-Path -LiteralPath $sPath)) { Test-Fail "$($suite.Name) test suite missing: $($suite.File)"; continue }
+    # powershell.exe explicitly: the scheduled task runs 5.1, so the suites must pass there.
+    $tOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $sPath 2>&1 | Out-String
     $tLine = ($tOut -split "`r?`n" | Where-Object { $_ -match 'passed,.*failed' } | Select-Object -Last 1)
     if ($tLine -match '(\d+) passed, (\d+) failed') {
-        if ([int]$Matches[2] -eq 0) { Test-Ok "triage suite: $($Matches[1]) passed" }
-        else { Test-Fail "triage suite: $($Matches[2]) failed" }
-    } else { Test-Fail 'triage suite produced no tally' }
+        if ([int]$Matches[2] -eq 0) { Test-Ok "$($suite.Name) suite: $($Matches[1]) passed" }
+        else { Test-Fail "$($suite.Name) suite: $($Matches[2]) failed" }
+    } else { Test-Fail "$($suite.Name) suite produced no tally" }
 }
 
 # -- Catalog integrity ---------------------------------------------------------

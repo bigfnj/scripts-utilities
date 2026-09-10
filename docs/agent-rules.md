@@ -30,8 +30,10 @@ bootstrap stops and tells the operator to review a dry run first.
 Check whether the tool is already present:
 
 ```powershell
-# Check this workstation's generated bootstrap manifest, if bootstrap has run
-Get-Content "$PSScriptRoot\..\manifest\tools.json" | ConvertFrom-Json | Select-Object name, binary
+# Check this workstation's generated bootstrap manifest, if bootstrap has run.
+# Run this from the repo root. $PSScriptRoot is empty outside a script file, so a
+# "$PSScriptRoot\..\manifest\tools.json" form resolves to \..\manifest and finds nothing.
+Get-Content .\manifest\tools.json | ConvertFrom-Json | Select-Object name, binary
 
 # Check the dev toolbox manifest
 Get-Content "$env:LOCALAPPDATA\DevToolbox\toolbox-manifest.json" | ConvertFrom-Json
@@ -140,9 +142,16 @@ the `Debuggers\x64` dir before running bootstrap.
 `scripts\install-machine-scope.ps1` (reads `catalog.json`). **Do NOT pass
 `--scope machine`** to winget for this package — it fails `0x8A150010 "no
 applicable installer"`; `install-machine-scope.ps1` handles this via the
-`$NoScopeFlag` list. The WDK is large (~1-2 GB). To skip it set
-`TOOLBOX_SKIP_WDK=1` (user env var); poolmon/debuggers are still wrapped if
-already on disk. The WDK installer typically pulls in the matching Windows SDK,
+`$NoScopeFlag` list. The WDK is large (~1-2 GB), and there are two separate ways
+to skip it which do different things. `install-machine-scope.ps1 -SkipWDK` drops
+`Microsoft.WindowsWDK.10.0.26100` from the winget id list, so the package is
+never installed. `TOOLBOX_SKIP_WDK=1` (user env var, and all that
+`fresh-toolbox-setup-runner.ps1 -SkipWDK` does) installs nothing either way — it
+is read only by `security_install_wdk`, which returns before wrapping poolmon, so
+**poolmon is not wrapped even when it is already on disk**. It does not reach the
+console debuggers: `security_install_console_debuggers` never consults it, so
+`cdb`/`kd`/`ntsd` (and `windbg`, `gflags`, `dumpchk`) are still detected and
+wrapped. The WDK installer typically pulls in the matching Windows SDK,
 so `cdb.exe` often appears as a side effect — re-run `bootstrap.ps1 -Only
 security` after the WDK installs to pick up both poolmon and the console debuggers.
 

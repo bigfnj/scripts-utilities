@@ -29,13 +29,31 @@
   writing the key directly: [Environment]::SetEnvironmentVariable silently rewrites it as REG_SZ,
   which would break any %VAR% entry a future PATH picks up.
 
+  ELEVATION IS NOT OPTIONAL - THIS ALREADY DESTROYED A PATH. The plan MOVES native\bin and
+  sysinternals from the user PATH to the machine PATH, so the two registry writes are two halves
+  of one change and neither is safe on its own. Until 2026-09-10 this script wrote the user half
+  unconditionally and only THEN checked for admin, so an unelevated run deleted both entries from
+  the user PATH and re-added them nowhere. That is not hypothetical; it happened on 2026-09-09
+  and the two backups the run left behind are still in logs\ as the evidence:
+
+      path-backup-20260909-203021.json   user PATH  945 chars, ...\DevToolbox\sysinternals present
+      path-backup-20260909-203149.json   user PATH  171 chars, sysinternals gone,
+                                         machine PATH unchanged at 4363 chars
+
+  88 seconds apart, and ~40 developer tools stopped resolving because the entries then existed in
+  NEITHER scope. Now an unelevated run writes no PATH at all: it reports the plan, re-launches
+  itself through UAC (-NoElevate opts out of the prompt), and exits 2 with the PATH untouched if
+  consent is refused. The elevated pass writes MACHINE first, so even a run that dies half-way
+  leaves the entries in both scopes rather than in none.
+
   SHADOWING. Where two package directories provide the same executable (ffmpeg.exe ships in at
   least three), the one earliest in the current PATH wins, which is precisely what resolves today.
   Shadowed copies are reported, never silently reassigned.
 
 .EXAMPLE
   .\scripts\consolidate-path.ps1 -DryRun     # report everything, change nothing
-  .\scripts\consolidate-path.ps1             # apply (elevates for the machine PATH)
+  .\scripts\consolidate-path.ps1             # apply; re-launches itself elevated through UAC
+  .\scripts\consolidate-path.ps1 -NoElevate  # unelevated: report the plan, write nothing, exit 2
   .\scripts\consolidate-path.ps1 -Restore logs\path-backup-20260827-120000.json
 #>
 [CmdletBinding()]
@@ -43,7 +61,16 @@ param(
     [switch]$DryRun,
     [string]$Restore,
     # Windows handed this shell 4095 chars. Aim comfortably under it rather than at it.
-    [int]$TargetMax = 3500
+    [int]$TargetMax = 3500,
+    # Report the plan and exit 2 instead of raising a UAC prompt. For unattended callers that
+    # must never block on a consent dialog nobody is there to click.
+    [switch]$NoElevate,
+    # Internal, set only on the UAC child: the SID of the account that asked for the change.
+    # Elevation can change identity. On a standard-user account UAC accepts a DIFFERENT
+    # administrator's credentials, and the child's HKCU is then that administrator's hive - so
+    # "write the user PATH" would edit the wrong account and leave this one just as broken. The
+    # child refuses to write anything unless the SID it was launched with is its own.
+    [string]$ElevatedFor
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,6 +79,8 @@ $Root = if ($env:CODEX_TOOLBOX) { $env:CODEX_TOOLBOX } else { Join-Path $env:LOC
 $NativeBin = Join-Path $Root 'native\bin'
 $Sysinternals = Join-Path $Root 'sysinternals'
 $LogDir = Join-Path $RepoRoot 'logs'
+# Fixed name, not timestamped, because the parent must print this path BEFORE the child exists.
+$ElevatedLog = Join-Path $LogDir 'consolidate-elevated.log'
 
 function Write-Head($t) { Write-Host ''; Write-Host "  $t" -ForegroundColor Cyan }
 function Write-Ok($t)   { Write-Host "  [ok]   $t" -ForegroundColor Green }
@@ -68,6 +97,12 @@ function Get-RawPath {
     } else {
         $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
     }
+    # OpenSubKey returns $null for a key it cannot open - it does not throw. Without this guard
+    # the try block died on a null .GetValue(), and then finally{} threw its OWN
+    # NullReferenceException on $k.Close() on the way out, which REPLACED the real error with a
+    # stack trace pointing at the cleanup. Set-RawPath below has always guarded this; the read
+    # path did not, which made a read failure the harder of the two to diagnose.
+    if (-not $k) { throw "cannot open the $Scope environment key for reading." }
     try { return [string]$k.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
     finally { $k.Close() }
 }
@@ -115,6 +150,49 @@ function Split-Path2 { param([string]$Value) return @(@($Value -split ';') | Whe
 function Test-Admin {
     (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     ).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
+}
+
+function Invoke-SelfElevate {
+    # ShellExecute with the RunAs verb is the only way to raise UAC from inside a script. It
+    # cannot be handed a custom environment block, but the AppInfo service copies the caller's,
+    # so CODEX_TOOLBOX and friends survive the hop and the child computes the same plan.
+    # Returns the child's exit code, or $null if consent was refused or there was no interactive
+    # desktop to show the prompt on. ShellExecute fails fast with ERROR_CANCELLED in that case,
+    # it does not hang, so an unattended caller gets an answer instead of a wedged -Wait.
+    $hostExe = (Get-Process -Id $PID).Path
+    if (-not $hostExe) { $hostExe = Join-Path $PSHOME 'powershell.exe' }
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    # -ArgumentList is joined with spaces and is NOT quoted for you, so quote the path here or a
+    # repo checked out under "C:\my projects\" launches something else entirely.
+    $argList = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', ('"{0}"' -f $PSCommandPath),
+        '-TargetMax', [string]$TargetMax,
+        '-ElevatedFor', $sid
+    )
+    try {
+        $p = Start-Process -FilePath $hostExe -ArgumentList $argList -Verb RunAs -Wait -PassThru -ErrorAction Stop
+    } catch {
+        return $null
+    }
+    if ($null -eq $p) { return $null }
+    return [int]$p.ExitCode
+}
+
+# --- elevated child: prove we are still the same user ---------------------------
+if ($ElevatedFor) {
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ($me -ne $ElevatedFor) {
+        throw ("Elevated as a different account ($me) than the one that asked ($ElevatedFor). " +
+               "HKCU in this process is the wrong hive, so writing 'the user PATH' here would " +
+               "edit that other account and leave yours exactly as broken. Sign in as an " +
+               "administrator and run this again.")
+    }
+    # A UAC child owns a brand-new console window that closes the instant it exits, so in
+    # practice nobody ever reads its output - including the backup path it prints, which is the
+    # one line you need when a PATH change goes wrong. Transcribe it beside the PATH backups.
+    New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+    try { Start-Transcript -Path $ElevatedLog -Force | Out-Null } catch { }
 }
 
 # --- restore ------------------------------------------------------------------
@@ -221,6 +299,45 @@ if ($DryRun) {
     return
 }
 
+# --- elevation gate ---------------------------------------------------------------
+# Nothing past this point may run unelevated. Writing the user PATH without the machine PATH is
+# not a partial fix, it is the 2026-09-09 outage described in the header: the plan above takes
+# native\bin and sysinternals OFF the user PATH because the machine PATH is meant to carry them,
+# so the user write on its own removes ~40 tools from every shell on the box. The old code did
+# the user write first and only then tested for admin.
+if (-not (Test-Admin)) {
+    Write-Head 'Elevation required - NOTHING has been changed'
+    Write-Info2 ("would set MACHINE PATH to {0,5} chars / {1} entries  (gains native\bin + sysinternals)" -f $newMachine.Length, $newM.Count)
+    Write-Info2 ("would set USER    PATH to {0,5} chars / {1} entries  (loses them to the machine scope)" -f $newUser.Length, $newU.Count)
+    Write-Info2 "would write $($claimed.Count) shim(s) into $NativeBin"
+    Write-Info2 "would drop $($drop.Count) winget package entries"
+
+    New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+    $pending = Join-Path $LogDir 'machine-path-pending.txt'
+    Set-Content -Path $pending -Value $newMachine -Encoding UTF8 -NoNewline
+    Write-Info2 "intended machine PATH saved for review: $pending"
+
+    if ($NoElevate) {
+        Write-Warn2 '-NoElevate: no UAC prompt was raised and no PATH was written. Your PATH is unchanged.'
+        Write-Warn2 'Re-run from an elevated shell to apply the plan above.'
+        exit 2
+    }
+    Write-Info2 "requesting elevation - the elevated run transcribes to $ElevatedLog"
+    $childCode = Invoke-SelfElevate
+    if ($null -eq $childCode) {
+        Write-Warn2 'Elevation was declined or unavailable, so NOTHING was written. Your PATH is exactly as it was.'
+        Write-Warn2 'Re-run from an elevated shell, or apply the pending machine PATH by hand.'
+        exit 2
+    }
+    if ($childCode -ne 0) {
+        Write-Warn2 "The elevated run exited $childCode - read $ElevatedLog before re-running."
+        exit $childCode
+    }
+    Write-Ok "the elevated run finished; its full output is in $ElevatedLog"
+    Write-Warn2 'Open a NEW shell: an already-running process keeps the environment block it started with.'
+    exit 0
+}
+
 # --- back up --------------------------------------------------------------------
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $backup = Join-Path $LogDir "path-backup-$(Get-Date -Format 'yyyyMMdd-HHmmss').json"
@@ -248,20 +365,16 @@ foreach ($name in ($claimed.Keys | Sort-Object)) {
 Write-Ok "$written shim(s) in $NativeBin"
 
 # --- write the PATHs ---------------------------------------------------------------
+# MACHINE first, then USER, and never one without the other. Both writes only ever happen in an
+# elevated process now (see the gate above), but the ORDER still matters: this change moves
+# native\bin and sysinternals from the user scope to the machine scope, so machine-first means a
+# run that dies between the two leaves them present in BOTH scopes - a duplicate PATH entry,
+# harmless - instead of in neither, which is what user-first cost us on 2026-09-09.
 Write-Head 'PATH'
+Set-RawPath -Scope Machine -Value $newMachine
+Write-Ok "machine PATH updated ($($newMachine.Length) chars)"
 Set-RawPath -Scope User -Value $newUser
 Write-Ok "user PATH updated ($($newUser.Length) chars)"
-
-if (Test-Admin) {
-    Set-RawPath -Scope Machine -Value $newMachine
-    Write-Ok "machine PATH updated ($($newMachine.Length) chars)"
-} else {
-    $tmp = Join-Path $LogDir 'machine-path-pending.txt'
-    Set-Content -Path $tmp -Value $newMachine -Encoding UTF8 -NoNewline
-    Write-Warn2 'Not elevated - the MACHINE PATH was not written.'
-    Write-Warn2 "Re-run this script elevated to finish, or apply $tmp by hand."
-    Write-Warn2 'Until then the toolbox stays on the user PATH only, which is the bug being fixed.'
-}
 
 Publish-EnvChange
 

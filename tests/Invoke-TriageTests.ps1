@@ -65,6 +65,61 @@ It 'a parent directory of one it WAS shown is accepted as imprecision, not inven
     }
     $r.Findings.Count -eq 1
 }
+Write-Host "`n== a citation must be specific enough to be a citation ==" -ForegroundColor Cyan
+# These axes were all missing. Every "invented directory" case above uses a full path sharing no
+# prefix with anything shown, so the generator never produced a case in the region where the
+# check was actually weak - and an audit then demonstrated two live bypasses. Same degenerate-axis
+# trap as the earlier differential-test finding: the cases were plentiful and all one shape.
+It 'a one-character directory is DISCARDED, not treated as a prefix of everything' {
+    # The worst case: "C" is a prefix of every path this ever shows, so the model could attach any
+    # concern at all to it and the panel would report "0 discarded" while rendering it as a lead.
+    $r = Get-FxTriage -Facts $facts -Responder {
+        '{"findings":[{"process":"rm.exe","directory":"C","concern":"vacuous","confidence":"high"}]}'
+    }
+    ($r.Findings.Count -eq 0) -and ($r.Rejected -eq 1)
+}
+It 'a bare drive root is DISCARDED' {
+    $r = Get-FxTriage -Facts $facts -Responder {
+        '{"findings":[{"process":"rm.exe","directory":"C:\\","concern":"vacuous","confidence":"high"}]}'
+    }
+    ($r.Findings.Count -eq 0) -and ($r.Rejected -eq 1)
+}
+It 'a two-segment ancestor is DISCARDED as too broad to mean anything' {
+    $r = Get-FxTriage -Facts $facts -Responder {
+        '{"findings":[{"process":"rm.exe","directory":"C:\\Users","concern":"too broad","confidence":"high"}]}'
+    }
+    ($r.Findings.Count -eq 0) -and ($r.Rejected -eq 1)
+}
+It 'a CHILD of a shown directory is DISCARDED - that is invention, not imprecision' {
+    # The most dangerous shape, because a specific invented path reads as the most authoritative
+    # thing on the page.
+    $r = Get-FxTriage -Facts $facts -Responder {
+        '{"findings":[{"process":"rm.exe","directory":"C:\\Users\\Admin\\.ssh\\exfiltrated-to-attacker","concern":"invented","confidence":"high"}]}'
+    }
+    ($r.Findings.Count -eq 0) -and ($r.Rejected -eq 1)
+}
+It 'a partial-segment near-miss is DISCARDED' {
+    # "C:\Users\Ad" is a string prefix of "C:\Users\Admin\..." but not a path ancestor.
+    $r = Get-FxTriage -Facts $facts -Responder {
+        '{"findings":[{"process":"rm.exe","directory":"C:\\Users\\Ad","concern":"near miss","confidence":"high"}]}'
+    }
+    ($r.Findings.Count -eq 0) -and ($r.Rejected -eq 1)
+}
+It 'but a genuine three-segment ancestor is still KEPT, so the fix did not just reject everything' {
+    $r = Get-FxTriage -Facts $facts -Responder {
+        '{"findings":[{"process":"rm.exe","directory":"C:\\Users\\Admin","concern":"legitimate imprecision","confidence":"medium"}]}'
+    }
+    $r.Findings.Count -eq 1
+}
+It 'an uppercase confidence is normalised, not silently rendered verbatim' {
+    # -notin is case-insensitive, so "HIGH" passed the validity check and reached the HTML
+    # unnormalised. It is a valid answer typed loudly - normalise it rather than downgrade it.
+    $r = Get-FxTriage -Facts $facts -Responder {
+        '{"findings":[{"process":"rm.exe","directory":"C:\\Users\\Admin\\.ssh","concern":"x","confidence":"HIGH"}]}'
+    }
+    ($r.Findings.Count -eq 1) -and ($r.Findings[0].Confidence -eq 'high')
+}
+
 It 'good and bad findings in one response are separated, not both dropped' {
     $r = Get-FxTriage -Facts $facts -Responder {
         '{"findings":[{"process":"nope.exe","directory":"C:\\Users\\Admin\\.ssh","concern":"a","confidence":"high"},{"process":"pwsh.exe","directory":"C:\\Users\\Admin\\.ollama\\models","concern":"b","confidence":"low"}]}'
@@ -130,6 +185,31 @@ It 'the request declares utf-8, because 5.1 silently mis-encodes without it' {
     # parameter itself is the only check that fails when someone tidies it away.
     $src = Get-Content (Join-Path $repoRoot 'scripts\ForensicsReport.Triage.ps1') -Raw
     $src -match "charset=utf-8"
+}
+
+Write-Host "`n== the model asked for must be one that is installed ==" -ForegroundColor Cyan
+# The default tag was correct on exactly one machine. Everywhere else Ollama 404s, triage
+# degrades silently, and the report looks identical to a box with no model at all - so the
+# feature would have been on by default and never once run.
+It 'an exactly-installed preferred model is used as-is' {
+    (Resolve-FxTriageModel -Preferred 'mistral-small3.2:24b' -Installed @('llama3:8b','mistral-small3.2:24b')) -eq 'mistral-small3.2:24b'
+}
+It 'a different tag of the same family is accepted' {
+    # What install-llm.ps1 actually pulls is "mistral-small"; the default asked for a tag it
+    # never creates.
+    (Resolve-FxTriageModel -Preferred 'mistral-small3.2:24b' -Installed @('mistral-small:latest')) -eq 'mistral-small:latest'
+}
+It 'and the family match works in the other direction too' {
+    (Resolve-FxTriageModel -Preferred 'mistral-small' -Installed @('mistral-small3.2:24b')) -eq 'mistral-small3.2:24b'
+}
+It 'an unrelated chat model is used rather than giving up' {
+    (Resolve-FxTriageModel -Preferred 'mistral-small' -Installed @('qwen3:8b')) -eq 'qwen3:8b'
+}
+It 'embedding and reranker models are never chosen - they cannot answer the prompt' {
+    $null -eq (Resolve-FxTriageModel -Preferred 'mistral-small' -Installed @('bge-m3:latest','qwen3-embedding:0.6b'))
+}
+It 'nothing installed yields no model, not a guess' {
+    $null -eq (Resolve-FxTriageModel -Preferred 'mistral-small' -Installed @())
 }
 
 Write-Host "`n== the prompt shows only aggregates, never the raw log ==" -ForegroundColor Cyan

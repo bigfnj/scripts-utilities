@@ -22,6 +22,18 @@ token by whatever means your environment provides:
   # a 'DONE (...)' sentinel and records the security context via whoami:
   .\scripts\install-machine-scope.ps1 -LogPath C:\Users\Public\ms-install.log
 
+There are exactly three sentinels, and only the first means the machine is
+provisioned:
+
+  DONE (success)   every ID is installed and was verified present by winget list
+  DONE (failure)   at least one install failed, or winget could not be resolved
+  DONE (dry-run)   -DryRun: nothing was installed. NOT a success
+
+Match on the whole sentinel line, not on the word 'DONE'. -DryRun used to print
+'all machine-scope packages present' followed by 'DONE (success)' without ever
+attempting an install, because the only thing that could add to $failures sat in
+a branch -DryRun skipped - so a rehearsal told automation the box was ready.
+
 The ID list comes from catalog.json (machine_scope_ids); override with -Ids only
 for a one-off. Keep catalog.json in sync with the machineScope entries in
 scripts/build-devtoolbox.ps1.
@@ -113,10 +125,13 @@ catch {
 }
 
 $failures = @()
+$alreadyCount = 0
+$plannedCount = 0
 foreach ($id in $Ids) {
     $listed = & $winget list --id $id -e --accept-source-agreements 2>&1
     if ($LASTEXITCODE -eq 0 -and ($listed -match [regex]::Escape($id))) {
         Log "SKIP already installed: $id"
+        $alreadyCount++
         continue
     }
     $scopeArgs = if ($id -in $NoScopeFlag) { @() } else { @('--scope', 'machine') }
@@ -125,6 +140,7 @@ foreach ($id in $Ids) {
         $scopeStr = if ($scopeArgs) { "--scope machine" } else { "(no --scope flag)" }
         $typeStr = if ($typeArgs) { " --installer-type $($installerTypes[$id])" } else { "" }
         Log "[DRY-RUN] would: winget install --id $id -e $scopeStr$typeStr"
+        $plannedCount++
         continue
     }
     $scopeLabel = if ($scopeArgs) { "machine scope" } else { "default scope (no --scope flag)" }
@@ -144,6 +160,19 @@ if ($failures.Count -gt 0) {
     Log "completed with failures: $($failures -join ', ')"
     Log "DONE (failure)"
     exit 1
+}
+
+# A dry run installs nothing, so it must not emit the sentinel that says it did. $failures can
+# only grow in the install branch, which -DryRun skips with a 'continue' well before it - so the
+# old code fell straight through to "all machine-scope packages present" / "DONE (success)"
+# after attempting exactly zero installs. The header points SYSTEM/headless callers at that
+# sentinel, so a rehearsal reported a provisioned machine to automation that could not see the
+# '[DRY-RUN]' lines above it. Give the rehearsal its own sentinel instead.
+if ($DryRun) {
+    Log "DRY-RUN: $plannedCount of $($Ids.Count) package(s) would be installed; $alreadyCount already present"
+    Log "DRY-RUN: nothing was installed and no install was verified - this is not a success"
+    Log "DONE (dry-run)"
+    exit 0
 }
 Log "all machine-scope packages present"
 Log "DONE (success)"

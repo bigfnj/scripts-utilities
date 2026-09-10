@@ -40,10 +40,18 @@ $CANONICAL_TOOLBOX = if ($env:CODEX_TOOLBOX -and
 }
 $env:CODEX_TOOLBOX = $CANONICAL_TOOLBOX
 Sync-EnvPath
+# Locations a PREVIOUS clone may still occupy. Everything in this list is a candidate for
+# -CleanLegacyState to delete recursively, so an entry that is wrong is a loaded gun.
+#
+# It was wrong. This list used to end with "D:\.ai-work\projects\scripts-utilities" under the
+# comment "pre-2026-08-20 location, before the move to D:\.ai-work\projects" - but that path is
+# the DESTINATION of that move and is where this repo lives now. Remove-OldRepositoryClone's
+# three guards (owned clone, clean tree, not the running copy) all pass for it; the only reason
+# it survived is that bootstrap normally runs FROM there. Following this repo's own documented
+# installer (get.ps1 clones to %USERPROFILE%\scripts-utilities) and then taking its advice to
+# pass -CleanLegacyState would have deleted the live repo, .git and all.
 $KNOWN_OLD_REPO_ROOTS = @(
-    (Join-Path $env:USERPROFILE "Documents\scripts-utilities"),
-    # pre-2026-08-20 location, before the move to D:\.ai-work\projects
-    "D:\.ai-work\projects\scripts-utilities"
+    (Join-Path $env:USERPROFILE "Documents\scripts-utilities")
 )
 $AGENT_TARGETS = @(
     (Join-Path $env:USERPROFILE ".codex\AGENTS.md"),
