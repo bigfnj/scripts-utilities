@@ -1,0 +1,153 @@
+<Sysmon schemaversion="4.90">
+  <!--
+    Deletion forensics for this workstation, written 2026-09-09 after a mass profile deletion
+    (16:00-17:37) could not be attributed: Sysmon was not installed, File System auditing was
+    off, and the USN journal retained under two hours. This config exists so a repeat is
+    answerable.
+
+    EVENT 26 (FileDeleteDetected), NOT EVENT 23 (FileDelete). This is the single most important
+    line in the file. Event 23 ARCHIVES a copy of every deleted file into an archive directory
+    before logging it, which on a machine that deletes build output, node_modules and package
+    caches all day would consume the disk it is meant to protect. Event 26 records the same
+    who/what/when and copies nothing.
+
+    Sysmon fires this per FILE, not per directory, so a recursive tree delete appears as a burst
+    of events sharing one Image and ProcessGuid. That is the signature to look for, and it is
+    more useful than a single directory-removal record would be.
+
+    Scope is the user profile, because that is what was lost. The exclusions below are churn that
+    would otherwise drown the signal - a log nobody can read is a log nobody reads.
+  -->
+  <EventFiltering>
+
+    <!--
+      ProcessCreate, deliberately an INCLUDE list rather than an exclude list.
+
+      Measured before this change: 997 events/minute, of which only 42 were deletions. The other
+      955 were process create/terminate on a busy dev box - about 8 process launches a second
+      during a build. At that rate a 1 GB log holds ~12 hours, against a 72-hour requirement.
+
+      Event 26 already names the deleting Image, so ProcessCreate is not load-bearing for "who";
+      it adds the COMMAND LINE and the parent, which is what turns "powershell.exe" into the
+      actual command. That is only worth its volume for the handful of programs capable of
+      running a mass delete: shells, script hosts, installers, bulk copy tools, and anything
+      executing out of Temp or Downloads.
+    -->
+    <RuleGroup name="proc-create" groupRelation="or">
+      <ProcessCreate onmatch="include">
+        <Image condition="end with">\powershell.exe</Image>
+        <Image condition="end with">\pwsh.exe</Image>
+        <Image condition="end with">\cmd.exe</Image>
+        <Image condition="end with">\wscript.exe</Image>
+        <Image condition="end with">\cscript.exe</Image>
+        <Image condition="end with">\mshta.exe</Image>
+        <Image condition="end with">\rundll32.exe</Image>
+        <Image condition="end with">\regsvr32.exe</Image>
+        <Image condition="end with">\msiexec.exe</Image>
+        <Image condition="end with">\cleanmgr.exe</Image>
+        <Image condition="end with">\robocopy.exe</Image>
+        <Image condition="end with">\xcopy.exe</Image>
+        <Image condition="end with">\bash.exe</Image>
+        <Image condition="end with">\wsl.exe</Image>
+        <Image condition="end with">\python.exe</Image>
+        <!-- Anything running out of a scratch or download location. -->
+        <Image condition="contains">\AppData\Local\Temp\</Image>
+        <Image condition="contains">\Downloads\</Image>
+      </ProcessCreate>
+    </RuleGroup>
+
+    <!--
+      ProcessTerminate off entirely: an include rule with no children matches nothing. It was
+      roughly half the volume and answers no question that ProcessCreate plus Event 26 does not.
+    -->
+    <RuleGroup name="proc-term" groupRelation="or">
+      <ProcessTerminate onmatch="include" />
+    </RuleGroup>
+
+    <!--
+      Scope. A mass deletion is defined by BREADTH - the 2026-09-09 event hit 16 profile dotdirs
+      plus 11 directories under AppData\Local. So complete coverage is not required to detect one;
+      reliable coverage of QUIET, valuable paths is, because there any deletion at all is
+      anomalous. Noisy caches make the worst sentinels: deletions in them are normal, so they
+      cost log space and raise the threshold at which a real burst becomes visible.
+
+      Kept broad rather than enumerated per directory, deliberately. "Anything beginning
+      C:\Users\Admin\." covers a tool installed next week without anyone remembering to add it;
+      a hand-maintained list of 20 dotdirs would have been missing .antigravity and .u2net until
+      the day they mattered.
+
+      Dropped from an earlier version: AppData\Roaming (broad app churn, and nothing was lost
+      there on 09-09 - the PSReadline history that survived lives in it) and all of ProgramData
+      (service churn; Backblaze alone was 1062 of a 1500-event sample).
+    -->
+    <RuleGroup name="delete-include" groupRelation="or">
+      <FileDeleteDetected onmatch="include">
+        <TargetFilename condition="begin with">C:\Users\Admin\.</TargetFilename>
+        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\</TargetFilename>
+        <TargetFilename condition="begin with">C:\Users\Admin\Documents\</TargetFilename>
+      </FileDeleteDetected>
+    </RuleGroup>
+
+    <!-- Churn. Excluded to keep 72 hours legible, not because it is uninteresting.
+         Note the trade: a mass deletion still lands in the INCLUDE set above via .ollama,
+         .cargo, .nuget, DevToolbox and the rest, so the burst signature survives these. -->
+    <RuleGroup name="delete-exclude" groupRelation="or">
+      <FileDeleteDetected onmatch="exclude">
+        <!-- The two loudest by a wide margin. -->
+        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\Temp\</TargetFilename>
+        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\Packages\</TargetFilename>
+        <!-- Browser and shell caches: continuous, never the thing we are chasing. -->
+        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\Microsoft\Windows\INetCache\</TargetFilename>
+        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\Microsoft\Windows\Explorer\</TargetFilename>
+        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\Microsoft\Windows\WebCache\</TargetFilename>
+        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\Microsoft\Edge\</TargetFilename>
+        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\Google\Chrome\</TargetFilename>
+        <!-- GPU shader caches rewrite constantly. -->
+        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\D3DSCache\</TargetFilename>
+        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\NVIDIA\</TargetFilename>
+        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\AMD\</TargetFilename>
+        <!-- Editor and agent working state, rewritten many times a minute. -->
+        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Roaming\Code\</TargetFilename>
+        <TargetFilename condition="begin with">C:\Users\Admin\.vscode-server\data\</TargetFilename>
+        <!-- Build and dependency churn anywhere in the tree. -->
+        <TargetFilename condition="contains">\node_modules\</TargetFilename>
+        <TargetFilename condition="contains">\.git\objects\</TargetFilename>
+        <TargetFilename condition="contains">\__pycache__\</TargetFilename>
+        <!--
+          Package-manager caches. These ARE valuable and .nuget/.cache were both damaged on
+          09-09, so excluding them is a deliberate trade, not an oversight: they rewrite
+          constantly during any build, and a mass deletion still trips .ollama, .gemini,
+          .agents, .ssh, DevToolbox and a dozen other quiet paths in the same burst. We lose
+          nothing in detection and get the log back.
+          Scoped to the churning SUBdirectory in each case, so deleting the parent still shows.
+        -->
+        <TargetFilename condition="begin with">C:\Users\Admin\.nuget\packages\</TargetFilename>
+        <TargetFilename condition="begin with">C:\Users\Admin\.npm\_cacache\</TargetFilename>
+        <TargetFilename condition="begin with">C:\Users\Admin\.cargo\registry\</TargetFilename>
+        <TargetFilename condition="begin with">C:\Users\Admin\.cache\</TargetFilename>
+        <TargetFilename condition="begin with">C:\Users\Admin\.bun\install\cache\</TargetFilename>
+        <!-- Our own telemetry must not feed itself. -->
+        <TargetFilename condition="begin with">C:\ProgramData\Microsoft\Windows Defender\</TargetFilename>
+        <TargetFilename condition="begin with">C:\ProgramData\Sysmon\</TargetFilename>
+        <!--
+          Added after the first verification run, which showed these three dominating the log.
+          Backblaze matters most: a restore stages and deletes thousands of chunk files under
+          bzrestore\active\, and the ~100 GB restore this config was installed to protect would
+          have rolled 72 hours of history off the log while running. The backup client deleting
+          its own staging area is never the event we are hunting.
+        -->
+        <TargetFilename condition="begin with">C:\ProgramData\Backblaze\</TargetFilename>
+        <!--
+          .NET SDK telemetry, measured at 160 of a 1500-event sample and the single largest
+          remaining source. Note this excludes ONE SUBDIRECTORY, not .dotnet itself - .dotnet
+          was a victim on 2026-09-09 and must stay watched.
+        -->
+        <TargetFilename condition="begin with">C:\Users\Admin\.dotnet\TelemetryStorageService\</TargetFilename>
+        <TargetFilename condition="begin with">C:\ProgramData\Whesvc\</TargetFilename>
+        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\Dropbox\</TargetFilename>
+        <TargetFilename condition="begin with">C:\ProgramData\Rainmeter-GPU\</TargetFilename>
+      </FileDeleteDetected>
+    </RuleGroup>
+
+  </EventFiltering>
+</Sysmon>

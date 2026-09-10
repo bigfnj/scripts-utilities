@@ -265,6 +265,67 @@ analyzeHeadless `
 For scripted analysis, Ghidra's headless mode accepts Java or Python (Jython)
 scripts placed in `ghidra_scripts/` or passed with `-scriptPath`.
 
+### Deletion forensics — Sysmon + a sized USN journal
+
+Answers "**which process deleted this?**". Optional, and installed by an explicit helper rather
+than by `bootstrap.ps1`, because it loads a `BOOT_START` kernel driver and resizes an NTFS
+structure — not something a general toolbox run should do to you unasked.
+
+```powershell
+.\scripts\install-deletion-forensics.ps1            # install or update (self-elevates)
+.\scripts\install-deletion-forensics.ps1 -Verify    # health only, changes nothing
+.\scripts\install-deletion-forensics.ps1 -DryRun    # show the plan
+.\scripts\install-deletion-forensics.ps1 -Uninstall # remove Sysmon, restore a 32 MB journal
+```
+
+**Why it exists.** On 2026-09-09 this workstation lost ~16 profile dotdirs,
+`%LOCALAPPDATA%\DevToolbox`, `.dotnet\tools` and ~70 GB of Ollama models inside a 97-minute
+window. The cause was never established and *could not be*: Sysmon was absent, File System
+auditing was off, and the USN journal was 32 MB — under two hours of history on this volume.
+Every suspect had to be excluded by inference rather than evidence.
+
+**Two sensors, answering different halves of the question.**
+
+| | Sysmon event 26 | USN journal |
+|---|---|---|
+| WHO (process) | **yes** | no |
+| WHAT / WHEN | yes | **yes** |
+| Needs an agent | yes | no |
+| Survives Sysmon being stopped | no | **yes** |
+
+**Event 26 `FileDeleteDetected`, never event 23 `FileDelete`.** Event 23 archives a *copy of
+every deleted file* to disk before logging it, which on a machine that deletes build output all
+day consumes the disk it is meant to protect. Event 26 records the same who/what/when and copies
+nothing.
+
+**The log is admin-only to read.** An unelevated `Get-WinEvent` returns *"Attempted to perform an
+unauthorized operation"*, which is easy to misread as an empty log — it did mislead once during
+the original investigation. Query elevated:
+
+```powershell
+Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational'; Id=26} |
+  ForEach-Object { $x = [xml]$_.ToXml()
+    '{0}  {1}  <- {2}' -f $_.TimeCreated,
+      ($x.Event.EventData.Data | Where-Object Name -eq 'TargetFilename').'#text',
+      ($x.Event.EventData.Data | Where-Object Name -eq 'Image').'#text' }
+```
+
+Sysmon fires **per file, not per directory**, so a recursive tree delete appears as a *burst of
+event 26 sharing one `Image` and `ProcessGuid`*. That burst is the signature; pair it with event 1
+for the command line.
+
+**Scope is deliberate.** `config\sysmon-filedelete.xml` watches `C:\Users\<user>\.*`,
+`AppData\Local` and `Documents`, and excludes Temp, Packages, browser and GPU caches, Backblaze
+staging, `.dotnet\TelemetryStorageService` and the package caches. The reasoning: a mass deletion
+is defined by *breadth*, so quiet valuable paths make better sentinels than noisy caches where
+deletions are normal. Tuning measured 997 events/min → 67, i.e. ~12 h → ~178 h of retention
+against a 72 h target. **If retention ever runs short, tighten the exclusions before enlarging the
+log** — a bigger log holds more noise, not more signal.
+
+Both sensors are checked by `scripts\smoke-test.ps1`, which fails on *degradation* (installed but
+not capturing, or a start type that will not survive a reboot) and only warns on absence. A sensor
+nobody verifies is one that stops working quietly.
+
 ### cdb / kd / ntsd — Windows console debuggers
 
 `cdb`, `kd`, and `ntsd` are the **scriptable** Windows debuggers from the "Debugging Tools for

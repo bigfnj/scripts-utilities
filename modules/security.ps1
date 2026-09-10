@@ -8,7 +8,7 @@
 # binwalk and foremost are intentionally omitted - firmware carving is a
 # WSL-native workflow with no good Windows equivalents.
 
-function security_desc { "Wireshark (tshark), WinDbg + cdb/kd/ntsd + symbols, WDK (poolmon), optional Ghidra, frida (toolbox venv)" }
+function security_desc { "Wireshark (tshark), WinDbg + cdb/kd/ntsd + symbols, WDK (poolmon), optional Ghidra, frida (toolbox venv), deletion forensics (Sysmon + USN)" }
 
 function security_install {
     # Wireshark/tshark (catalog: winget-machine) - needs elevation, so it's
@@ -58,7 +58,53 @@ function security_install {
     # the toolbox venv because frida's Python binding must match the target Python.
     Install-CatalogItem -Item (Get-CatalogItem -Name "frida") | Out-Null
 
+    # Deletion forensics (Sysmon + a resized USN journal). Detect-and-report only, like
+    # Ghidra: it installs a kernel driver and needs elevation, so it stays an explicit
+    # opt-in helper rather than something a bootstrap run does to you.
+    security_report_deletion_forensics
+
     Write-Ok "security group complete"
+}
+
+function security_report_deletion_forensics {
+    <#
+        Report whether deletion forensics are present and healthy, and point at the installer
+        if not. Deliberately does NOT install: scripts\install-deletion-forensics.ps1 loads a
+        BOOT_START kernel driver and resizes an NTFS structure, which is not something a
+        general "bootstrap the toolbox" run should do without being asked.
+
+        Exists because the sensors are only useful if someone notices when they stop. They were
+        added after a mass profile deletion on 2026-09-09 that could not be attributed to
+        anything, because nothing on the machine was recording who deletes what.
+    #>
+    $svc = Get-Service -Name 'Sysmon64', 'Sysmon' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $svc) {
+        Write-Skip "deletion forensics not installed (scripts\install-deletion-forensics.ps1)"
+        return
+    }
+
+    $problems = @()
+    if ($svc.Status -ne 'Running')      { $problems += "service $($svc.Status)" }
+    # Running now and running after a restart are different properties; a service flipped to
+    # Manual keeps working until the next boot and then silently stops capturing.
+    if ($svc.StartType -ne 'Automatic') { $problems += "StartType $($svc.StartType), not Automatic" }
+
+    $usn = $null
+    try {
+        $out = & fsutil usn queryjournal C: 2>&1 | Out-String
+        $m = [regex]::Match($out, '(?im)^\s*Maximum Size\s*:\s*0x([0-9a-f]+)')
+        if ($m.Success) { $usn = [Convert]::ToInt64($m.Groups[1].Value, 16) }
+    } catch { }
+    # 1 GB floor: below that the journal holds hours, not the days an investigation needs.
+    if ($null -eq $usn)      { $problems += "USN journal unreadable on C:" }
+    elseif ($usn -lt 1GB)    { $problems += ("USN journal only {0:N0} MB on C:" -f ($usn / 1MB)) }
+
+    if ($problems.Count) {
+        Write-Warn ("deletion forensics degraded: " + ($problems -join '; '))
+        Write-Info "repair with: .\scripts\install-deletion-forensics.ps1"
+    } else {
+        Write-Skip ("deletion forensics healthy (Sysmon + {0:N2} GB USN journal)" -f ($usn / 1GB))
+    }
 }
 
 function security_install_debugger {

@@ -535,6 +535,18 @@ PATH too. Set CODEX_TOOLBOX to override the toolbox root path.
   poolmon     Live kernel pool-tag monitor (WDK, run elevated):
               poolmon /b /r /n snapshot.txt  (top nonpaged consumers)
               Installed by: install-machine-scope.ps1 + bootstrap.ps1 -Only security
+  Sysmon      Deletion forensics - WHICH PROCESS deleted a file. Optional; provision with
+              $RepoRoot\scripts\install-deletion-forensics.ps1  (-Verify to health-check).
+              Uses event 26 FileDeleteDetected, never event 23, which archives a copy of
+              every deleted file and would fill the disk.
+              THE LOG IS ADMIN-ONLY TO READ. An unelevated Get-WinEvent returns
+              "unauthorized", which is easy to misread as an empty log. Query elevated:
+                Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational'; Id=26}
+              A mass deletion appears as a BURST of event 26 sharing one Image and
+              ProcessGuid - Sysmon fires per file, not per directory.
+              Paired with a 1.5 GB USN journal (fsutil usn queryjournal C:), which records
+              what/when with no agent and survives Sysmon being stopped. Both are checked by
+              scripts\smoke-test.ps1, because a sensor nobody verifies stops working quietly.
 
 ### Local LLM stack (optional - only if installed via scripts\install-llm.ps1)
 

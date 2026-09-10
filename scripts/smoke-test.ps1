@@ -263,6 +263,59 @@ if (Test-Path $tbRoot) {
     Test-Warn "DevToolbox not found at $tbRoot - skipping PATH readiness checks"
 }
 
+# -- Deletion forensics --------------------------------------------------------
+# Optional sensors, so absence is a WARN not a FAIL. Degradation, however, is a FAIL:
+# a sensor that is installed but not actually capturing is worse than one that is absent,
+# because it is the one you will rely on and it will have nothing.
+#
+# Added after 2026-09-09, when a mass profile deletion could not be attributed to anything -
+# Sysmon was not installed, File System auditing was off, and the USN journal held under two
+# hours. The point of checking it here is that a control nobody verifies is a control that
+# quietly stops working.
+Test-Hdr "deletion forensics"
+$fxSvc = Get-Service -Name 'Sysmon64', 'Sysmon' -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $fxSvc) {
+    Test-Warn "Sysmon not installed (optional: scripts\install-deletion-forensics.ps1)"
+} else {
+    if ($fxSvc.Status -eq 'Running') { Test-Ok "Sysmon service running ($($fxSvc.Name))" }
+    else { Test-Fail "Sysmon service is $($fxSvc.Status)" }
+
+    # Running now and surviving a restart are different properties. A service flipped to
+    # Manual keeps capturing until the next boot and then stops, with nothing to announce it.
+    if ($fxSvc.StartType -eq 'Automatic') { Test-Ok "Sysmon starts automatically at boot" }
+    else { Test-Fail "Sysmon StartType is $($fxSvc.StartType), not Automatic - it will not capture after a restart" }
+
+    $drvStart = $null
+    try {
+        $qc = & sc.exe qc SysmonDrv 2>&1 | Out-String
+        $m = [regex]::Match($qc, '(?im)START_TYPE\s*:\s*\d+\s+(\S+)')
+        if ($m.Success) { $drvStart = $m.Groups[1].Value }
+    } catch { }
+    if ($drvStart -match 'BOOT_START|SYSTEM_START|AUTO_START') { Test-Ok "SysmonDrv loads at boot ($drvStart)" }
+    elseif ($drvStart) { Test-Fail "SysmonDrv START_TYPE is $drvStart - it will not load after a restart" }
+    else { Test-Warn "could not read SysmonDrv start type" }
+
+    # The deployed config must still match the repo, or the sensor is watching something
+    # nobody reviewed.
+    $cfgRepo = Join-Path $REPO_ROOT 'config\sysmon-filedelete.xml'
+    $cfgLive = Join-Path $env:ProgramData 'Sysmon\filedelete-forensics.xml'
+    if (-not (Test-Path $cfgLive)) { Test-Warn "no deployed Sysmon config at $cfgLive" }
+    elseif (-not (Test-Path $cfgRepo)) { Test-Warn "repo config missing: $cfgRepo" }
+    elseif ((Get-FileHash $cfgLive).Hash -eq (Get-FileHash $cfgRepo).Hash) { Test-Ok "Sysmon config matches the repo copy" }
+    else { Test-Fail "deployed Sysmon config DIFFERS from config\sysmon-filedelete.xml" }
+}
+
+# USN is checked independently of Sysmon: it needs no agent and survives Sysmon being stopped.
+$usnBytes = $null
+try {
+    $usnOut = & fsutil usn queryjournal C: 2>&1 | Out-String
+    $um = [regex]::Match($usnOut, '(?im)^\s*Maximum Size\s*:\s*0x([0-9a-f]+)')
+    if ($um.Success) { $usnBytes = [Convert]::ToInt64($um.Groups[1].Value, 16) }
+} catch { }
+if ($null -eq $usnBytes) { Test-Warn "could not read the USN journal on C:" }
+elseif ($usnBytes -ge 1GB) { Test-Ok ("USN journal {0:N2} GB on C:" -f ($usnBytes / 1GB)) }
+else { Test-Warn ("USN journal only {0:N0} MB on C: - hours of history, not days" -f ($usnBytes / 1MB)) }
+
 # -- Catalog integrity ---------------------------------------------------------
 # The catalog is the source of truth for the gap-fill modules; a malformed entry
 # would silently drop a tool from installs, so structurally validate it.
