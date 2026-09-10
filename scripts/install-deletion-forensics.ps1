@@ -38,23 +38,28 @@ surprise nobody wants. -ShrinkJournal opts into it explicitly.
 [CmdletBinding()]
 param(
     [string]$Root = $(if ($env:CODEX_TOOLBOX) { $env:CODEX_TOOLBOX } else { "$env:LOCALAPPDATA\DevToolbox" }),
-    # 2 GB, and the reboot burst is why it is not 1.5.
+    # 2 GB. Target is 48 HOURS of history - two days is the useful window for "what happened
+    # to my files", and it is a far more honest goal than the 72 this was first sized for.
     #
-    # Measured on this volume: 9 MB/hour sustained, which alone would make 1.5 GB good for ~164
-    # hours. But a RESTART writes ~300 MB in its first minutes - Windows startup and every
-    # autostart app touch an enormous number of files - and that cost is per reboot, not per
-    # hour. At one reboot a day the real figure is 216 MB/day sustained + 300 MB burst, so
-    # 1.5 GB held ~70 hours: just under the 72 the journal is sized for. 2 GB gives ~93 hours
-    # with a daily reboot and ~218 without.
+    # Measured on this volume: 9 MB/hour sustained. A RESTART then writes ~300 MB in its first
+    # minutes - Windows startup and every autostart app touch an enormous number of files - and
+    # that cost is per reboot, not per hour. At one reboot a day that is 216 MB/day sustained
+    # plus a 300 MB burst, so 2 GB holds ~95 hours; with no reboots, ~227.
     #
     # The general lesson, if this is ever retuned: measure the SUSTAINED rate separately from
     # bursts. Sampling right after a reboot showed 258 MB/hour and would have sized this ~14x
     # too small.
     [long]$UsnMaxBytes = 2147483648,
     [long]$UsnDeltaBytes = 33554432,
-    # 1 GB. Measured at 67 events/min after tuning -> ~178h. A heavy build day runs several
-    # times that, which is what the headroom is for; the target is 72h.
-    [long]$LogMaxBytes = 1073741824,
+    # 2 GB, for a 48-hour target.
+    #
+    # Two estimates were wrong before this one was measured, which is why the dashboard now
+    # reports retention instead of anyone asserting it. The first assumed ~1.5 KB per event;
+    # a real log averages 3,756 bytes. The second missed that 73.5% of all volume was
+    # ProcessCreate from agent shell tooling. With that excluded, measured at 4,620 events/hour
+    # = 16.5 MB/hour, 2 GB projects to ~124 hours - 2.6x the target, which is the margin a
+    # heavy build or agent day needs.
+    [long]$LogMaxBytes = 2147483648,
     [string]$Volume = 'C:',
     [switch]$Verify,
     [switch]$DryRun,

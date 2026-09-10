@@ -315,12 +315,30 @@ event 26 sharing one `Image` and `ProcessGuid`*. That burst is the signature; pa
 for the command line.
 
 **Scope is deliberate.** `config\sysmon-filedelete.xml` watches `C:\Users\<user>\.*`,
-`AppData\Local` and `Documents`, and excludes Temp, Packages, browser and GPU caches, Backblaze
-staging, `.dotnet\TelemetryStorageService` and the package caches. The reasoning: a mass deletion
-is defined by *breadth*, so quiet valuable paths make better sentinels than noisy caches where
-deletions are normal. Tuning measured 997 events/min → 67, i.e. ~12 h → ~178 h of retention
-against a 72 h target. **If retention ever runs short, tighten the exclusions before enlarging the
-log** — a bigger log holds more noise, not more signal.
+`AppData\Local` and `Documents`. The reasoning: a mass deletion is defined by *breadth*, so quiet
+valuable paths make better sentinels than noisy caches where deletions are normal.
+
+**Retention target is 48 hours** of deletion history — two days is the useful window for "what
+happened to my files". Every exclusion was measured before being added, over four rounds:
+
+| round | what was cut | measured effect |
+|---|---|---|
+| 1 | ProcessTerminate off; ProcessCreate narrowed to shells and installers | 997 → 233 events/min |
+| 2 | `.dotnet\TelemetryStorageService` (160 of a 1,500 sample) | → 67 events/min |
+| 3 | Vendor cache churn — Backblaze 1,566, Razer 720, Steam 380 | 51% of the log |
+| 4 | Agent shell tooling (`C:\Anthropic\.Git\` and its children) | 94% of remaining ProcessCreate |
+
+Final measured rate: **4,620 events/hour at 3,756 bytes each → ~124 hours at 2 GB**, comfortably
+past the target.
+
+Round 3 is excluded by **path, not by process**, and the measurement is what justifies that: all
+three vendors had *zero* deletions outside their own directories. `RazerAppEngine.exe` clearing its
+service-worker cache is noise; `RazerAppEngine.exe` deleting `.ssh` is the exact event this exists
+to catch, and a path rule keeps that visible where an image rule would not.
+
+**If retention ever runs short, tighten the exclusions before enlarging the log** — a bigger log
+holds more noise, not more signal. Two hand estimates were wrong by an order of magnitude before
+any of this was measured, which is why the dashboard reports retention from the log itself.
 
 #### The weekly dashboard
 
