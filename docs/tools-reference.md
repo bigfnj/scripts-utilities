@@ -322,6 +322,56 @@ deletions are normal. Tuning measured 997 events/min → 67, i.e. ~12 h → ~178
 against a 72 h target. **If retention ever runs short, tighten the exclusions before enlarging the
 log** — a bigger log holds more noise, not more signal.
 
+#### The weekly dashboard
+
+```powershell
+.\scripts\New-ForensicsReport.ps1              # now, last 7 days
+.\scripts\New-ForensicsReport.ps1 -Days 30     # wider window
+```
+
+A SYSTEM scheduled task (`DeletionForensicsReport`, Sunday 04:00 - an hour after pc-maintenance's
+sweep, so they do not collide) writes a self-contained HTML dashboard to the interactive user's
+real Downloads. Registered by the installer; `-NoSchedule` opts out. Only the three most recent
+are kept, ordered by the timestamp in the *name* rather than mtime, so a touched file cannot
+promote itself past a newer one.
+
+It answers two different needs.
+
+**Insights.** Four openable stat tiles (deletions, processes, bursts, sentinel paths), a burst
+panel and a coverage panel. The headline is the largest **burst** - one process deleting many
+files in a short window - because that, not raw volume, is the shape of a mass deletion. A
+machine steadily deleting build output all week is not interesting; 1,566 files in 159 seconds is.
+
+**A log reader.** Up to 4,000 recent deletions in a filterable table: free-text on path or
+process, a process picker, and a sentinel-only toggle. Every *count* above it is computed over
+all events in the window, not just the embedded rows, and the report says so rather than letting
+you assume otherwise.
+
+**Sentinel paths are chosen by measured quietness, not by importance.** The tile is only worth
+reading if any hit is unusual, so `AppData\Local\Programs` (992 hits in the first week - VS Code
+rewriting itself), `.claude` (78) and `.codex` (52) were removed after measurement. They are
+still fully tracked in the counts, the reader and burst detection; they just cannot be sentinels.
+A healthy week reads **0**.
+
+**Coverage is measured, not estimated.** The panel reports the log's actual span and projects
+retention from observed size and rate. An earlier hand estimate was out by an order of magnitude
+because it assumed 1.5 KB/event when the real figure is nearer 3.5 KB.
+
+Self-contained, like the pc-maintenance report: no CDN, no webfont, no library. It does carry
+inline vanilla JavaScript for the reader's filtering - the constraint that matters is that
+*nothing is fetched from anywhere*, and every insight renders without script.
+
+Reading the log by hand instead:
+
+```powershell
+# ELEVATED. Unelevated this returns "unauthorized", which looks exactly like an empty log.
+Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational'; Id=26} |
+  ForEach-Object { $x = [xml]$_.ToXml()
+    '{0}  {1}  <- {2}' -f $_.TimeCreated,
+      ($x.Event.EventData.Data | Where-Object Name -eq 'TargetFilename').'#text',
+      ($x.Event.EventData.Data | Where-Object Name -eq 'Image').'#text' }
+```
+
 Both sensors are checked by `scripts\smoke-test.ps1`, which fails on *degradation* (installed but
 not capturing, or a start type that will not survive a reboot) and only warns on absence. A sensor
 nobody verifies is one that stops working quietly.

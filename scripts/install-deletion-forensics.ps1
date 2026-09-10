@@ -59,6 +59,8 @@ param(
     [switch]$Verify,
     [switch]$DryRun,
     [switch]$Uninstall,
+    # Skip registering the weekly HTML report task; the sensors install either way.
+    [switch]$NoSchedule,
     # Only meaningful with -Uninstall. Shrinking a USN journal is impossible in place, so this
     # DELETES it and recreates it small, discarding every record. Opt-in for that reason.
     [switch]$ShrinkJournal
@@ -69,6 +71,7 @@ $REPO_ROOT = Split-Path $PSScriptRoot
 . (Join-Path $REPO_ROOT 'lib\common.ps1')
 
 $SysmonLog     = 'Microsoft-Windows-Sysmon/Operational'
+$TaskName      = 'DeletionForensicsReport'
 $ConfigSource  = Join-Path $REPO_ROOT 'config\sysmon-filedelete.xml'
 # Deployed OUTSIDE the toolbox on purpose: DevToolbox was destroyed in the incident this exists
 # to investigate, so the forensics config must not live inside its own subject.
@@ -186,6 +189,18 @@ if ($Verify) {
     if ($null -eq $h.UsnMaxBytes) { Write-Err "no USN journal readable on $Volume"; $ok = $false }
     elseif ($h.UsnMaxBytes -ge $UsnMaxBytes) { Write-Ok ("USN journal {0:N2} GB on {1}" -f ($h.UsnMaxBytes / 1GB), $Volume) }
     else { Write-Warn ("USN journal only {0:N0} MB on {1} (want {2:N2} GB)" -f ($h.UsnMaxBytes / 1MB), $Volume, ($UsnMaxBytes / 1GB)); $ok = $false }
+    # A SYSTEM-registered task is ADMIN-ONLY TO VIEW. Unelevated, Get-ScheduledTask returns
+    # nothing whether the task exists or not, so reporting "missing" here would be a check that
+    # announces a failure it never actually tested. This said "no weekly report task" about a
+    # task that had just been registered successfully.
+    if (-not (Test-Elevated)) {
+        Write-Skip "weekly report task: cannot check unelevated (SYSTEM tasks are admin-only to view)"
+    } else {
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($task) { Write-Ok "weekly report task registered ($($task.State))" }
+        else { Write-Warn "no weekly report task - reports will not be generated" }
+    }
+
     if ($ok) { Write-Ok 'deletion forensics healthy' } else { Write-Warn 'run scripts\install-deletion-forensics.ps1 to repair' }
     exit $(if ($ok) { 0 } else { 1 })
 }
@@ -198,6 +213,7 @@ if (-not (Test-Elevated) -and -not $DryRun) {
                  '-UsnMaxBytes', $UsnMaxBytes, '-UsnDeltaBytes', $UsnDeltaBytes, '-LogMaxBytes', $LogMaxBytes)
     if ($Uninstall) { $argList += '-Uninstall' }
     if ($ShrinkJournal) { $argList += '-ShrinkJournal' }
+    if ($NoSchedule) { $argList += '-NoSchedule' }
     $p = Start-Process powershell.exe -Verb RunAs -ArgumentList $argList -PassThru -Wait
     exit $p.ExitCode
 }
@@ -210,6 +226,11 @@ if ($Uninstall) {
         if ($DryRun) { Write-Info "[DRY-RUN] $sysmon -u force" }
         else { $null = Invoke-Native -FilePath $sysmon -Arguments @('-u', 'force'); Write-Ok 'Sysmon uninstalled' }
     } else { Write-Skip 'Sysmon binary not found; nothing to uninstall' }
+    if ($DryRun) { Write-Info "[DRY-RUN] unregister scheduled task '$TaskName'" }
+    elseif (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+        Write-Ok "removed the weekly report task"
+    } else { Write-Skip 'no weekly report task registered' }
     # The journal is NOT shrunk by default, and the reason is worth stating plainly because an
     # earlier version of this block claimed it was.
     #
@@ -292,7 +313,38 @@ else { $null = Invoke-Native -FilePath $sysmon -Arguments @('-accepteula', '-i',
 $null = Invoke-Native -FilePath 'wevtutil' -Arguments @('sl', $SysmonLog, "/ms:$LogMaxBytes", '/rt:false')
 Write-Ok ("Sysmon log sized to {0:N0} MB, circular" -f ($LogMaxBytes / 1MB))
 
-# -- 3. prove it, rather than assume ------------------------------------------------------------
+# -- 3. the weekly report ------------------------------------------------------------------------
+# SYSTEM, because the Sysmon channel is admin-only to read; the report resolves the interactive
+# user at run time so the HTML still lands in THEIR Downloads. Sunday 04:00 rather than 03:00 so
+# it does not collide with pc-maintenance's weekly sweep on the same machine.
+if (-not $NoSchedule) {
+    $gen = Join-Path $PSScriptRoot 'New-ForensicsReport.ps1'
+    if (-not (Test-Path -LiteralPath $gen)) {
+        Write-Warn "report generator not found at $gen; skipping the schedule"
+    } else {
+        try {
+            $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}" -Days 7' -f $gen)
+            $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At '04:00'
+            $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+            # StartWhenAvailable so a machine that was off on Sunday still gets its report.
+            $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+                -DontStopIfGoingOnBatteries -AllowStartIfOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+            if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+                Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+            }
+            $null = Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
+                -Principal $principal -Settings $settings -Force -ErrorAction Stop
+            Write-Ok "weekly report task '$TaskName' registered (Sunday 04:00, SYSTEM)"
+        } catch {
+            # The sensors are the point; the report is the delivery. Losing the delivery is a
+            # warning, not a failed install.
+            Write-Warn "could not register the report task: $($_.Exception.Message)"
+        }
+    }
+}
+
+# -- 4. prove it, rather than assume ------------------------------------------------------------
 $h = Get-ForensicsHealth
 if (-not ($h.ServiceRunning -and $h.DriverRunning)) {
     Write-Err 'Sysmon installed but the service or driver is not running'

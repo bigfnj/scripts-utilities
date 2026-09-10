@@ -316,6 +316,31 @@ if ($null -eq $usnBytes) { Test-Warn "could not read the USN journal on C:" }
 elseif ($usnBytes -ge 1GB) { Test-Ok ("USN journal {0:N2} GB on C:" -f ($usnBytes / 1GB)) }
 else { Test-Warn ("USN journal only {0:N0} MB on C: - hours of history, not days" -f ($usnBytes / 1MB)) }
 
+# The weekly report. A SYSTEM task is ADMIN-ONLY TO VIEW, so unelevated we cannot distinguish
+# "missing" from "invisible" - and saying "missing" there would be a check announcing a failure
+# it never tested. It did exactly that once, about a task registered seconds earlier.
+$fxElevated = (New-Object Security.Principal.WindowsPrincipal(
+    [Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $fxElevated) {
+    Test-Warn "weekly forensics report task: not checkable unelevated (SYSTEM tasks are admin-only to view)"
+} else {
+    $fxTask = Get-ScheduledTask -TaskName 'DeletionForensicsReport' -ErrorAction SilentlyContinue
+    if ($fxTask) { Test-Ok "weekly forensics report task registered ($($fxTask.State))" }
+    else { Test-Warn "no weekly forensics report task (optional: install-deletion-forensics.ps1)" }
+}
+
+# The generator and its renderer must at least parse under 5.1 - the scheduled task runs
+# powershell.exe, not pwsh, and a parse error there fails silently at 04:00 on a Sunday.
+foreach ($fxScript in 'New-ForensicsReport.ps1', 'ForensicsReport.Render.ps1') {
+    $fxPath = Join-Path $PSScriptRoot $fxScript
+    if (-not (Test-Path $fxPath)) { Test-Fail "missing $fxScript"; continue }
+    $fxErr = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile($fxPath, [ref]$null, [ref]$fxErr)
+    if ($fxErr -and $fxErr.Count) { Test-Fail "$fxScript does not parse: $($fxErr[0].Message)" }
+    else { Test-Ok "$fxScript parses" }
+}
+
 # -- Catalog integrity ---------------------------------------------------------
 # The catalog is the source of truth for the gap-fill modules; a malformed entry
 # would silently drop a tool from installs, so structurally validate it.
