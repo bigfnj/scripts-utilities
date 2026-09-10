@@ -1,0 +1,101 @@
+name: gate
+
+# WINDOWS POWERSHELL 5.1, NOT pwsh - and that is the whole point of this file.
+#
+# GitHub's Windows runners default to `shell: pwsh`, and this repository's own documentation
+# warns that CI running 7 while production runs 5.1 is how a green build ships a broken script:
+# `&&`, `??` and ternary parse cleanly under 7 and are parse ERRORS under 5.1; Get-WmiObject
+# and -Encoding Byte exist in one and not the other; Set-Content defaults to ANSI on 5.1 and
+# UTF-8 on 7. The weekly SYSTEM forensics task runs powershell.exe.
+#
+# This is not hypothetical here. smoke-test.ps1 contains a "must parse under 5.1" gate that
+# until recently called the parser IN-PROCESS, so running the smoke test from a pwsh prompt
+# silently checked 7's grammar - the one check whose entire purpose was catching 7-only syntax
+# quietly stopped doing it. A CI job on the wrong host would recreate that with more ceremony.
+#
+# WHAT IS DELIBERATELY NOT HERE. smoke-test.ps1 itself does not run: it checks ~40 installed
+# tools, the machine PATH, and a live Sysmon service, none of which exist on a runner. It would
+# fail for environmental reasons, or - worse - be softened until it passed, which is how a gate
+# becomes decorative. Only the suites that depend on nothing outside the repository run here.
+# The machine-dependent checks stay in run-gate.ps1, where they are true.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  suites:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Confirm the host really is 5.1
+        shell: powershell
+        run: |
+          $v = $PSVersionTable.PSVersion
+          "host: $v ($($PSVersionTable.PSEdition))"
+          if ($v.Major -ne 5) {
+            Write-Error "expected Windows PowerShell 5.x, got $v - this job is checking the wrong host"
+            exit 1
+          }
+
+      # Each suite runs separately so a failure names itself in the job log rather than
+      # arriving as one opaque non-zero exit.
+      - name: Core suite
+        shell: powershell
+        run: |
+          .\tests\Invoke-CoreTests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Installer suite
+        shell: powershell
+        run: |
+          .\tests\Invoke-InstallerTests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Triage suite
+        shell: powershell
+        run: |
+          .\tests\Invoke-TriageTests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Render suite
+        shell: powershell
+        run: |
+          .\tests\Invoke-RenderTests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Every script parses under 5.1
+        shell: powershell
+        run: |
+          $bad = 0
+          Get-ChildItem -Recurse -Filter *.ps1 | ForEach-Object {
+            $e = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$e)
+            if ($e -and $e.Count) {
+              $bad++
+              Write-Host ("FAIL {0}: {1}" -f $_.Name, $e[0].Message)
+            }
+          }
+          if ($bad) { exit 1 }
+          "all .ps1 parse under $($PSVersionTable.PSVersion)"
+
+      # The suite list above is hand-maintained, and a suite added to tests\ but not to this
+      # file would be silently uncovered on CI while looking covered. Same failure the local
+      # gate treats as fatal.
+      - name: No test suite is missing from this workflow
+        shell: powershell
+        run: |
+          $onDisk = @(Get-ChildItem .\tests -Filter 'Invoke-*Tests.ps1' | ForEach-Object { $_.Name })
+          $wired  = (Get-Content .\.github\workflows\gate.yml -Raw)
+          $missing = @($onDisk | Where-Object { $wired -notmatch [regex]::Escape($_) })
+          if ($missing.Count) {
+            Write-Error ("test suite(s) not run by CI: {0}" -f ($missing -join ', '))
+            exit 1
+          }
+          "all $($onDisk.Count) suite(s) are wired into CI"
