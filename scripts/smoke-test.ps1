@@ -341,13 +341,32 @@ if (-not $fxSvc) {
     else { Test-Warn "could not read SysmonDrv start type" }
 
     # The deployed config must still match the repo, or the sensor is watching something
-    # nobody reviewed.
-    $cfgRepo = Join-Path $REPO_ROOT 'config\sysmon-filedelete.xml'
-    $cfgLive = Join-Path $env:ProgramData 'Sysmon\filedelete-forensics.xml'
+    # nobody reviewed. The repo copy is a TEMPLATE now, so the comparison is against it
+    # RENDERED for this profile - and it uses the installer's own renderer rather than
+    # restating it. This check and Get-ForensicsHealth's were previously two hand-written
+    # copies of one hash comparison; that is how they drift, and one of them being wrong while
+    # the other is right is worse than either being wrong alone.
+    . (Join-Path $REPO_ROOT (Join-Path 'lib' 'SysmonConfig.ps1'))
+    $cfgRepo = Join-Path $REPO_ROOT (Join-Path 'config' 'sysmon-filedelete.xml')
+    $cfgLive = Join-Path $env:ProgramData (Join-Path 'Sysmon' 'filedelete-forensics.xml')
     if (-not (Test-Path $cfgLive)) { Test-Warn "no deployed Sysmon config at $cfgLive" }
     elseif (-not (Test-Path $cfgRepo)) { Test-Warn "repo config missing: $cfgRepo" }
-    elseif ((Get-FileHash $cfgLive).Hash -eq (Get-FileHash $cfgRepo).Hash) { Test-Ok "Sysmon config matches the repo copy" }
-    else { Test-Fail "deployed Sysmon config DIFFERS from config\sysmon-filedelete.xml" }
+    else {
+        $want = Get-RenderedSysmonConfig -TemplatePath $cfgRepo -ProfilePath $env:USERPROFILE
+        $have = [IO.File]::ReadAllText($cfgLive)
+        if ($want -eq $have) { Test-Ok "deployed Sysmon config matches the template rendered for this profile" }
+        else { Test-Fail "deployed Sysmon config is stale - re-run install-deletion-forensics.ps1 elevated" }
+    }
+
+    # A SEPARATE fact. The deployed file can be a faithful render of an older template AND
+    # still name the right profile, or vice versa. Reporting one boolean for both is what let
+    # a config that named a nonexistent profile pass as healthy for a year.
+    if (Test-Path $cfgLive) {
+        $liveText = [IO.File]::ReadAllText($cfgLive)
+        if ($liveText -match '\|') { Test-Fail "the deployed config contains an unsubstituted placeholder - the sensor is watching nothing" }
+        elseif ($liveText -like "*$($env:USERPROFILE.TrimEnd('\'))*") { Test-Ok "the live rules name this profile" }
+        else { Test-Fail "the live rules do NOT name $env:USERPROFILE - the sensor is watching a different user" }
+    }
 }
 
 # USN is checked independently of Sysmon: it needs no agent and survives Sysmon being stopped.
@@ -395,10 +414,15 @@ $parseProbe = {
 }
 $fxFiles = @()
 foreach ($fxScript in 'New-ForensicsReport.ps1', 'ForensicsReport.Core.ps1',
-                      'ForensicsReport.Render.ps1', 'ForensicsReport.Triage.ps1') {
+                      'ForensicsReport.Render.ps1', 'ForensicsReport.Triage.ps1',
+                      'install-deletion-forensics.ps1') {
     $fxPath = Join-Path $PSScriptRoot $fxScript
     if (-not (Test-Path $fxPath)) { Test-Fail "missing $fxScript" } else { $fxFiles += $fxPath }
 }
+# The renderer/validator lives in lib\, and it is the piece that decides whether the sensor
+# watches anything at all - so it is parse-gated under 5.1 like the rest.
+$fxLib = Join-Path $REPO_ROOT (Join-Path 'lib' 'SysmonConfig.ps1')
+if (-not (Test-Path $fxLib)) { Test-Fail 'missing lib\SysmonConfig.ps1' } else { $fxFiles += $fxLib }
 if ($fxFiles.Count) {
     $parseOut = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -Command $parseProbe -Args (,$fxFiles) 2>&1 | Out-String).Trim()
     if ($parseOut) {
@@ -458,9 +482,10 @@ if ($lintOut) {
 # nothing for as long as that went unnoticed. A gate that passes when its tests have vanished is
 # not a gate.
 foreach ($suite in @(
-    @{ Name = 'core';   File = 'tests\Invoke-CoreTests.ps1' },
-    @{ Name = 'triage'; File = 'tests\Invoke-TriageTests.ps1' },
-    @{ Name = 'render'; File = 'tests\Invoke-RenderTests.ps1' }
+    @{ Name = 'core';      File = 'tests\Invoke-CoreTests.ps1' },
+    @{ Name = 'installer'; File = 'tests\Invoke-InstallerTests.ps1' },
+    @{ Name = 'triage';    File = 'tests\Invoke-TriageTests.ps1' },
+    @{ Name = 'render';    File = 'tests\Invoke-RenderTests.ps1' }
 )) {
     $sPath = Join-Path $REPO_ROOT $suite.File
     if (-not (Test-Path -LiteralPath $sPath)) { Test-Fail "$($suite.Name) test suite missing: $($suite.File)"; continue }

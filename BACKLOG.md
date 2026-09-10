@@ -15,7 +15,7 @@ destroys something. Fixed items are struck through with the date.
 
 ## Bugs - HIGH
 
-### 1. The Sysmon config is hardcoded to one profile name, and `-Verify` says it is fine
+### 1. ~~The Sysmon config is hardcoded to one profile name, and `-Verify` says it is fine~~ DONE 2026-09-10
 
 `config/sysmon-filedelete.xml` contains the literal `C:\Users\Admin` in **25 places**, including
 all three `FileDeleteDetected` *include* rules (`:150-152`). Sysmon's `begin with` does **not**
@@ -30,16 +30,40 @@ fully green and `smoke-test.ps1` passes. The repo ships a public `irm | iex` boo
 This is the cardinal sin of the whole effort: a forensics sensor that is verifiably, invisibly
 blind. Silence looks exactly like "nothing was deleted".
 
-**Fix:** substitute the profile path at deploy time (read it, rewrite the XML into ProgramData,
-and hash-compare the *rendered* file rather than the repo copy), then assert at verify time that
-the deployed config's include prefixes actually match the current profile. Documented as current
-behaviour in `docs/tools-reference.md` in the meantime, but documentation is not a sensor.
+**Fixed 2026-09-10.** `config/sysmon-filedelete.xml` is now a template using `|USERPROFILE|`,
+rendered at deploy time into ProgramData by `lib/SysmonConfig.ps1`. The pipe was chosen because
+it is illegal in every Windows path, which makes "no placeholder survived" a total assertion
+rather than a hopeful one - braces and percent signs are both legal in real paths.
+
+Three things came out of doing it that were not in the original write-up:
+
+- **The fix contained the bug.** `install-deletion-forensics.ps1` self-elevates, and in the
+  elevated child `$env:USERPROFILE` is the CONSENTING ADMINISTRATOR's profile. Rendering there
+  would have watched the admin's profile on any managed workstation and left the sensor blind
+  for exactly the user losing files. The profile is now resolved in the unelevated parent and
+  passed through as `-ProfilePath`.
+- **One boolean was hiding three facts.** "The deployed config matches the repo" is really
+  *rendered-from-the-current-template*, *Sysmon-accepted-it*, and *the-live-rules-name-this-
+  profile*, and they can disagree - a second user logging in makes the third false while the
+  first stays true. `-Verify` and the smoke test now report them separately. Collapsing them
+  is how the original bug survived review.
+- **The hash comparison existed in two hand-written copies** (the installer's health check and
+  the smoke test). Both now call the same renderer. Two copies of one comparison is how they
+  drift, and one being right while the other is wrong is worse than both being wrong.
+
+Validated by a free oracle that existed only on the day: this machine's deployed config matched
+the repo byte-for-byte and its profile IS `Admin`, so rendering the template for `Admin` had to
+reproduce the deployed file exactly. It did - all 27 rules identical, the only difference being
+the new banner comment. `tests/Invoke-InstallerTests.ps1` (12 tests) then proves the validator
+REJECTS an unrendered template, a config rendered for a nonexistent profile, malformed XML, and
+an empty include list - with a positive control, because a validator that rejects everything
+looks perfect until you need it to accept something.
 
 ---
 
 ## Bugs - MEDIUM
 
-### 2. Nothing reads Sysmon's ACTIVE config, so a rejected ruleset reports as applied
+### 2. Nothing reads Sysmon's ACTIVE config - PARTLY FIXED 2026-09-10
 
 `install-deletion-forensics.ps1:167-168`, `:314-315`, `:353-357`. `ConfigCurrent` compares the
 hash of the deployed file to the repo copy - but `Copy-Item` at `:308` makes that true
@@ -48,6 +72,31 @@ unconditionally, *before* `sysmon -c` runs, and the `sysmon -c` exit code is dis
 XML, `-Verify` and the smoke test both report "config matches the repo copy" while the sensor
 runs the previous ruleset. The post-condition restates the pre-condition - the same shape as the
 deploy bug fixed in pc-maintenance with `Test-PMPayloadItemCurrent`.
+
+**Half of this is fixed.** The `sysmon -c` exit code is no longer discarded: a rejected ruleset
+now fails the install loudly instead of printing "Sysmon config updated" while the previous
+ruleset stays live. And `ConfigCurrent` no longer restates its own pre-condition - it compares
+the deployed file against the template rendered for this profile, which `Copy-Item` cannot make
+true in advance.
+
+**Still open: reading back what Sysmon ACTUALLY loaded.** Two routes, neither implemented:
+
+- `sysmon -c` with NO trailing argument dumps the running config. **Danger: `sysmon -c --`
+  RESETS Sysmon to defaults**, so the argument array must be the literal `@('-c')` and never a
+  splatted variable that could be empty. The dump is Sysmon's own re-serialisation - comments
+  stripped, defaults materialised - so it cannot be hash-compared; the check has to be
+  semantic (assert the include prefixes begin with the resolved profile).
+- Better: **Sysmon writes event 16 (`SYSMONEVENT_SERVICE_CONFIGURATION_CHANGE`) carrying
+  `ConfigurationFileHash`** - the hash of the ruleset it ACCEPTED, written by the thing being
+  verified rather than by the installer. The post-condition becomes "the newest event 16 is
+  later than the moment we applied, and its hash matches the rendered file". Needs one elevated
+  observation to pin the `ALGO=HEX` format before it can be relied on, which is why it is not
+  in yet. `New-ForensicsReport.ps1` already queries event 4; adding 16 would also let the
+  report's coverage panel say which ruleset was live during the window.
+
+Both require elevation, so neither can live in the unelevated smoke test - they belong in
+`install-deletion-forensics.ps1 -Verify`. An unelevated SKIP is the honest answer there; a PASS
+would be the very defect this backlog is about.
 
 ### 3. The weekly report lands in `C:\Windows\TEMP` when nobody is logged in
 

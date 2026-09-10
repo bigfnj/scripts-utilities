@@ -1,3 +1,27 @@
+<!--
+  THIS FILE IS A TEMPLATE, NOT THE DEPLOYED CONFIG.
+
+  |USERPROFILE| is substituted with the interactive user's profile directory by
+  scripts/install-deletion-forensics.ps1, which writes the rendered result to
+  C:\ProgramData\Sysmon\filedelete-forensics.xml. Do not deploy this file directly.
+
+  It has to be a template because Sysmon cannot do it. The condition set is a fixed list -
+  is, is not, contains, begin with, end with, image, and a few more - with no environment-
+  variable expansion, no wildcard and no per-user construct anywhere in the schema (checked
+  against `Sysmon64.exe -s`, schema 4.91). Two of the three include rules could be written
+  machine-agnostically as `contains \AppData\Local\` and `contains \Documents\`, but the
+  third - a dot-directory immediately under a profile root - cannot be expressed in that
+  grammar at all, so substitution is required rather than merely convenient.
+
+  Until 2026-09-10 this file hardcoded one profile name in 24 rules. On any machine whose
+  user is not named Admin the include list matched nothing, so the sensor recorded ZERO
+  deletions while -Verify reported fully green and the smoke test passed. A forensics sensor
+  that is verifiably, invisibly blind is the worst failure this tooling can have, and the
+  repo ships a public bootstrap that recommends installing it on a fresh workstation.
+
+  The pipe character is deliberate: it is illegal in every Windows path, so "no placeholder
+  survived rendering" is a total, machine-checkable assertion rather than a hopeful one.
+-->
 <Sysmon schemaversion="4.90">
   <!--
     Deletion forensics for this workstation, written 2026-09-09 after a mass profile deletion
@@ -137,7 +161,7 @@
       cost log space and raise the threshold at which a real burst becomes visible.
 
       Kept broad rather than enumerated per directory, deliberately. "Anything beginning
-      C:\Users\Admin\." covers a tool installed next week without anyone remembering to add it;
+      |USERPROFILE|\." covers a tool installed next week without anyone remembering to add it;
       a hand-maintained list of 20 dotdirs would have been missing .antigravity and .u2net until
       the day they mattered.
 
@@ -147,9 +171,9 @@
     -->
     <RuleGroup name="delete-include" groupRelation="or">
       <FileDeleteDetected onmatch="include">
-        <TargetFilename condition="begin with">C:\Users\Admin\.</TargetFilename>
-        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\</TargetFilename>
-        <TargetFilename condition="begin with">C:\Users\Admin\Documents\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\.</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\AppData\Local\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\Documents\</TargetFilename>
       </FileDeleteDetected>
     </RuleGroup>
 
@@ -159,21 +183,21 @@
     <RuleGroup name="delete-exclude" groupRelation="or">
       <FileDeleteDetected onmatch="exclude">
         <!-- The two loudest by a wide margin. -->
-        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\Temp\</TargetFilename>
-        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\Packages\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\AppData\Local\Temp\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\AppData\Local\Packages\</TargetFilename>
         <!-- Browser and shell caches: continuous, never the thing we are chasing. -->
-        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\Microsoft\Windows\INetCache\</TargetFilename>
-        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\Microsoft\Windows\Explorer\</TargetFilename>
-        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\Microsoft\Windows\WebCache\</TargetFilename>
-        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\Microsoft\Edge\</TargetFilename>
-        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\Google\Chrome\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\AppData\Local\Microsoft\Windows\INetCache\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\AppData\Local\Microsoft\Windows\Explorer\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\AppData\Local\Microsoft\Windows\WebCache\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\AppData\Local\Microsoft\Edge\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\AppData\Local\Google\Chrome\</TargetFilename>
         <!-- GPU shader caches rewrite constantly. -->
-        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\D3DSCache\</TargetFilename>
-        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\NVIDIA\</TargetFilename>
-        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\AMD\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\AppData\Local\D3DSCache\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\AppData\Local\NVIDIA\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\AppData\Local\AMD\</TargetFilename>
         <!-- Editor and agent working state, rewritten many times a minute. -->
-        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Roaming\Code\</TargetFilename>
-        <TargetFilename condition="begin with">C:\Users\Admin\.vscode-server\data\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\AppData\Roaming\Code\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\.vscode-server\data\</TargetFilename>
         <!-- Build and dependency churn anywhere in the tree. -->
         <TargetFilename condition="contains">\node_modules\</TargetFilename>
         <TargetFilename condition="contains">\.git\objects\</TargetFilename>
@@ -186,11 +210,11 @@
           nothing in detection and get the log back.
           Scoped to the churning SUBdirectory in each case, so deleting the parent still shows.
         -->
-        <TargetFilename condition="begin with">C:\Users\Admin\.nuget\packages\</TargetFilename>
-        <TargetFilename condition="begin with">C:\Users\Admin\.npm\_cacache\</TargetFilename>
-        <TargetFilename condition="begin with">C:\Users\Admin\.cargo\registry\</TargetFilename>
-        <TargetFilename condition="begin with">C:\Users\Admin\.cache\</TargetFilename>
-        <TargetFilename condition="begin with">C:\Users\Admin\.bun\install\cache\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\.nuget\packages\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\.npm\_cacache\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\.cargo\registry\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\.cache\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\.bun\install\cache\</TargetFilename>
         <!--
           Five C:\ProgramData\ exclusions used to live here - Defender, Sysmon, Backblaze,
           Whesvc, Rainmeter-GPU. They were REMOVED, not because that churn stopped mattering
@@ -205,8 +229,8 @@
           time. Note this excludes ONE SUBDIRECTORY, not .dotnet itself: .dotnet was a victim
           on 2026-09-09 and must stay watched.
         -->
-        <TargetFilename condition="begin with">C:\Users\Admin\.dotnet\TelemetryStorageService\</TargetFilename>
-        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\Dropbox\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\.dotnet\TelemetryStorageService\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\AppData\Local\Dropbox\</TargetFilename>
         <!--
           Vendor apps churning their own Chromium caches. Measured over 5,269 deletions:
           Razer 720, Steam 380, Backblaze 1,566 - together 51% of the entire log.
@@ -218,8 +242,8 @@
           deleting its service-worker cache is noise; RazerAppEngine.exe deleting .ssh is the
           exact event this whole thing exists to catch.
         -->
-        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\Razer\</TargetFilename>
-        <TargetFilename condition="begin with">C:\Users\Admin\AppData\Local\Steam\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\AppData\Local\Razer\</TargetFilename>
+        <TargetFilename condition="begin with">|USERPROFILE|\AppData\Local\Steam\</TargetFilename>
       </FileDeleteDetected>
     </RuleGroup>
 

@@ -68,12 +68,21 @@ param(
     [switch]$NoSchedule,
     # Only meaningful with -Uninstall. Shrinking a USN journal is impossible in place, so this
     # DELETES it and recreates it small, discarding every record. Opt-in for that reason.
-    [switch]$ShrinkJournal
+    [switch]$ShrinkJournal,
+    # Whose profile the sensor watches. Resolved in the UNELEVATED parent and passed explicitly
+    # into the elevated child, which is the whole point: after Start-Process -Verb RunAs,
+    # $env:USERPROFILE belongs to the administrator who consented, not to the person sitting at
+    # the machine. On a box where those differ - any managed workstation - rendering the config
+    # in the child would watch the admin's profile and leave the sensor blind for exactly the
+    # user losing files. That is the bug this template was written to fix, wearing a different
+    # hat, and it would have been reintroduced by the fix itself.
+    [string]$ProfilePath
 )
 $ErrorActionPreference = 'Stop'
 
 $REPO_ROOT = Split-Path $PSScriptRoot
 . (Join-Path $REPO_ROOT 'lib\common.ps1')
+. (Join-Path $REPO_ROOT 'lib\SysmonConfig.ps1')
 
 $SysmonLog     = 'Microsoft-Windows-Sysmon/Operational'
 $TaskName      = 'DeletionForensicsReport'
@@ -81,6 +90,10 @@ $ConfigSource  = Join-Path $REPO_ROOT 'config\sysmon-filedelete.xml'
 # Deployed OUTSIDE the toolbox on purpose: DevToolbox was destroyed in the incident this exists
 # to investigate, so the forensics config must not live inside its own subject.
 $ConfigDeployed = Join-Path $env:ProgramData 'Sysmon\filedelete-forensics.xml'
+
+# Resolved HERE, at the top, while we may still be the interactive user. See -ProfilePath.
+if (-not $ProfilePath) { $ProfilePath = $env:USERPROFILE }
+$ProfilePath = $ProfilePath.TrimEnd('\')
 
 function Invoke-Native {
     <#
@@ -164,8 +177,27 @@ function Get-ForensicsHealth {
         DriverStartType = $drvStart
         DriverRunning = [bool]$drv
         ConfigPresent = (Test-Path -LiteralPath $ConfigDeployed)
-        ConfigCurrent = ((Test-Path -LiteralPath $ConfigDeployed) -and (Test-Path -LiteralPath $ConfigSource) -and
-                         ((Get-FileHash -LiteralPath $ConfigDeployed).Hash -eq (Get-FileHash -LiteralPath $ConfigSource).Hash))
+        # Compared against the template RENDERED FOR THIS PROFILE, not against the template.
+        # Hashing the raw template would now always differ, and hashing the deployed file
+        # against itself is what made the old check vacuous.
+        ConfigCurrent = $(
+            if (-not (Test-Path -LiteralPath $ConfigDeployed)) { $false }
+            elseif (-not (Test-Path -LiteralPath $ConfigSource)) { $false }
+            else {
+                $want = Get-RenderedSysmonConfig -TemplatePath $ConfigSource -ProfilePath $ProfilePath
+                $have = [IO.File]::ReadAllText($ConfigDeployed)
+                $want -eq $have
+            })
+        # A SEPARATE fact from the one above, deliberately. The deployed file can be a faithful
+        # render of an older template, or a faithful render for a DIFFERENT user - and a second
+        # person logging in makes the second true while the first stays true. Collapsing three
+        # facts into one boolean is how the original bug survived review.
+        ConfigMatchesProfile = $(
+            if (-not (Test-Path -LiteralPath $ConfigDeployed)) { $false }
+            else {
+                $have = [IO.File]::ReadAllText($ConfigDeployed)
+                ($have -notmatch '\|') -and ($have -like "*$ProfilePath*")
+            })
         LogMaxBytes = $logMax
         UsnMaxBytes = (Get-UsnState -Vol $Volume)
     }
@@ -183,9 +215,13 @@ if ($Verify) {
     else { Write-Err "Sysmon service StartType is '$($h.ServiceStartType)', not Automatic - it will not capture after a restart"; $ok = $false }
     if ($h.DriverStartType -match 'BOOT_START|SYSTEM_START|AUTO_START') { Write-Ok "SysmonDrv loads at boot ($($h.DriverStartType))" }
     else { Write-Err "SysmonDrv START_TYPE is '$($h.DriverStartType)' - it will not load after a restart"; $ok = $false }
-    if ($h.ConfigCurrent)  { Write-Ok "config matches the repo copy" }
-    elseif ($h.ConfigPresent) { Write-Warn "deployed config DIFFERS from config\sysmon-filedelete.xml"; $ok = $false }
+    if ($h.ConfigCurrent)  { Write-Ok "deployed config matches the template rendered for $ProfilePath" }
+    elseif ($h.ConfigPresent) { Write-Warn "deployed config DIFFERS from config\sysmon-filedelete.xml rendered for $ProfilePath"; $ok = $false }
     else { Write-Err "config missing at $ConfigDeployed"; $ok = $false }
+    if ($h.ConfigPresent) {
+        if ($h.ConfigMatchesProfile) { Write-Ok "the live rules name this profile, so the sensor is watching the right user" }
+        else { Write-Err "the live rules do NOT name $ProfilePath - the sensor is watching a different profile, or nothing at all"; $ok = $false }
+    }
     # Null means "could not read it", which is not the same as zero and must not divide.
     if ($null -eq $h.LogMaxBytes) { Write-Err "could not read the size of $SysmonLog"; $ok = $false }
     elseif ($h.LogMaxBytes -ge $LogMaxBytes) { Write-Ok ("Sysmon log {0:N0} MB" -f ($h.LogMaxBytes / 1MB)) }
@@ -215,7 +251,10 @@ if (-not (Test-Elevated) -and -not $DryRun) {
     Write-Warn 'Elevation is required to install a driver and resize the USN journal. Relaunching...'
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"",
                  '-Root', "`"$Root`"", '-Volume', $Volume,
-                 '-UsnMaxBytes', $UsnMaxBytes, '-UsnDeltaBytes', $UsnDeltaBytes, '-LogMaxBytes', $LogMaxBytes)
+                 '-UsnMaxBytes', $UsnMaxBytes, '-UsnDeltaBytes', $UsnDeltaBytes, '-LogMaxBytes', $LogMaxBytes,
+                 # The interactive user's profile, resolved BEFORE this relaunch. Without it the
+                 # child renders for the consenting administrator.
+                 '-ProfilePath', "`"$ProfilePath`"")
     if ($Uninstall) { $argList += '-Uninstall' }
     if ($ShrinkJournal) { $argList += '-ShrinkJournal' }
     if ($NoSchedule) { $argList += '-NoSchedule' }
@@ -305,14 +344,34 @@ if ($DryRun) {
 }
 
 New-Item -ItemType Directory -Path (Split-Path $ConfigDeployed) -Force | Out-Null
-Copy-Item -LiteralPath $ConfigSource -Destination $ConfigDeployed -Force
-Write-Ok "config deployed to $ConfigDeployed"
+$rendered = Get-RenderedSysmonConfig -TemplatePath $ConfigSource -ProfilePath $ProfilePath
+$configProblems = Test-RenderedSysmonConfig -Text $rendered -ProfilePath $ProfilePath
+if ($configProblems.Count) {
+    foreach ($problem in $configProblems) { Write-Err "config: $problem" }
+    Write-Err 'refusing to deploy a config that cannot work - the sensor would run blind and report healthy'
+    exit 1
+}
+# WriteAllText with UTF8-no-BOM and the template's own line endings. Set-Content under 5.1
+# writes CRLF and ANSI, which changes the bytes and therefore every hash comparison downstream.
+[IO.File]::WriteAllText($ConfigDeployed, $rendered, (New-Object Text.UTF8Encoding($false)))
+Write-Ok "config rendered for $ProfilePath and deployed to $ConfigDeployed"
 
 $existing = Get-Service -Name 'Sysmon64', 'Sysmon' -ErrorAction SilentlyContinue | Select-Object -First 1
 # Sysmon writes its banner to stderr even on success, so decide by re-querying state below
 # rather than by parsing this output.
-if ($existing) { $null = Invoke-Native -FilePath $sysmon -Arguments @('-c', $ConfigDeployed); Write-Ok 'Sysmon config updated' }
-else { $null = Invoke-Native -FilePath $sysmon -Arguments @('-accepteula', '-i', $ConfigDeployed); Write-Ok 'Sysmon installed' }
+# The exit code was discarded here and "Sysmon config updated" printed regardless, so a
+# REJECTED ruleset reported as applied while the sensor kept running the previous one. The
+# hash check could not catch it either: Copy-Item makes the deployed file match before this
+# line runs, which is a post-condition restating its own pre-condition.
+if ($existing) {
+    $rc = Invoke-Native -FilePath $sysmon -Arguments @('-c', $ConfigDeployed)
+    if ($rc -ne 0) { Write-Err "Sysmon REJECTED the config (exit $rc) - the previous ruleset is still live"; exit 1 }
+    Write-Ok 'Sysmon accepted the config'
+} else {
+    $rc = Invoke-Native -FilePath $sysmon -Arguments @('-accepteula', '-i', $ConfigDeployed)
+    if ($rc -ne 0) { Write-Err "Sysmon install failed (exit $rc)"; exit 1 }
+    Write-Ok 'Sysmon installed'
+}
 
 # Circular (/rt:false) is what gives the natural roll-off; nothing is archived.
 $null = Invoke-Native -FilePath 'wevtutil' -Arguments @('sl', $SysmonLog, "/ms:$LogMaxBytes", '/rt:false')
