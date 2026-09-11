@@ -87,6 +87,46 @@ function Sync-EnvPath {
 # user PATH during a run that promised to change nothing. Deliberately left open: this change is
 # confined to the registry MECHANISM, and closing that gap is a behaviour change belonging either
 # to the catalog call sites or to a guard here. Recorded so the next reader need not rediscover it.
+function Invoke-Native {
+    <#
+        Run a native command with its output captured and its stderr survivable, returning the
+        exit code beside the captured lines.
+
+        LIVES HERE, not in bootstrap.ps1, because this file is where the exposure is. lib\ and
+        modules\ are dot-sourced into a caller and never run standalone, so they inherit whatever
+        $ErrorActionPreference that caller set - and bootstrap.ps1 sets 'Stop' at :24 before
+        dot-sourcing this file at :27. Neither this file nor modules\security.ps1 assigns the
+        preference, which is exactly what made the exposure invisible: a reader checking "does
+        this script set Stop?" finds no, and is wrong.
+
+        MEASURED, not assumed, 2026-09-11 under Windows PowerShell 5.1, because 2>$null looks
+        like it should discard the stderr rather than promote it. It does not:
+
+            $ErrorActionPreference = 'Stop'
+            $o = & cmd /c "echo e 1>&2 & exit /b 0" 2>$null
+            -> THREW  [NativeCommandError]
+
+        Identical for 2>&1, and identical in all three host-stream conditions tested (console
+        inherited, parent-captured with 2>&1 | Out-String, Start-Process with both standard
+        streams to files). The same probe with NO redirection - bare, assigned, or piped to
+        Out-Null - survived every condition. The REDIRECTION is the trigger, not the pipe.
+
+        And the dynamic scoping is real, probed separately: a function in a file that never
+        mentions $ErrorActionPreference, dot-sourced by a script that set 'Stop', THREW on a
+        redirected native call. That is why a file-scoped audit misses these.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @()
+    )
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $FilePath @Arguments 2>&1
+        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = @($out) }
+    } finally { $ErrorActionPreference = $prev }
+}
+
 function Add-UserPathEntry {
     param([string]$Path)
     if (-not (Test-Path $Path)) {
@@ -272,9 +312,14 @@ function Install-WingetTool {
         return $true
     }
     Assert-WingetAvailable
-    # Secondary check via winget list in case the binary isn't on PATH yet
-    $listed = winget list --id $Id -e --accept-source-agreements 2>&1
-    if ($LASTEXITCODE -eq 0 -and ($listed -match [regex]::Escape($Id))) {
+    # Secondary check via winget list in case the binary isn't on PATH yet.
+    # THROUGH Invoke-Native: this ran under bootstrap.ps1's 'Stop', where a redirected native
+    # stderr is a terminating error. LATENT on measurement - `winget list` survived for both a
+    # present and an absent package id, because winget answers on stdout - but the shape is the
+    # banned one and the next winget release is not obliged to keep doing that.
+    $listedR = Invoke-Native -FilePath 'winget' -Arguments @('list', '--id', $Id, '-e', '--accept-source-agreements')
+    $listed = $listedR.Output
+    if ($listedR.ExitCode -eq 0 -and ($listed -match [regex]::Escape($Id))) {
         Write-Skip "$Name installed (not yet on PATH - open a new shell)"
         Sync-EnvPath
         return $true
@@ -308,10 +353,20 @@ function Install-WingetTool {
     #
     # Kept in a variable rather than sent to Out-Null so the diagnostics survive for the
     # failure branch, which is the only place they are worth reading.
-    $wingetOut = winget @args 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    # THROUGH Invoke-Native. The 2>&1 here is load-bearing - the diagnostics are the whole point
+    # of the failure branch below - so the redirection cannot be dropped; it has to happen
+    # somewhere that has set 'Continue' first.
+    #
+    # This is the most-travelled install path in the repo and the one site of the six that was
+    # NOT provoked either way: a failing winget INSTALL was not run on this box, and `winget
+    # list` surviving says nothing about it, since the two subcommands need not use the same
+    # stream. Unproven, not proven safe - which on the repo's most-travelled path is reason to
+    # fix rather than reason to wait.
+    $wingetR = Invoke-Native -FilePath 'winget' -Arguments $args
+    $wingetOut = $wingetR.Output
+    if ($wingetR.ExitCode -ne 0) {
         foreach ($line in @($wingetOut)) { Write-Host "    $line" -ForegroundColor DarkGray }
-        Write-Err "$Name install failed via winget id $Id (exit $LASTEXITCODE)"
+        Write-Err "$Name install failed via winget id $Id (exit $($wingetR.ExitCode))"
         return $false
     }
     Sync-EnvPath
@@ -474,16 +529,29 @@ function Install-NpmGlobal {
     # the whole run; a failure is non-fatal here (returns $false, caller warns).
     # Captured for the same reason as winget above: unredirected, npm's stdout becomes part
     # of this function's return value and the caller's boolean guard stops working.
-    $npmOut = npm install -g $Package --no-audit --no-fund --fetch-timeout=60000 --fetch-retries=1 --fetch-retry-maxtimeout=20000 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    # THROUGH Invoke-Native, and npm is the one site of the six CONFIRMED to throw rather than
+    # merely being the banned shape. Measured 2026-09-11 under 'Stop': `npm view <absent> 2>&1`
+    # THREW [RemoteException], while the winget and fsutil probes all survived because those two
+    # answer on stdout. npm is the family member that really does use stderr, which makes this
+    # line an active defect on every npm failure path and not a precaution.
+    $npmR = Invoke-Native -FilePath 'npm' -Arguments @(
+        'install', '-g', $Package, '--no-audit', '--no-fund',
+        '--fetch-timeout=60000', '--fetch-retries=1', '--fetch-retry-maxtimeout=20000')
+    $npmOut = $npmR.Output
+    if ($npmR.ExitCode -ne 0) {
         foreach ($line in @($npmOut)) { Write-Host "    $line" -ForegroundColor DarkGray }
-        Write-Err "$Package npm install failed or timed out (exit $LASTEXITCODE)"
+        Write-Err "$Package npm install failed or timed out (exit $($npmR.ExitCode))"
         return $false
     }
     # npm's global prefix (e.g. %APPDATA%\npm) is where -g CLIs land, but a
     # machine-scope Node install does not add it to PATH - register it (user
     # scope) so npm-global tools resolve by name.
-    $npmPrefix = (& npm config get prefix | Select-Object -First 1)
+    # Through the wrapper too. A bare pipe does not promote stderr on its own, but an ENCLOSING
+    # 2>&1 - which any log-capturing parent applies - makes PowerShell redirect this command's
+    # stderr as well, and then it throws like the rest. Latent rather than live, fixed anyway
+    # because the next reader cannot tell the two shapes apart by looking.
+    $npmPrefixR = Invoke-Native -FilePath 'npm' -Arguments @('config', 'get', 'prefix')
+    $npmPrefix = @($npmPrefixR.Output | Select-Object -First 1)[0]
     if ($npmPrefix -and (Test-Path $npmPrefix)) { Add-UserPathEntry $npmPrefix | Out-Null }
     Sync-EnvPath
     return (Test-CommandAvailable $bin)

@@ -1286,7 +1286,22 @@ function Get-SUExposedNativeCalls {
             $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
             $n.Left.Extent.Text -eq '$ErrorActionPreference' -and
             $n.Right.Extent.Text -match "^['`"]Stop['`"]$" }, $true)).Count -gt 0
-        if (-not $setsStop) { continue }
+
+        # A LIBRARY IS EXPOSED WHETHER OR NOT IT SETS THE PREFERENCE. lib\ and modules\ are
+        # dot-sourced into a caller and never run standalone, so they inherit whatever that
+        # caller set - and bootstrap.ps1 sets 'Stop' at :24 before dot-sourcing lib\common.ps1
+        # at :27. Probed 2026-09-11: a function in a file that never mentions
+        # $ErrorActionPreference, dot-sourced by a script that set 'Stop', THREW on a redirected
+        # native call. Scoping this rule to "files that set Stop themselves" left four live
+        # defects unseen in Install-WingetTool, Install-NpmGlobal and the security module.
+        #
+        # NOT every file. scripts\smoke-test.ps1 holds seven calls of the same shape and is
+        # genuinely not exposed: run-gate.ps1 runs it as a CHILD PROCESS, which starts at the
+        # default 'Continue'. A blanket rule would flag those seven for no reason, and a rule
+        # that has to be argued away is one nobody keeps.
+        $relPath = $f.FullName.Substring($suRepoPrefix.Length)
+        $isLibrary = ($relPath -like 'lib\*') -or ($relPath -like 'modules\*')
+        if (-not ($setsStop -or $isLibrary)) { continue }
 
         foreach ($c in $ast.FindAll({ param($n)
                 $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {

@@ -126,7 +126,20 @@ function security_report_deletion_forensics {
 
     $usn = $null
     try {
-        $out = & fsutil usn queryjournal C: 2>&1 | Out-String
+        # THROUGH Invoke-Native (lib\common.ps1, in scope because bootstrap.ps1 dot-sources it).
+        # This file never sets $ErrorActionPreference but runs under bootstrap's 'Stop', so the
+        # 2>&1 here was the banned shape.
+        #
+        # LATENT, NOT ACTIVE, and measured rather than assumed: fsutil writes its errors to
+        # STDOUT, so the old line survived on this box for both a valid volume and an absent one.
+        # Fixed anyway because the shape is one fsutil release away from throwing and nothing at
+        # the call site would say so.
+        #
+        # While measuring, BACKLOG's claim that this "requires elevation and so reports a problem
+        # on every unelevated run" turned out to be wrong: unelevated it exits 0 and reports a
+        # 2,048 MB journal, comfortably over the 1 GB floor below.
+        $usnR = Invoke-Native -FilePath 'fsutil' -Arguments @('usn', 'queryjournal', 'C:')
+        $out = ($usnR.Output | Out-String)
         $m = [regex]::Match($out, '(?im)^\s*Maximum Size\s*:\s*0x([0-9a-f]+)')
         if ($m.Success) { $usn = [Convert]::ToInt64($m.Groups[1].Value, 16) }
     } catch { }
@@ -170,8 +183,17 @@ function security_install_debugger {
         if (Test-CommandAvailable "WinDbgX") {
             $preexisting = $true
         } elseif (Test-CommandAvailable "winget") {
-            $listed = winget list --id Microsoft.WinDbg -e --accept-source-agreements 2>&1
-            $preexisting = ($LASTEXITCODE -eq 0) -and ($listed -match [regex]::Escape("Microsoft.WinDbg"))
+            # THROUGH Invoke-Native, same exposure as the two in lib\common.ps1: this file sets
+            # no preference of its own and inherits bootstrap's 'Stop'. Unlike the fsutil probe
+            # above there is no try/catch here, so a throw would take the whole security group
+            # down rather than answering.
+            #
+            # Also LATENT on measurement: `winget list` survived under 'Stop' for both a present
+            # and an absent package id, because winget reports "no installed package found" on
+            # stdout. npm is the one in this family that genuinely throws.
+            $listedR = Invoke-Native -FilePath 'winget' -Arguments @('list', '--id', 'Microsoft.WinDbg', '-e', '--accept-source-agreements')
+            $listed = $listedR.Output
+            $preexisting = ($listedR.ExitCode -eq 0) -and ($listed -match [regex]::Escape("Microsoft.WinDbg"))
         }
     }
     Install-WingetTool -Id "Microsoft.WinDbg" -Binary "WinDbgX" -Name "WinDbg" | Out-Null

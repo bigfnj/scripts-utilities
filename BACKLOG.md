@@ -552,23 +552,64 @@ redirect the inner command's stderr too, and then even an unpiped, unredirected 
 the record. So `| Out-Null` is a latent form of the same defect rather than a different one, and
 the uv failure was almost certainly observed under exactly such a parent.
 
-### Native stderr sites left OPEN in library and module files
+### ~~Native stderr sites left OPEN in library and module files~~ FIXED 2026-09-11
 
-The 2026-09-11 sweep fixed the thirteen sites in scripts that set `Stop` *themselves*, and the AST
-gate covers that set. Six more are the same defect reached by **dynamic scoping** and are
-deliberately not fixed here, because they belong to the bootstrap install path this round was told
-not to run:
+The sweep fixed the thirteen sites in scripts that set `Stop` *themselves*. Six more were the same
+defect reached by **dynamic scoping** and were left open on the grounds that they belong to the
+bootstrap install path and could not be validated without a real bootstrap run. They are fixed now,
+because the premise was checkable without one.
 
-- `lib/common.ps1` - `Install-WingetTool` (`winget list ... 2>&1`, `winget @args 2>&1`) and
-  `Install-NpmGlobal` (`npm install -g ... 2>&1`, `& npm config get prefix | Select-Object`).
-- `modules/security.ps1` - `& fsutil usn queryjournal C: 2>&1 | ...` and
-  `winget list --id Microsoft.WinDbg -e ... 2>&1`.
+Probed first, since the whole case rests on it: a function in a file that never mentions
+`$ErrorActionPreference`, dot-sourced by a script that set `Stop`, **THREW** on a redirected native
+call. `bootstrap.ps1` sets `Stop` at `:24` and dot-sources `lib/common.ps1` at `:27`, so all six ran
+under it.
 
-Neither file assigns `$ErrorActionPreference` itself, which is why the gate does not see them - but
-`bootstrap.ps1` dot-sources `lib/common.ps1` at `:27` under `Stop`, so every one of those calls runs
-under it. `Install-WingetTool`'s is the same shape as the uv failure, in the most-travelled install
-path in the repo. The fix is mechanical (give each file the same `Invoke-Native`); the risk is that
-it cannot be validated without a real bootstrap run.
+Then each site was provoked individually, because "same shape" is not "same behaviour" and the
+difference decides whether this was a crash fix or a precaution. **One of the six is confirmed
+active. Four are latent. One could not be provoked either way.**
+
+| site | measured under `Stop` |
+|---|---|
+| `Install-NpmGlobal` `npm install -g` | **ACTIVE.** `npm view <absent> 2>&1` THREW [RemoteException]. npm really does use stderr, so every npm failure path was killing the run |
+| `Install-WingetTool` `winget @args` | **UNPROVEN.** A failing winget *install* was not run on this box, and `winget list` surviving says nothing about it - the subcommands need not share a stream |
+| `Install-WingetTool` `winget list` | latent - survived for both a present and an absent package id; winget answers on stdout |
+| `security.ps1` `winget list WinDbg` | latent, same reason. Would have taken the security group down had it thrown, as it has no `catch` |
+| `security.ps1` `fsutil usn queryjournal` | latent - survived even for an absent volume; fsutil writes errors to stdout too |
+| `Install-NpmGlobal` `npm config get prefix` | latent - a pipe alone is safe; an enclosing `2>&1` is not |
+
+The unproven one is the repo's most-travelled install path, which is a reason to fix rather than
+a reason to wait. The four latent ones were fixed because the shape is banned uniformly and no
+reader can tell "safe today" from "safe" by looking at the call site.
+
+**This correction is the point of the entry.** The sites were first written up - by me, from a
+subagent's summary - as six crashes, including "npm threw on the SUCCESS path" and "the USN probe
+reported a problem whether or not it was". Neither survived being probed. Plausible reasoning
+about which stream a native tool uses is not evidence about which stream it uses.
+
+`Invoke-Native` **moved** from `bootstrap.ps1` into `lib/common.ps1`, which is where the exposure
+is, and reaches bootstrap, both modules and the library from one definition - the same argument
+that moved the shim byte contract into `lib/ShimFormat.ps1`.
+
+The gate now treats `lib\` and `modules\` as exposed regardless of whether they set the preference,
+because they are dot-sourced and never run standalone. It is still NOT every file:
+`scripts/smoke-test.ps1` holds seven of the shape and is genuinely safe, since `run-gate.ps1` runs
+it as a child process starting at `Continue`. A rule that has to be argued away is one nobody keeps.
+
+### `Invoke-Native` exists seven times, and mostly deserves to
+
+Counted rather than assumed: **7 definitions, 3 distinct bodies**. Five are byte-identical after
+stripping comment help; `install-deletion-forensics.ps1` adds a `-PassThru` parameter and
+`New-ForensicsReport.ps1` is a third variant. Four of the seven are in scripts that dot-source no
+library at all, so a local copy is the only option.
+
+Only `uninstall-toolbox.ps1:49` is strictly redundant - it dot-sources `lib/common.ps1` fourteen
+lines earlier and then defines an identical body. **Left deliberately**: its comment-based help is
+uninstaller-specific ("THIS SCRIPT IS THE ONE THAT CANNOT AFFORD TO DIE HALFWAY", and why
+`| Out-Null` was rejected), and deleting eight duplicated lines at the cost of that reasoning is a
+bad trade. Consolidating would mean moving the prose, not just the code.
+
+`install-machine-scope.ps1` looks redundant and is not: it dot-sources `lib/catalog.ps1`, and
+`catalog.ps1` dot-sources nothing, so `Invoke-Native` does not reach it.
 
 `scripts/smoke-test.ps1` has seven more of the shape and is **not** exposed: it never sets `Stop`,
 and `run-gate.ps1` runs it as a child process, which starts at the default `Continue`. Widening the
@@ -653,13 +694,20 @@ the machine most likely to need it**, and this repo ships a public `irm | iex` b
 other consumer guards correctly (`Sync-EnvPath` filters with `Where-Object { $_ }`, `Get-RawPath`
 passes `''` as the default). This one dereference is unguarded.
 
-### modules/security.ps1's USN probe reports a problem on every unelevated run
+### ~~modules/security.ps1's USN probe reports a problem on every unelevated run~~ WRONG, corrected 2026-09-11
 
-`fsutil usn queryjournal C:` requires elevation; `bootstrap.ps1` is documented to run
-unelevated. So on the normal path this throws into an empty catch, the value stays `$null`, and
-the module reports "USN journal unreadable on C:" as a problem every time. It is also the only
-hardcoded system volume in a module - `install-deletion-forensics.ps1` correctly parameterises
-`$Volume`; `$env:SystemDrive` would remove the assumption.
+**The premise does not hold.** This entry claimed `fsutil usn queryjournal C:` requires elevation,
+so the probe throws into an empty catch and the module reports "USN journal unreadable on C:" every
+time. Measured unelevated on 2026-09-11: it exits **0** and reports a **2,048 MB** journal, well
+over the module's 1 GB floor. No false problem is reported, and the empty catch is not being hit.
+
+Left standing from the entry: `C:` is still the only hardcoded system volume in a module -
+`install-deletion-forensics.ps1` correctly parameterises `$Volume`, and `$env:SystemDrive` would
+remove the assumption. That part is real and still open.
+
+Worth keeping as a record of the failure mode: the claim was plausible (fsutil *does* need
+elevation for most of its verbs), was never checked, and sat in the backlog long enough to be
+cited as a known issue. One command settled it.
 
 ### Write-only diagnostic keys
 

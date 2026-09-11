@@ -114,42 +114,19 @@ function Remove-GeneratedManifest {
     Write-Ok "removed generated manifest: $manifestPath"
 }
 
-function Invoke-Native {
-    <#
-        Run a native command with its output captured and its stderr survivable, returning the
-        exit code beside the captured lines. Same shape and name as the wrapper in
-        install-deletion-forensics.ps1.
-
-        MEASURED, not assumed, on 2026-09-11 under Windows PowerShell 5.1, because 2>$null looks
-        like it should discard the stderr rather than promote it. It does not:
-
-            $ErrorActionPreference = 'Stop'
-            $o = & cmd /c "echo e 1>&2 & exit /b 0" 2>$null
-            -> THREW  [NativeCommandError]
-
-        Identical result for 2>&1, and identical in all three host-stream conditions tested
-        (console inherited, parent-captured with 2>&1 | Out-String, Start-Process with both
-        standard streams redirected to files). The same probe with NO redirection at all - bare,
-        assigned, or `| Out-Null` - survived in every condition. The REDIRECTION is the trigger.
-        This confirms the claim already written at lib\common.ps1:405-408.
-
-        The two callers below are the whole reason this matters: both guard Remove-OldRepositoryClone,
-        which deletes a directory tree. `git status --short` on a repo with an unreadable index,
-        or `git remote -v` on a path git dislikes, wrote to stderr and threw - so the refusal
-        this function exists to produce ("not a recognized clone", "has local changes") was
-        replaced by a bootstrap that died mid-run.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$FilePath,
-        [string[]]$Arguments = @()
-    )
-    $prev = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        $out = & $FilePath @Arguments 2>&1
-        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = @($out) }
-    } finally { $ErrorActionPreference = $prev }
-}
+# Invoke-Native MOVED to lib\common.ps1, dot-sourced at :27 above, and is not redefined here.
+#
+# It moved because the exposure is wider than this script: lib\ and modules\ never set
+# $ErrorActionPreference themselves, yet they run under whatever this file set, so the same
+# defect lived in Install-WingetTool and Install-NpmGlobal where no file-scoped audit would look
+# for it. One definition, reaching bootstrap, both modules and the library, is the same argument
+# that moved the shim byte contract into lib\ShimFormat.ps1.
+#
+# The two callers below are why it mattered here: both guard Remove-OldRepositoryClone, which
+# deletes a directory tree. `git status --short` on a repo with an unreadable index, or
+# `git remote -v` on a path git dislikes, wrote to stderr and threw - so the refusal this
+# function exists to produce ("not a recognized clone", "has local changes") was replaced by a
+# bootstrap that died mid-run.
 
 function Test-RepositoryLooksOwned {
     param([string]$Path)
