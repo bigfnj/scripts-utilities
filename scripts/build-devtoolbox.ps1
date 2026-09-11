@@ -597,7 +597,23 @@ function Get-Download {
 
     $aria = Find-Executable -Name "aria2c"
     if ($aria) {
-        & $aria --allow-overwrite=true --auto-file-renaming=false --max-tries=3 --dir (Split-Path $OutFile) --out (Split-Path $OutFile -Leaf) $Url
+        # --disable-ipv6=true is NOT optional on this class of host, and it is the whole reason
+        # tessdata has been half-installed here for weeks. aria2 resolves AAAA first and, with no
+        # working IPv6 route, dies on every URL with:
+        #
+        #   Exception: [AbstractCommand.cc:312] errorCode=1 Network problem has occurred.
+        #   cause:A socket operation was attempted to an unreachable network.
+        #
+        # Measured 2026-09-11 against tessdata_fast/osd.traineddata: plain aria2c returned 0 B and
+        # ERR; the identical command plus --disable-ipv6=true returned 10,562,727 B, the exact
+        # expected size. The same URL answered HTTP 200 to Invoke-WebRequest throughout, so this
+        # never looked like a network outage from anywhere except aria2. That is why the symptom
+        # reached us as "download failed or was unexpectedly small" on all 11 languages: the size
+        # check is downstream of a transport that never connected.
+        #
+        # Forcing IPv4 costs nothing here - every URL this function fetches is dual-stack - and a
+        # host WITH working IPv6 is unaffected, because A records resolve for all of them too.
+        & $aria --disable-ipv6=true --allow-overwrite=true --auto-file-renaming=false --max-tries=3 --dir (Split-Path $OutFile) --out (Split-Path $OutFile -Leaf) $Url
     } else {
         try {
             Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
@@ -735,12 +751,35 @@ function Install-Tessdata {
     if ($failed.Count) { Write-Warn "tessdata not installed (rerun to retry): $($failed -join ', ')" }
 }
 
+function Assert-NodeCaBundleSane {
+    # A NODE_EXTRA_CA_CERTS pointing at a file that does not exist is worse than not setting it:
+    # Node emits "Warning: Ignoring extra certs from <path>, load failed" on STDERR for every
+    # process that loads TLS, and under this file's $ErrorActionPreference = 'Stop' that warning
+    # is a terminating error. Measured 2026-09-11: it failed the Playwright phase of this very
+    # script, on a machine where the variable pointed into the toolbox tree the script was in the
+    # middle of rebuilding.
+    #
+    # The ordering is the real defect and it is NOT fixable here: the bundle is written by
+    # bootstrap.ps1 (Set-NodeSystemCaBundle), which runs AFTER this builder, so on any box whose
+    # toolbox was deleted the variable necessarily dangles for the whole of this run. Recorded in
+    # BACKLOG. What this function does is refuse to let a stale pointer fail the build: the
+    # variable is cleared FOR THIS PROCESS ONLY, so the persisted user value is untouched and
+    # bootstrap still rewrites both the file and the variable afterwards.
+    $pem = $env:NODE_EXTRA_CA_CERTS
+    if (-not $pem) { return }
+    if (Test-Path -LiteralPath $pem) { return }
+    Write-Warn "NODE_EXTRA_CA_CERTS points at a missing file ($pem) - unsetting it for this process only"
+    Write-Info "bootstrap.ps1 rewrites the bundle and the variable; the persisted value is unchanged"
+    $env:NODE_EXTRA_CA_CERTS = $null
+}
+
 function Install-PlaywrightBrowsers {
     param([string]$Python)
     if ($SkipPlaywrightBrowsers) {
         Write-Warn "skipping Playwright browser install"
         return
     }
+    Assert-NodeCaBundleSane
     Invoke-Checked "install Playwright browsers" {
         & $Python -m playwright install chromium firefox webkit
     }

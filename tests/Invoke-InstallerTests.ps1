@@ -1136,6 +1136,90 @@ It 'a shim map with an unknown or absent schema_version is REFUSED, not deserial
     $bad -eq 2
 }
 
+Write-Host "`n== a native command's stderr must not be able to fail the build ==" -ForegroundColor Cyan
+
+# Three failed rebuild attempts on 2026-09-11, three different native commands, one root cause:
+# under this file's global $ErrorActionPreference = 'Stop', a native command's stderr becomes a
+# TERMINATING error the moment its output flows into another command. The repo already had this
+# lesson written down at lib\common.ps1:294-298 and had applied it at some call sites and not
+# others, which is exactly the state these tests exist to stop recurring.
+$builderFile = Join-Path $repoRoot 'scripts\build-devtoolbox.ps1'
+$builderAst = [System.Management.Automation.Language.Parser]::ParseFile($builderFile, [ref]$null, [ref]$null)
+
+It 'no native command in the builder is piped, because the pipe is what makes its stderr fatal' {
+    # The defect, verbatim from the failed run:
+    #   & $uv python install 3.11 | Out-Null
+    #   uv.exe : Installed Python 3.11.15 in 103ms
+    #   + FullyQualifiedErrorId : NativeCommandError
+    # uv SUCCEEDED and the build died. `| Out-Null` did not fail to prevent that, it caused it -
+    # Out-Null solves the unrelated problem of native stdout leaking into a function's return
+    # value, and the two are confusable enough that the comment at that call site named the right
+    # hazard and drew the opposite conclusion from it.
+    #
+    # Asserts the CONDITION (no native command has a downstream pipeline element), not the
+    # presence of Invoke-NativeCapture: a file could call the helper in ten places and still pipe
+    # an eleventh command, which is precisely how this shipped.
+    $nativeNames = @('winget', '7z', 'aria2c', 'uv', 'npm', 'py', 'curl')
+    $bad = @()
+    foreach ($p in $builderAst.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.PipelineAst] }, $true)) {
+        if (@($p.PipelineElements).Count -lt 2) { continue }
+        $first = $p.PipelineElements[0]
+        if ($first -isnot [System.Management.Automation.Language.CommandAst]) { continue }
+        $amp = ($first.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Ampersand)
+        $nm = $first.GetCommandName()
+        if ($amp -or ($nm -and $nativeNames -contains $nm)) { $bad += $p.Extent.StartLineNumber }
+    }
+    if ($bad.Count) { Write-Host "     piped native command(s) at line(s): $($bad -join ', ')" -ForegroundColor Red }
+    $bad.Count -eq 0
+}
+
+It 'aria2c is invoked with IPv6 disabled, on the call itself' {
+    # aria2 resolves AAAA first, and on a host with no working IPv6 route every download dies:
+    #   errorCode=1 Network problem has occurred. cause:A socket operation was attempted to an
+    #   unreachable network.
+    # Measured 2026-09-11 against tessdata_fast/osd.traineddata: plain aria2c returned 0 B and
+    # ERR, the same command plus --disable-ipv6=true returned 10,562,727 B (the exact expected
+    # size), and Invoke-WebRequest answered HTTP 200 to the same URL throughout. That gap is why
+    # the symptom always read as "download failed or was unexpectedly small" - the size check sits
+    # downstream of a transport that never connected - and why this box had 2 of 11 OCR languages
+    # for weeks while looking like a truncation bug.
+    #
+    # Asserted on the aria2c CommandAst's own elements, not by grepping the file, so moving the
+    # flag into a comment or onto a different command fails this.
+    $ariaCalls = @($builderAst.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.Extent.Text -match '\$aria\b' }, $true))
+    if ($ariaCalls.Count -eq 0) { Write-Host '     no aria2c invocation found at all' -ForegroundColor Red }
+    ($ariaCalls.Count -ge 1) -and
+    (@($ariaCalls | Where-Object {
+        @($_.CommandElements | Where-Object { $_.Extent.Text -eq '--disable-ipv6=true' }).Count -eq 0
+    }).Count -eq 0)
+}
+
+It 'the Playwright phase checks the CA bundle BEFORE it runs, not after' {
+    # NODE_EXTRA_CA_CERTS pointed into the toolbox tree this script was rebuilding, so it dangled
+    # for the whole run and Node's "Ignoring extra certs ... load failed" warning - on stderr, on
+    # every TLS-loading process - failed the Playwright phase. The ordering is the real defect and
+    # is not fixable here: the bundle is written by bootstrap.ps1, which runs AFTER this builder.
+    #
+    # An ORDER assertion, not a presence one. Disable the guard by moving it below the install and
+    # the call is still sitting there, unreachable in the only sense that matters, and a regex
+    # looking for its name would still match.
+    $fn = @($builderAst.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $n.Name -eq 'Install-PlaywrightBrowsers' }, $true))[0]
+    if (-not $fn) { return $false }
+    $guard = @($fn.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.GetCommandName() -eq 'Assert-NodeCaBundleSane' }, $true))
+    $run = @($fn.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.GetCommandName() -eq 'Invoke-Checked' }, $true))
+    ($guard.Count -eq 1) -and ($run.Count -eq 1) -and
+        ($guard[0].Extent.StartOffset -lt $run[0].Extent.StartOffset)
+}
+
 if (-not (Assert-SUSuiteFloor -SuiteFile $PSCommandPath -Ran ($script:Pass + $script:Fail))) { $script:Fail++ }
 Show-SUGuardSummary
 
