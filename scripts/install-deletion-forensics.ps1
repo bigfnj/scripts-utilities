@@ -76,7 +76,12 @@ param(
     # in the child would watch the admin's profile and leave the sensor blind for exactly the
     # user losing files. That is the bug this template was written to fix, wearing a different
     # hat, and it would have been reintroduced by the fix itself.
-    [string]$ProfilePath
+    [string]$ProfilePath,
+    # INTERNAL, set only on the UAC child this script spawns. It exists so the transcript below
+    # starts in the CHILD and nowhere else. Without it there is no way to tell "I am the relaunched
+    # child, whose console is about to be destroyed" from "an operator ran me in their own elevated
+    # shell", and the two need opposite behaviour.
+    [switch]$FromRelaunch
 )
 $ErrorActionPreference = 'Stop'
 
@@ -261,6 +266,7 @@ if (-not (Test-Elevated) -and -not $DryRun) {
     if ($Uninstall) { $argList += '-Uninstall' }
     if ($ShrinkJournal) { $argList += '-ShrinkJournal' }
     if ($NoSchedule) { $argList += '-NoSchedule' }
+    $argList += '-FromRelaunch'
 
     # TELL THE OPERATOR WHERE THE OUTPUT WENT, BEFORE THE CHILD EXISTS.
     #
@@ -290,7 +296,18 @@ if (-not (Test-Elevated) -and -not $DryRun) {
 # an outer transcript (the runner starts one) makes 5.1 throw "already been started", and the
 # output then lands in the caller's transcript instead - nothing is lost, but a silent catch
 # would make the line printed above a lie.
-if ((Test-Elevated) -and -not $DryRun) {
+# GATED ON $FromRelaunch, not on Test-Elevated. Gating on elevation alone transcribed the
+# CALLER'S SESSION whenever an operator ran this from their own admin prompt: PowerShell runs a
+# .ps1 in the current session, the script's `exit` ends the script rather than the session, and
+# there is no Stop-Transcript on any of the eight exit paths - so every later command in that
+# window kept being written to the log until it closed. Found by audit on 2026-09-11, hours after
+# the transcript was added to fix the opposite problem.
+#
+# There is deliberately still no Stop-Transcript. The only process that starts one now is the UAC
+# child, which is a SEPARATE powershell.exe whose exit closes the transcript for us - the same
+# reason consolidate-path.ps1 needs none. An operator in their own elevated shell gets no
+# transcript and needs none: their console already has the output, and they can redirect it.
+if ($FromRelaunch -and (Test-Elevated) -and -not $DryRun) {
     New-Item -ItemType Directory -Force -Path (Split-Path $ElevatedLog) | Out-Null
     try { Start-Transcript -Path $ElevatedLog -Force | Out-Null }
     catch {

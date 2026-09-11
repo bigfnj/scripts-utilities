@@ -230,10 +230,14 @@ if ($ElevatedFor) {
     # Already-transcribing is benign - the output still lands in the RUNNER's transcript, so
     # nothing is lost - so it is reported and execution continues. Any other failure (a locked
     # file, a full disk) is reported with its real message for the same reason.
-    $script:TranscriptStarted = $false
+    # No flag recording whether this succeeded, and no Stop-Transcript: this block only runs in
+    # the UAC child (gated on $ElevatedFor above), which is a separate powershell.exe whose exit
+    # closes the transcript. A $script:TranscriptStarted flag was written here on 2026-09-11 to
+    # gate a Stop-Transcript that was never written, and an audit the same day found it set on
+    # both branches and read nowhere. Removed rather than completed, because the Stop it was
+    # waiting for is genuinely unnecessary.
     try {
         Start-Transcript -Path $ElevatedLog -Force | Out-Null
-        $script:TranscriptStarted = $true
     } catch {
         if ($_.Exception.Message -match 'already been started') {
             Write-Info2 "already transcribing - this run's output goes to the caller's transcript, not $ElevatedLog"

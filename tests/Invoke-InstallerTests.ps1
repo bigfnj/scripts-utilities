@@ -359,12 +359,11 @@ It 'bootstrap.ps1 exits explicitly, on BOTH the success and failure paths' {
     # It previously fell off the end with no exit at all, so it inherited the exit code of
     # whatever native command it last happened to run - which is precisely why
     # fresh-toolbox-setup-runner.ps1 had to stop trusting it.
-    $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-        (Join-Path $repoRoot 'bootstrap.ps1'), [ref]$null, [ref]$null)
-    $exits = $ast.FindAll({ param($n)
-        $n -is [System.Management.Automation.Language.CommandAst] -and
-        $n.GetCommandName() -eq 'exit' }, $true)
-    # PowerShell parses `exit N` as a statement, not a command, so match the source instead.
+    # PowerShell parses `exit N` as a STATEMENT, not a CommandAst, so an AST walk for a command
+    # named 'exit' finds nothing however the file is written. A full FindAll doing exactly that
+    # was computed here and its result discarded - left behind when the check switched to source
+    # matching, and caught by audit on 2026-09-11. Matching the source is the correct approach
+    # for this one; the dead traversal is gone.
     $src = Get-Content (Join-Path $repoRoot 'bootstrap.ps1') -Raw
     ($src -match '(?m)^\s*exit 0\s*$') -and ($src -match '(?m)^\s*exit 1\s*$')
 }

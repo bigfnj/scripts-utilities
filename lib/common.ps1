@@ -519,6 +519,17 @@ function Add-WinManifest {
     # Invoke-Expression, from a string in catalog.json). The same is true of
     # last_verified and of status, which was the literal "core" on every entry and so
     # measured nothing. `detect` stays: it is the recipe, and it IS read.
+    #
+    # `group` and `notes` ALSO have no code reader, and they stay anyway. An audit on 2026-09-11
+    # flagged them as the same class and it was right about the facts and wrong about the test:
+    # smoke-test.ps1 and toolbox-gui.ps1 read those fields off the CATALOG object, never off this
+    # file. But this file's intended reader is not code. The agent-discovery block this same
+    # library generates tells every agent on the machine "Check the Windows manifest first - the
+    # tool may already be present: Get-Content manifest	ools.json", and `notes` is the field that
+    # answers "what is this for" for whoever is deciding whether they already have the tool.
+    # Removing them would cost nothing measurable - unlike installed_version, which bought a
+    # process launch per tool - and would strip the content from the one file we ask agents to
+    # consult. Kept deliberately; do not re-flag.
     $entry = [ordered]@{
         name              = $Name
         binary            = $Binary
