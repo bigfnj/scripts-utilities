@@ -94,6 +94,30 @@ function Add-UserPathEntry {
         return $false
     }
     $resolved = (Resolve-Path $Path).Path
+
+    # DO NOT ADD WHAT THE MACHINE HIVE ALREADY ANSWERS FOR. Windows composes machine-then-user,
+    # so a user entry duplicating a machine one can never win a lookup - it cannot change
+    # resolution, it only spends characters against the 4,095-character truncation cliff. This
+    # box had two such duplicates (the toolbox native\bin and sysinternals), added here on every
+    # bootstrap run because this function only ever looked at the user hive.
+    #
+    # It is also what makes those two entries prunable at all: config\path-hygiene.json can now
+    # list them as duplicate-in-machine without the next bootstrap run silently putting them
+    # back, which would have made -Prune and bootstrap fight over the hive forever.
+    #
+    # FAILS OPEN, LOUDLY. If the machine hive cannot be read we add as before rather than fail a
+    # bootstrap over a deduplication - but we say so, because a check that can run degraded and
+    # stays quiet about it is indistinguishable from one that passed.
+    try {
+        if (Test-PathListProvides -Value (Get-RawPath -Scope Machine) -Path $resolved) {
+            Write-Info "machine PATH already provides it, so no user entry is needed: $resolved"
+            Sync-EnvPath
+            return $true
+        }
+    } catch {
+        Write-Warn "could not read the machine PATH to check for a duplicate ($($_.Exception.Message)); adding the user entry anyway"
+    }
+
     $raw = Get-RawPath -Scope User
     $entries = Split-PathList $raw
     # EXPANDED TO COMPARE, RAW TO RE-EMIT. Reading through the framework API used to expand every

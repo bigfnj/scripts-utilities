@@ -984,6 +984,28 @@ It 'matching ignores ONE trailing backslash and is case-insensitive' {
     $r = Remove-PathEntryFromString -Value 'P:\Keep;P:\Python311\;P:\keep2' -Remove @('p:\PYTHON311')
     ($r.Value -eq 'P:\Keep;P:\keep2') -and (@($r.Removed).Count -eq 1)
 }
+It 'Test-PathListProvides sees through %VAR%, which is the whole reason it expands' {
+    # The OPPOSITE rule to Remove-PathEntryFromString above, and deliberately so. That function
+    # must not expand because it RE-EMITS what it compared; this one re-emits nothing, it answers
+    # a yes/no. A machine hive holding '%LOCALAPPDATA%\DevToolbox\native\bin' and a caller asking
+    # about the expanded literal are talking about one directory, and a comparison that cannot
+    # see that is exactly how the duplicate gets added on every bootstrap run.
+    $expanded = [Environment]::ExpandEnvironmentVariables('%SystemRoot%\system32')
+    (Test-PathListProvides -Value '%SystemRoot%\system32;P:\other' -Path $expanded) -and
+        (Test-PathListProvides -Value ($expanded + ';P:\other') -Path '%SystemRoot%\system32')
+}
+It 'Test-PathListProvides says NO for an absent entry, an empty list and an empty path' {
+    # The negative half. A predicate that answered "yes" too readily would suppress a user PATH
+    # entry that nothing else provides, and the tool would stop resolving by bare name - a worse
+    # failure than the duplicate it exists to prevent, and a silent one.
+    (-not (Test-PathListProvides -Value 'P:\a;P:\b' -Path 'P:\c')) -and
+        (-not (Test-PathListProvides -Value '' -Path 'P:\a')) -and
+        (-not (Test-PathListProvides -Value 'P:\a' -Path '   '))
+}
+It 'Test-PathListProvides ignores ONE trailing backslash and case, like its neighbours' {
+    (Test-PathListProvides -Value 'P:\Keep;P:\Python311\' -Path 'p:\PYTHON311') -and
+        (Test-PathListProvides -Value 'P:\Keep;P:\Python311' -Path 'p:\PYTHON311\')
+}
 It 'Test-PathPlanChanged says NO CHANGE for a semantically identical PATH' {
     # This answer is the elevation gate. A trailing ';' or a regained trailing backslash makes the
     # two STRINGS differ while the PATH is identical, and comparing strings there drags a pure
@@ -1460,6 +1482,45 @@ It 'the three PATH editors reach Get-RawPath/Set-RawPath and the framework API n
             foreach ($helper in @('Get-RawPath', 'Set-RawPath')) {
                 if ($calls -notcontains $helper) { $bad += "$name never calls $helper" }
             }
+        }
+    }
+    foreach ($b in $bad) { Write-Host "     $b" -ForegroundColor Red }
+    $bad.Count -eq 0
+}
+
+It 'Add-UserPathEntry asks the machine hive BEFORE it writes, and returns on yes' {
+    # ORDER AND EFFECT, not presence. A Test-PathListProvides call sitting anywhere in the
+    # function satisfies "the guard exists" while changing nothing: after the write it is dead,
+    # and without a return it is a comment with a CPU cost. So this asserts both - the call comes
+    # before the Set-RawPath, and the if-statement holding it actually leaves the function.
+    #
+    # Why it matters beyond tidiness: config\path-hygiene.json now lists the toolbox native\bin
+    # and sysinternals entries as duplicate-in-machine. If this guard stops working, -Prune
+    # removes the user copies and the next bootstrap run puts them straight back, and the two
+    # halves of this repo spend forever undoing each other.
+    $fn = Get-SUFunctionAst -Ast $pathEditorAsts['lib\common.ps1'] -Name 'Add-UserPathEntry'
+    $bad = @()
+    if (-not $fn) { $bad += 'lib\common.ps1 is missing Add-UserPathEntry' }
+    else {
+        $guard = @($fn.Body.FindAll({ param($n)
+            ($n -is [System.Management.Automation.Language.CommandAst]) -and
+            ($n.GetCommandName() -eq 'Test-PathListProvides') }, $true))
+        $write = @($fn.Body.FindAll({ param($n)
+            ($n -is [System.Management.Automation.Language.CommandAst]) -and
+            ($n.GetCommandName() -eq 'Set-RawPath') }, $true))
+        if ($guard.Count -eq 0) { $bad += 'Add-UserPathEntry never consults the machine hive' }
+        if ($write.Count -eq 0) { $bad += 'Add-UserPathEntry no longer writes at all' }
+        if ($guard.Count -and $write.Count) {
+            $gLine = ($guard | ForEach-Object { $_.Extent.StartLineNumber } | Measure-Object -Minimum).Minimum
+            $wLine = ($write | ForEach-Object { $_.Extent.StartLineNumber } | Measure-Object -Minimum).Minimum
+            if ($gLine -ge $wLine) { $bad += "the machine-hive check is at line $gLine, at or after the write at $wLine" }
+            # The call must be inside an if whose body returns, or it decides nothing.
+            $returning = @($fn.Body.FindAll({ param($n)
+                ($n -is [System.Management.Automation.Language.IfStatementAst]) -and
+                ($n.Extent.Text -match 'Test-PathListProvides') -and
+                (@($n.FindAll({ param($m)
+                    $m -is [System.Management.Automation.Language.ReturnStatementAst] }, $true)).Count -gt 0) }, $true))
+            if ($returning.Count -eq 0) { $bad += 'the machine-hive check does not return, so it changes nothing' }
         }
     }
     foreach ($b in $bad) { Write-Host "     $b" -ForegroundColor Red }

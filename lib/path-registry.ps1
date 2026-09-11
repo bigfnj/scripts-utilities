@@ -165,3 +165,39 @@ function Remove-PathEntryFromString {
         Kept    = @($kept.ToArray())
     }
 }
+
+function Test-PathListProvides {
+    <#
+        Does this raw PATH value already name this directory? PURE: takes text, returns a bool.
+
+        EXPANDS TO COMPARE, and that is safe here in a way it is not in Remove-PathEntryFromString
+        above, because nothing is re-emitted: the caller is deciding whether to ADD, not rewriting
+        the value. '%LOCALAPPDATA%\DevToolbox\native\bin' and the expanded literal are the same
+        directory, and a comparison that could not see that is how the duplicate gets added.
+
+        Same one-trailing-backslash rule as Remove-PathEntryFromString, for the same reason.
+
+        Exists so Add-UserPathEntry can ask "is the machine hive already answering for this?"
+        without a second registry reader and without anything to stub in a test. Windows composes
+        machine-then-user, so a user entry duplicating a machine one can NEVER win a lookup: it
+        cannot change resolution, it only spends characters against the 4,095-character
+        truncation cliff that smoke-test.ps1 exists to warn about.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value,
+        [Parameter(Mandatory)][string]$Path
+    )
+    $norm = {
+        param($s)
+        $t = ([string]$s).Trim()
+        if ($t) { $t = [System.Environment]::ExpandEnvironmentVariables($t) }
+        if ($t.EndsWith('\')) { $t = $t.Substring(0, $t.Length - 1) }
+        return $t.ToLowerInvariant()
+    }
+    $want = & $norm $Path
+    if (-not $want) { return $false }
+    foreach ($e in (Split-PathList $Value)) {
+        if ((& $norm $e) -eq $want) { return $true }
+    }
+    return $false
+}

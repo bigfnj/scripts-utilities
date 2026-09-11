@@ -21,6 +21,18 @@
       "reason": "Same cross-scope duplicate. Literal rather than %VAR%-based because C:\\Anthropic is a managed install root with no environment variable pointing at it."
     },
     {
+      "scope": "user",
+      "entry": "%LOCALAPPDATA%\\DevToolbox\\native\\bin",
+      "require": "duplicate-in-machine",
+      "reason": "The toolbox's own entry, in BOTH hives since install-machine-scope.ps1 ratified the machine copy: bootstrap.ps1 added the user copy on every run because Add-UserPathEntry only ever looked at the user hive. Machine composes first, so the user copy has never won a lookup and removing it cannot change which ffmpeg or rg answers. Add-UserPathEntry now checks the machine hive before adding, so a -Prune here is not undone by the next bootstrap run - if that guard ever regresses the two would fight over the hive forever, which is why Invoke-InstallerTests asserts its order and its return."
+    },
+    {
+      "scope": "user",
+      "entry": "%LOCALAPPDATA%\\DevToolbox\\sysinternals",
+      "require": "duplicate-in-machine",
+      "reason": "Same duplicate, same cause, same guard. procdump, handle and sigcheck keep resolving from the machine copy."
+    },
+    {
       "scope": "machine",
       "entry": "%USERPROFILE%\\.dotnet\\tools",
       "require": "no-executables",
