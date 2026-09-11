@@ -184,35 +184,78 @@ function Remove-StaleCodexToolboxEnv {
 }
 
 function Remove-StalePathEntries {
+    <#
+        Drop PATH entries under a KNOWN_OLD_TOOLBOX_ROOTS directory, from both hives.
+
+        THROUGH lib\path-registry.ps1, never [Environment]::Get/SetEnvironmentVariable. Both
+        halves of that API were wrong here and the second was permanent: Get EXPANDS %VAR% on
+        read, Set writes the value back as REG_SZ, and a REG_SZ PATH never expands a %VAR% again.
+        So the old two lines did not merely drop the stale entries - they rewrote the whole
+        machine PATH as today's literal expansion of itself.
+
+        Measured on this box 2026-09-11: the machine hive holds 39 entries of which 6 are
+        %VAR%-based - %SystemRoot%\system32, %SystemRoot%, %SystemRoot%\System32\Wbem,
+        %SYSTEMROOT%\System32\WindowsPowerShell\v1.0\, %SYSTEMROOT%\System32\OpenSSH\ and
+        %C_EM64T_REDIST11%bin\Intel64 - and its kind is ExpandString. One -CleanLegacyState run
+        baked all six flat, for good, on the one code path a user is told to run when something is
+        already wrong. lib\path-registry.ps1's header and Remove-MachinePathEntry in lib\common.ps1
+        have both carried this prohibition since 2026-09-09; this function violated it anyway,
+        which is why the checks in tests\Invoke-InstallerTests.ps1 assert the CALL and not a
+        comment about it.
+    #>
     $oldPrefixes = @($KNOWN_OLD_TOOLBOX_ROOTS | ForEach-Object { $_.TrimEnd('\') })
+    # One backup per RUN, not per hive, and only once a value is really about to be written -
+    # mirrors scripts\consolidate-path.ps1:541. A logs\ directory full of identical files is how
+    # the one that matters gets lost, and a rebuild that writes nothing has nothing to restore.
+    $backup = $null
     foreach ($scope in @("User", "Machine")) {
-        $pathValue = [System.Environment]::GetEnvironmentVariable("PATH", $scope)
-        if (-not $pathValue) { continue }
-        $entries = @($pathValue -split ';' | Where-Object { $_ })
-        $kept = @()
+        $raw = Get-RawPath -Scope $scope
+        if (-not $raw) { continue }
+        # EXPANDED TO COMPARE, RAW TO RE-EMIT. KNOWN_OLD_TOOLBOX_ROOTS is built with
+        # Join-Path $env:USERPROFILE, so every prefix is an absolute literal and a raw entry
+        # spelled '%USERPROFILE%\Documents\Codex\_codex-toolbox\native\bin' does not textually
+        # match one. Comparing literally would leave that entry in place and then fail the run 80
+        # lines down at Assert-OldToolchainClean, which reads PATH through the framework API and so
+        # sees it expanded: "cleanup validation failed" about the very entry the cleanup had just
+        # declined to recognise. Expansion decides MATCHING only; $removed holds the raw text.
         $removed = @()
-        foreach ($entry in $entries) {
-            $trimmed = $entry.TrimEnd('\')
-            $isOld = $false
+        foreach ($entry in (Split-PathList $raw)) {
+            $probe = ([System.Environment]::ExpandEnvironmentVariables($entry)).Trim().TrimEnd('\')
             foreach ($prefix in $oldPrefixes) {
-                if ($trimmed -ieq $prefix -or $trimmed.StartsWith($prefix + "\", [StringComparison]::OrdinalIgnoreCase)) {
-                    $isOld = $true
+                if ($probe -ieq $prefix -or $probe.StartsWith($prefix + "\", [StringComparison]::OrdinalIgnoreCase)) {
+                    $removed += $entry
                     break
                 }
             }
-            if ($isOld) { $removed += $entry } else { $kept += $entry }
         }
         if ($removed.Count -eq 0) { continue }
         if ($DryRun) {
             Write-Info "[DRY-RUN] would remove stale $scope PATH entries: $($removed -join '; ')"
             continue
         }
-        try {
-            [System.Environment]::SetEnvironmentVariable("PATH", ($kept -join ';'), $scope)
-            Write-Ok "removed stale $scope PATH entries"
-        } catch {
-            throw "Failed to remove stale $scope PATH entries. Run from an elevated PowerShell or remove them manually: $($removed -join '; ')"
+        # UNELEVATED, THIS WRITES NOTHING AND SAYS SO. Same refusal as Remove-MachinePathEntry in
+        # lib\common.ps1 and for the same reason: a helper in the middle of a run must not
+        # self-elevate, because UAC on a standard-user account accepts a DIFFERENT administrator's
+        # credentials and the child would edit that account's hive while leaving this one broken.
+        #
+        # It no longer THROWS either. The old catch-and-rethrow killed bootstrap in the middle of
+        # -CleanLegacyState, after the old clone and toolbox directory were already deleted -
+        # failing loudest at the point where the least state was recoverable. Warning costs no
+        # strictness: Assert-OldToolchainClean re-reads the machine PATH a few lines later and
+        # throws on the entry this warning names, so the run still ends red, just in one piece.
+        if ($scope -eq "Machine" -and -not (Test-PathAdmin)) {
+            Write-Warn "stale Machine PATH entries NOT removed (needs elevation): $($removed -join '; ')"
+            continue
         }
+        if (-not $backup) {
+            $backup = Backup-PathRegistry -LogDir (Join-Path $REPO_ROOT "logs") `
+                -Machine (Get-RawPath -Scope Machine) -User (Get-RawPath -Scope User)
+            Write-Ok "PATH backed up -> $backup"
+            Write-Info "restore with: .\scripts\consolidate-path.ps1 -Restore `"$backup`""
+        }
+        $res = Remove-PathEntryFromString -Value $raw -Remove $removed
+        Set-RawPath -Scope $scope -Value $res.Value
+        Write-Ok "removed stale $scope PATH entries: $(@($res.Removed) -join '; ')"
     }
     Sync-EnvPath
 }
