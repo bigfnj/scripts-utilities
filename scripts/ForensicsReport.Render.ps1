@@ -425,11 +425,43 @@ border-left:4px solid var(--warn);border-radius:8px;padding:12px 14px;margin:0 0
         # that rm.exe deleted something while silently holding the argv that says what was asked
         # for. "rm.exe" and "rm -rf /c/Users/Admin/.ollama" are not the same finding.
         $cmd = if ($Procs -and $r.Guid -and $Procs.ContainsKey([string]$r.Guid)) { [string]$Procs[[string]$r.Guid] } else { '' }
-        $ttl = if ($cmd) { ' title="' + (ConvertTo-FxHtml $cmd) + '"' } else { '' }
-        [void]$sb.AppendLine('<tr' + $cls + ' data-i="' + (ConvertTo-FxHtml $r.Image) + '" data-s="' + $(if ($isSent) { '1' } else { '0' }) + '">' +
-                '<td class="t">' + (ConvertTo-FxHtml ('{0:MM-dd HH:mm:ss}' -f $r.Time)) + '</td>' +
-                '<td class="p"' + $ttl + '>' + (ConvertTo-FxHtml ([IO.Path]::GetFileName($r.Image))) + '</td>' +
-                '<td class="p">' + (ConvertTo-FxHtml $r.Path) + '</td></tr>')
+        # ESCAPES INLINED - the third and last item removed from this loop for this reason, after
+        # the & $add closure and Split-Path -Leaf recorded above. ConvertTo-FxHtml stays and is
+        # still the right call everywhere else in this file; it is the CALL COUNT here that costs.
+        #
+        # Measured 2026-09-11 at the real shape, twice, on this box under 5.1: 4,000 rows x 4
+        # unconditional escapes plus a fifth for the command-line title = 16,000 calls =
+        # 1,654 / 1,440 ms; the same escapes inlined = 117 / 119 ms. 12-14x, ~1.4 s off a
+        # 4,000-row report, with the two outputs asserted byte-identical (-ceq) in the benchmark.
+        # It is dispatch, not the Replace chain - an empty function call is 46-73 us under 5.1
+        # against ~2 us of work - so no rewrite of ConvertTo-FxHtml would have helped.
+        #
+        # The perf audit predicted 1,059 -> 17 ms (61x). That is NOT reproducible and its number
+        # is deliberately not repeated here: the audit's "after" timed bare .Replace() chains
+        # without the per-field [string] cast and empty check kept below, so it priced a version
+        # that does not preserve behaviour. The real inlined form costs ~29 us a row, not ~4.
+        #
+        # BACKLOG recorded this as "694 ms / 12,000 calls", which predates the command-line title
+        # added later: the entry was understating its own finding by a third.
+        #
+        # EVERY field the original escaped is still escaped, including the formatted time. It
+        # cannot contain &<>" today, but dropping it would be a behaviour change smuggled into a
+        # performance fix, and $r.Time is not guaranteed to be a DateTime.
+        $eCmd = [string]$cmd
+        if ($eCmd) { $eCmd = $eCmd.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;').Replace('"', '&quot;') }
+        $ttl = if ($cmd) { ' title="' + $eCmd + '"' } else { '' }
+        $eImg = [string]$r.Image
+        if ($eImg) { $eImg = $eImg.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;').Replace('"', '&quot;') }
+        $eLeaf = [string][IO.Path]::GetFileName([string]$r.Image)
+        if ($eLeaf) { $eLeaf = $eLeaf.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;').Replace('"', '&quot;') }
+        $ePath = [string]$r.Path
+        if ($ePath) { $ePath = $ePath.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;').Replace('"', '&quot;') }
+        $eTime = [string]('{0:MM-dd HH:mm:ss}' -f $r.Time)
+        if ($eTime) { $eTime = $eTime.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;').Replace('"', '&quot;') }
+        [void]$sb.AppendLine('<tr' + $cls + ' data-i="' + $eImg + '" data-s="' + $(if ($isSent) { '1' } else { '0' }) + '">' +
+                '<td class="t">' + $eTime + '</td>' +
+                '<td class="p"' + $ttl + '>' + $eLeaf + '</td>' +
+                '<td class="p">' + $ePath + '</td></tr>')
     }
     & $add '</tbody></table></div>'
     $shown = @($rows).Count
