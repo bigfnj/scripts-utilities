@@ -26,6 +26,11 @@
 [CmdletBinding()]
 param()
 
+# The deletion tripwire, the suite floor and the arm-time control. FIRST, before every other
+# dot-source: the Remove-Item shadow must be defined before any library can bind to the real
+# cmdlet. $PSScriptRoot rather than $repoRoot so this needs nothing computed first.
+. (Join-Path $PSScriptRoot 'SUTestGuard.ps1')
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $repoRoot 'lib\SysmonConfig.ps1')
 # common.ps1 and catalog.ps1 define functions only - no side effects on dot-source - so they
@@ -39,6 +44,20 @@ $script:DryRun = $false
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ("installer-tests-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $scratch -Force | Out-Null
 $script:MANIFEST = Join-Path $scratch 'tools.json'
+
+# REFUSING TO RUN rather than reporting a failed test: if the redirect above did not take, the
+# tests below must not run at all - three of them delete $script:MANIFEST, and lib\common.ps1
+# points it at the REAL manifest\tools.json until this line moves it.
+#
+# Asserts the runtime CONDITION (the path is under TEMP), not the source ORDER. Swap the
+# dot-source below this line and an order check would still match the statement sitting there
+# while the value it produced was a real path. The tally shape keeps both greppers honest.
+if (-not $script:MANIFEST.StartsWith($script:SUTempRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    Write-Host "  REFUSING TO RUN: `$script:MANIFEST is '$script:MANIFEST', outside $($script:SUTempRoot)." -ForegroundColor Red
+    Write-Host "  lib\common.ps1 must be dot-sourced BEFORE the redirect in this file." -ForegroundColor Red
+    Write-Host "0 passed, 1 failed"
+    exit 1
+}
 
 $script:Pass = 0; $script:Fail = 0
 function It {
@@ -354,5 +373,7 @@ It 'and it accumulates what the groups return' {
     ($src -match 'GROUP_FAILURES') -and ($src -match 'GROUP_FAILURES\s*\+=')
 }
 
+if (-not (Assert-SUSuiteFloor -SuiteFile $PSCommandPath -Ran ($script:Pass + $script:Fail))) { $script:Fail++ }
+Show-SUGuardSummary
 Write-Host ("`n{0} passed, {1} failed`n" -f $script:Pass, $script:Fail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
 exit $(if ($script:Fail) { 1 } else { 0 })

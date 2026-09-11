@@ -20,6 +20,11 @@
 [CmdletBinding()]
 param()
 
+# The deletion tripwire, the suite floor and the arm-time control. FIRST, before every other
+# dot-source: the Remove-Item shadow must be defined before any library can bind to the real
+# cmdlet. $PSScriptRoot rather than $repoRoot so this needs nothing computed first.
+. (Join-Path $PSScriptRoot 'SUTestGuard.ps1')
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $repoRoot 'scripts\ForensicsReport.Render.ps1')
 
@@ -259,5 +264,7 @@ It 'and the smaller tiers still read correctly' {
     ((Format-FxBytes 512) -eq '512 B') -and ((Format-FxBytes 2GB) -eq '2.00 GB')
 }
 
+if (-not (Assert-SUSuiteFloor -SuiteFile $PSCommandPath -Ran ($script:Pass + $script:Fail))) { $script:Fail++ }
+Show-SUGuardSummary
 Write-Host ("`n{0} passed, {1} failed`n" -f $script:Pass, $script:Fail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
 exit $(if ($script:Fail) { 1 } else { 0 })
