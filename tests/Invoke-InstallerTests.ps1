@@ -373,6 +373,240 @@ It 'and it accumulates what the groups return' {
     ($src -match 'GROUP_FAILURES') -and ($src -match 'GROUP_FAILURES\s*\+=')
 }
 
+Write-Host "`n== the toolbox builder's guards can actually fire ==" -ForegroundColor Cyan
+# scripts\build-devtoolbox.ps1 CANNOT be dot-sourced: its main body mutates machine state at
+# load - it creates directories, installs winget packages and runs pip. So these are AST
+# assertions over its source, the same technique scripts\smoke-test.ps1:458-471 uses to lint
+# its own try blocks. Everything below runs on a GitHub runner with no winget, no toolbox and
+# no network, which is the only way a check on a machine-mutating installer gets to run at all.
+#
+# They exist because all three defects here were the SAME shape: a guard that reads correctly
+# and cannot fire. Behavioural versions would have to make real winget installs fail and real
+# downloads truncate, so what is pinned instead is the source-level condition each guard needs.
+
+$builderPs1 = Join-Path $repoRoot 'scripts\build-devtoolbox.ps1'
+$builderAst = [System.Management.Automation.Language.Parser]::ParseFile($builderPs1, [ref]$null, [ref]$null)
+$builderFns = @($builderAst.FindAll({
+    param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
+
+function Get-BuilderFn {
+    param([string]$Name)
+    @($builderFns | Where-Object { $_.Name -eq $Name }) | Select-Object -First 1
+}
+
+It 'no bare native command inside a builder function' {
+    # THE Bug-1 regression test. An unredirected native command inside a function writes to
+    # that FUNCTION'S output stream, so `winget @args; if ($LASTEXITCODE -ne 0) { return
+    # $false }` returned [<winget's stdout lines>, $false] and the caller's `if (-not $ok)`
+    # guard stopped working - -not on a multi-element array is $false. Measured under 5.1: the
+    # leaky shape returns 3 elements and the guard fires = False. 8bca5e9 fixed the identical
+    # line in lib\common.ps1:190; the builder still had it, so an 18-package native install
+    # could fail outright and the build would still reach "OK DevToolbox ready".
+    #
+    # Assigned or piped both consume the output, so both are fine. Bare is the defect. `& $var`
+    # is not flagged: GetCommandName() is null for it, and the leak needs a name to match.
+    $native = @('winget', 'npm', 'npx', 'node', 'aria2c', 'py', 'py.exe', 'uv', 'tesseract', 'pip')
+    $bad = @()
+    foreach ($fn in $builderFns) {
+        foreach ($c in @($fn.Body.FindAll({
+            param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))) {
+            $name = $c.GetCommandName()
+            if (-not $name -or ($native -notcontains $name)) { continue }
+            $pipeline = $c.Parent
+            $consumed = ($pipeline -is [System.Management.Automation.Language.PipelineAst]) -and
+                        ($pipeline.PipelineElements.Count -gt 1)
+            # Walk no further than the function itself, so an assignment somewhere outside it
+            # cannot launder a bare call inside it.
+            $node = $c
+            while ((-not $consumed) -and $node -and ($node -ne $fn)) {
+                if ($node -is [System.Management.Automation.Language.AssignmentStatementAst]) { $consumed = $true }
+                $node = $node.Parent
+            }
+            if (-not $consumed) { $bad += ("{0}() line {1}: bare '{2}'" -f $fn.Name, $c.Extent.StartLineNumber, $name) }
+        }
+    }
+    if ($bad.Count) { foreach ($b in $bad) { Write-Host "       $b" -ForegroundColor DarkYellow } }
+    # The function floor stops a parse that silently returned nothing from passing.
+    ($builderFns.Count -ge 20) -and ($bad.Count -eq 0)
+}
+
+It 'a leaked native stdout defeats a -not guard' {
+    # Pure PowerShell, no I/O: this pins the language semantics the whole fix rests on, which
+    # is why the hardened call site type-checks the result instead of testing the call inline.
+    # Once winget's stdout rode along in the return value, `if (-not (Install-WingetPackage
+    # ...))` was not a guard at all - it was a constant.
+    $leaked = @('Found uv [astral-sh.uv]', 'Successfully installed', $false)
+    $clean = $false
+    ((-not $leaked) -eq $false) -and ((-not $clean) -eq $true) -and ($leaked -isnot [bool]) -and ($clean -is [bool])
+}
+
+It 'Install-WingetPackage returns only booleans' {
+    # Its caller's guard is a boolean test, so the contract has to be a boolean. Anything else
+    # returning from here - a captured line, a pscustomobject, a bare native call's output - is
+    # the Bug-1 shape arriving by another route.
+    $fn = Get-BuilderFn -Name 'Install-WingetPackage'
+    if (-not $fn) { Write-Host "       Install-WingetPackage is gone" -ForegroundColor DarkYellow; return $false }
+    $rets = @($fn.Body.FindAll({
+        param($n) $n -is [System.Management.Automation.Language.ReturnStatementAst] }, $true))
+    $bad = @($rets | Where-Object {
+        (-not $_.Pipeline) -or ($_.Pipeline.Extent.Text.Trim() -notmatch '^\$(true|false)$') })
+    if ($bad.Count) {
+        foreach ($b in $bad) { Write-Host ("       line {0}: {1}" -f $b.Extent.StartLineNumber, $b.Extent.Text) -ForegroundColor DarkYellow }
+    }
+    ($rets.Count -ge 3) -and ($bad.Count -eq 0)
+}
+
+It 'Install-Tessdata does not short-circuit on existence' {
+    # `if (Test-Path $out) { continue }` skipped Get-Download entirely, and with it
+    # Get-Download's own size check - so a zero-byte or partial .traineddata was permanent and
+    # every rerun reported nothing to do. Measured on this box: 2 of the 11 declared languages
+    # had usable data, while the build said it had installed them all. The existence fast-path
+    # belongs in Get-Download, which returns early when the file passes size and hash.
+    $fn = Get-BuilderFn -Name 'Install-Tessdata'
+    if (-not $fn) { Write-Host "       Install-Tessdata is gone" -ForegroundColor DarkYellow; return $false }
+    $bad = @(@($fn.Body.FindAll({
+        param($n) $n -is [System.Management.Automation.Language.IfStatementAst] }, $true)) | Where-Object {
+            ($_.Clauses[0].Item1.Extent.Text -match '\bTest-Path\b') -and
+            ($_.Clauses[0].Item2.Extent.Text -match '\bcontinue\b') })
+    if ($bad.Count) {
+        foreach ($b in $bad) { Write-Host ("       line {0}: {1}" -f $b.Extent.StartLineNumber, $b.Clauses[0].Item1.Extent.Text) -ForegroundColor DarkYellow }
+    }
+    # A loop that downloads nothing at all would also satisfy the assertion above, so pin that
+    # Get-Download is still on the per-language path.
+    ($bad.Count -eq 0) -and ($fn.Body.Extent.Text -match '\bGet-Download\b')
+}
+
+It 'Get-Download deletes the partial before throwing on the size branch' {
+    # The SHA-256 branch always deleted the bad file; the size branch threw and left it, and
+    # aria2c leaves a partial behind on a truncated transfer. That surviving short file is what
+    # the Test-Path fast-path above then found forever. ORDER is the assertion - a Remove-Item
+    # somewhere after the throw is unreachable code that still matches a source grep.
+    $fn = Get-BuilderFn -Name 'Get-Download'
+    if (-not $fn) { Write-Host "       Get-Download is gone" -ForegroundColor DarkYellow; return $false }
+    $sizeIf = @($fn.Body.FindAll({
+        param($n)
+        ($n -is [System.Management.Automation.Language.IfStatementAst]) -and
+        ($n.Clauses[0].Item1.Extent.Text -match '\bMinimumBytes\b') -and
+        ($n.Clauses[0].Item2.Extent.Text -match '\bthrow\b')
+    }, $true)) | Select-Object -First 1
+    if (-not $sizeIf) { Write-Host "       no size-failure branch that throws" -ForegroundColor DarkYellow; return $false }
+    $body = $sizeIf.Clauses[0].Item2
+    $removes = @($body.FindAll({ param($n)
+        ($n -is [System.Management.Automation.Language.CommandAst]) -and ($n.GetCommandName() -eq 'Remove-Item') }, $true))
+    $throws = @($body.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.ThrowStatementAst] }, $true))
+    if (-not $removes.Count) {
+        Write-Host ("       line {0}: size branch throws without deleting the partial" -f $sizeIf.Extent.StartLineNumber) -ForegroundColor DarkYellow
+        return $false
+    }
+    # -ErrorAction SilentlyContinue is required, not cosmetic: the first disjunct of this
+    # branch's own condition is "the file does not exist", so a Remove-Item that throws under
+    # $ErrorActionPreference='Stop' would replace the real message with its own.
+    $silent = @($removes | Where-Object { $_.Extent.Text -match 'SilentlyContinue' })
+    ($throws.Count -ge 1) -and
+        ($removes[0].Extent.StartOffset -lt $throws[0].Extent.StartOffset) -and
+        ($silent.Count -eq $removes.Count)
+}
+
+It 'the compliance warning before the system Python fallback is reachable' {
+    # It was not. The warning about falling back to a system install sat INSIDE `if ($uv)`, so
+    # the one path that actually reached the fallback - uv not resolvable at all, which is the
+    # state a deleted toolbox tree leaves behind - was the one path that printed nothing.
+    $fn = Get-BuilderFn -Name 'Get-Python311'
+    if (-not $fn) { Write-Host "       Get-Python311 is gone" -ForegroundColor DarkYellow; return $false }
+    $warns = @($fn.Body.FindAll({
+        param($n)
+        ($n -is [System.Management.Automation.Language.CommandAst]) -and
+        ($n.GetCommandName() -eq 'Write-Warn') -and
+        ($n.Extent.Text -match 'uv-managed Python 3\.11')
+    }, $true))
+    $nested = @()
+    foreach ($w in $warns) {
+        $node = $w.Parent
+        while ($node -and ($node -ne $fn)) {
+            if ($node -is [System.Management.Automation.Language.IfStatementAst]) {
+                if (($node.Clauses[0].Item1.Extent.Text -replace '[\s()]', '') -eq '$uv') { $nested += $w.Extent.StartLineNumber }
+            }
+            $node = $node.Parent
+        }
+    }
+    if ($nested.Count) {
+        Write-Host ("       line(s) {0}: can only print when uv IS resolvable" -f ($nested -join ',')) -ForegroundColor DarkYellow
+    }
+    ($warns.Count -ge 1) -and ($nested.Count -eq 0)
+}
+
+It 'Get-Python311 refuses a system interpreter unless -AllowSystemPython' {
+    # Fail-closed on purpose. A venv's base interpreter is written into pyvenv.cfg at creation,
+    # Ensure-PythonVenv returns the existing venv on every later run, and nothing else calls
+    # Get-Python311 - so a silent downgrade to the compliance-visible registered 3.11 is
+    # permanent in practice. The message has to name the cure (`uv python install 3.11`) as
+    # well as the override, because the cure is only cheap BEFORE the venv exists.
+    $switches = @($builderAst.ParamBlock.Parameters | Where-Object {
+        ($_.Name.VariablePath.UserPath -eq 'AllowSystemPython') -and
+        ($_.StaticType -eq [switch]) })
+    $fn = Get-BuilderFn -Name 'Get-Python311'
+    if (-not $fn) { Write-Host "       Get-Python311 is gone" -ForegroundColor DarkYellow; return $false }
+    $gates = @($fn.Body.FindAll({
+        param($n)
+        ($n -is [System.Management.Automation.Language.IfStatementAst]) -and
+        ($n.Clauses[0].Item1.Extent.Text -match '-not\s+\$AllowSystemPython') -and
+        ($n.Clauses[0].Item2.Extent.Text -match '\bthrow\b')
+    }, $true))
+    if (-not $switches.Count) { Write-Host "       no [switch]`$AllowSystemPython on the param block" -ForegroundColor DarkYellow }
+    if (-not $gates.Count) { Write-Host "       nothing throws when -AllowSystemPython is absent" -ForegroundColor DarkYellow }
+    ($switches.Count -eq 1) -and ($gates.Count -eq 1) -and
+        ($gates[0].Clauses[0].Item2.Extent.Text -match 'uv python install 3\.11') -and
+        ($gates[0].Clauses[0].Item2.Extent.Text -match 'AllowSystemPython')
+}
+
+It 'the manifest measures the venv base interpreter instead of restating it' {
+    # Write-Manifest's $Python is whatever Ensure-PythonVenv returned, and on every run after
+    # the first that is the venv's own python.exe - which says nothing about what the venv was
+    # built on. Whether the toolbox is sitting on a compliance-visible interpreter has to stay
+    # visible on the runs that never made the choice, so it is read back out of pyvenv.cfg.
+    $fn = Get-BuilderFn -Name 'Write-Manifest'
+    $reader = Get-BuilderFn -Name 'Get-VenvBaseInterpreter'
+    if (-not $fn -or -not $reader) { Write-Host "       Write-Manifest or Get-VenvBaseInterpreter is gone" -ForegroundColor DarkYellow; return $false }
+    $calls = @($fn.Body.FindAll({
+        param($n)
+        ($n -is [System.Management.Automation.Language.CommandAst]) -and
+        ($n.GetCommandName() -eq 'Get-VenvBaseInterpreter')
+    }, $true))
+    $body = $fn.Body.Extent.Text
+    ($calls.Count -ge 1) -and
+        ($body -match '(?m)^\s*base_interpreter\s*=') -and
+        ($body -match '(?m)^\s*base_interpreter_uv_managed\s*=') -and
+        ($reader.Body.Extent.Text -match 'pyvenv\.cfg') -and
+        ($reader.Body.Extent.Text -match 'base-executable')
+}
+
+It 'bootstrap weighs tessdata by size and requires eng' {
+    # Counting *.traineddata by NAME was the other half of the tessdata bug: Get-Download threw
+    # on a short file without deleting it, so the directory can hold zero-byte corpses that
+    # satisfy a name filter and load nothing - and TESSDATA_PREFIX would then point at them,
+    # which breaks OCR HARDER than leaving it unset. eng is required by name because it is the
+    # implicit default for every caller that does not pass -l.
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+        (Join-Path $repoRoot 'bootstrap.ps1'), [ref]$null, [ref]$null)
+    $gate = @($ast.FindAll({
+        param($n)
+        ($n -is [System.Management.Automation.Language.IfStatementAst]) -and
+        ($n.Clauses[0].Item1.Extent.Text -match '\$hasLangData')
+    }, $true)) | Select-Object -First 1
+    if (-not $gate) { Write-Host "       no `$hasLangData gate in bootstrap.ps1" -ForegroundColor DarkYellow; return $false }
+    # Everything in the gate's own block that talks about traineddata AND runs before it - i.e.
+    # the decision, not the comments around it. Statement extents exclude comments on purpose:
+    # a check that matched prose would pass on a file whose code had been gutted.
+    $decision = (@($gate.Parent.Statements |
+        Where-Object { ($_.Extent.StartOffset -lt $gate.Extent.StartOffset) -and ($_.Extent.Text -match 'traineddata') } |
+        ForEach-Object { $_.Extent.Text }) -join "`n")
+    if (-not $gate.ElseClause) { Write-Host "       no else branch: an unusable tessdata is silent" -ForegroundColor DarkYellow }
+    ($decision -match '\bLength\s+-ge\s+100KB\b') -and
+        ($decision -match 'eng\.traineddata') -and
+        ($null -ne $gate.ElseClause)
+}
+
 if (-not (Assert-SUSuiteFloor -SuiteFile $PSCommandPath -Ran ($script:Pass + $script:Fail))) { $script:Fail++ }
 Show-SUGuardSummary
 Write-Host ("`n{0} passed, {1} failed`n" -f $script:Pass, $script:Fail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
