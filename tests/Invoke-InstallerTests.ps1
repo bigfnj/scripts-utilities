@@ -1294,6 +1294,361 @@ It 'a START marker with no matching END is refused, not guessed at' {
     $threw -and ($after -eq $before)
 }
 
+# =============================================================================================
+# scripts\build-devtoolbox.ps1 - drift, not unfireable guards
+#
+# WHY THIS IS A SECOND BUILDER SECTION. The one at line 376 pins guards that read correctly and
+# could not fire. These three defects are a different shape: DIVERGENCE. build-devtoolbox.ps1 is
+# standalone on purpose - bootstrap.ps1 runs it as a child process, so it inherits none of
+# bootstrap's scope - and under that constraint it grew private copies of two things that already
+# had exactly one correct definition elsewhere. Both private copies were the wrong one:
+#
+#   Sync-EnvPath        vs lib\common.ps1:46       - re-appended $env:PATH to itself, every call
+#   the .cmd shim body  vs lib\ShimFormat.ps1      - a here-string, the one thing that file forbids
+#
+# BEHAVIOURAL, not source greps, and the caveat at line 377 does not apply. That section says the
+# builder cannot be dot-sourced, which is true of the FILE - its main body creates directories,
+# installs winget packages and runs pip at load. A single FUNCTION is a different matter: it is
+# lifted out of the AST by extent text and dot-sourced into a & { } child scope on its own. That
+# distinction is what makes the PATH defect testable at all, and it should be reached for before
+# another AST assertion is written.
+#
+# NOTHING HERE TOUCHES THE MACHINE. It installs nothing, downloads nothing, and writes only under
+# TEMP:
+#   - $Root is a directory under TEMP, so every Join-Path in the code under test lands there
+#   - $env:PATH is process-local, and is seeded, asserted on, then restored
+#   - Find-Executable is driven with $env:LOCALAPPDATA, $env:ProgramFiles and
+#     ${env:ProgramFiles(x86)} all pointed at a TEMP fixture, so its exhaustive fallback cannot
+#     wander onto this box - BACKLOG measures that path at 4,048 ms per miss - or read the real
+#     toolbox. Those three are PROCESS-wide even when assigned inside & { }, so each test that
+#     moves them restores them in a finally.
+#
+# A $Root that does NOT exist is the default on purpose: that is the first-build state, and it is
+# what gives the Test-Path assertions something to be about.
+#
+# Fixture root of its own, not $scratch - line 330 already removed that one.
+$bdRoot = Join-Path ([IO.Path]::GetTempPath()) ("builder-tests-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $bdRoot -Force | Out-Null
+
+function Get-BuilderFnScope {
+    # One or more builder functions, alone, as a dot-sourceable scriptblock. Extent text rather
+    # than a regex over the file: a function that was renamed or deleted comes back $null here and
+    # the caller reports it, instead of a pattern silently matching nothing and passing.
+    param([string[]]$Name)
+    $src = @()
+    foreach ($n in @($Name)) {
+        $fn = Get-BuilderFn -Name $n
+        if (-not $fn) { return $null }
+        $src += $fn.Extent.Text
+    }
+    return [scriptblock]::Create($src -join "`r`n")
+}
+
+Write-Host "`n== the builder's PATH sync must CONVERGE, not accumulate ==" -ForegroundColor Cyan
+
+It 'Sync-EnvPath discards the prior $env:PATH instead of folding it back into itself' {
+    # THE defect. The old body ended its joined array with $env:PATH, so every call appended the
+    # entire session PATH to itself. Measured on this box 2026-09-11 (Machine PATH 1,588 chars,
+    # User 148, a 990-char start) over the four calls one build makes:
+    #   2,868 -> 4,746 -> 6,624 -> 8,502 chars, +44 entries each time, 62 distinct throughout.
+    # Past 4,095 on call TWO. scripts\smoke-test.ps1 exists to warn about that truncation cliff;
+    # the builder was walking off it from the inside, and every winget, uv and pip child launched
+    # after that point inherited the oversized PATH.
+    #
+    # TWO assertions, because there are two ways to put it back. A sentinel that is in neither the
+    # Machine nor the User PATH has to be GONE after one call - that catches a re-append even when
+    # Select-Object -Unique hides the length. And call 2 has to reproduce call 1 exactly - that
+    # catches the verbatim original, which had no -Unique to hide behind.
+    $defs = Get-BuilderFnScope -Name 'Sync-EnvPath'
+    if (-not $defs) { Write-Host "       Sync-EnvPath is gone" -ForegroundColor DarkYellow; return $false }
+    $saved = $env:PATH
+    try {
+        $r = & {
+            param($Defs, $Root)
+            . $Defs
+            $env:PATH = 'C:\su-sentinel-one;C:\su-sentinel-two'
+            Sync-EnvPath
+            $one = $env:PATH
+            Sync-EnvPath
+            [pscustomobject]@{ One = $one; Two = $env:PATH }
+        } $defs (Join-Path $bdRoot 'absent-toolbox')
+    } finally { $env:PATH = $saved }
+    if ($r.Two -match 'su-sentinel') {
+        Write-Host "       the prior `$env:PATH survived the call - it is being folded back in" -ForegroundColor DarkYellow
+    }
+    if ($r.One -ne $r.Two) {
+        Write-Host ("       call 1 {0} chars / {1} entries, call 2 {2} chars / {3} entries" -f `
+            $r.One.Length, @($r.One -split ';').Count, $r.Two.Length, @($r.Two -split ';').Count) -ForegroundColor DarkYellow
+    }
+    ($r.Two -notmatch 'su-sentinel') -and ($r.One -eq $r.Two)
+}
+
+It 'and it still produces a REAL PATH - every Machine and User entry, each exactly once' {
+    # THE POSITIVE CONTROL for the test above, and the one that pins -Unique. `$env:PATH = ''`
+    # converges beautifully and would pass the convergence assertion on its own, so the result has
+    # to be shown to be the PATH it claims to be. -Unique is what makes that convergence a
+    # property of the FUNCTION rather than of this box's PATH happening to contain no repeats.
+    $defs = Get-BuilderFnScope -Name 'Sync-EnvPath'
+    if (-not $defs) { Write-Host "       Sync-EnvPath is gone" -ForegroundColor DarkYellow; return $false }
+    $machine = @([System.Environment]::GetEnvironmentVariable('PATH', 'Machine') -split ';' | Where-Object { $_ })
+    $user    = @([System.Environment]::GetEnvironmentVariable('PATH', 'User')    -split ';' | Where-Object { $_ })
+    $saved = $env:PATH
+    try {
+        $got = & {
+            param($Defs, $Root)
+            . $Defs
+            $env:PATH = 'C:\su-sentinel-one'
+            Sync-EnvPath
+            $env:PATH
+        } $defs (Join-Path $bdRoot 'absent-toolbox')
+    } finally { $env:PATH = $saved }
+    $entries = @($got -split ';')
+    $missing = @(@($machine + $user) | Where-Object { $entries -notcontains $_ })
+    $dupes = @($entries | Group-Object | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
+    if ($missing.Count) { Write-Host ("       dropped from PATH: " + ($missing -join ', ')) -ForegroundColor DarkYellow }
+    if ($dupes.Count)   { Write-Host ("       duplicated on PATH: " + ($dupes -join ', ')) -ForegroundColor DarkYellow }
+    # The floor stops a PATH read that returned nothing from satisfying "nothing is missing".
+    ($machine.Count -ge 5) -and ($missing.Count -eq 0) -and ($dupes.Count -eq 0) -and
+        (@($entries | Where-Object { -not $_ }).Count -eq 0)
+}
+
+It 'Sync-EnvPath puts a toolbox directory on PATH only when it exists on disk' {
+    # The old body added $Root\native\bin and $Root\python\.venv\Scripts unconditionally, so a
+    # FIRST build - before either exists - seeded the session PATH with two dead entries that
+    # every later call then preserved. They are indistinguishable from the dead entries
+    # scripts\consolidate-path.ps1 exists to remove, and they spend PATH budget that the
+    # 4,095-char limit actually meters.
+    #
+    # BOTH DIRECTIONS, because "never adds them" also satisfies the first half - and the whole
+    # point of the function is putting native\bin in front of everything else.
+    $defs = Get-BuilderFnScope -Name 'Sync-EnvPath'
+    if (-not $defs) { Write-Host "       Sync-EnvPath is gone" -ForegroundColor DarkYellow; return $false }
+    $absent = Join-Path $bdRoot 'absent-toolbox'
+    $present = Join-Path $bdRoot ('present-toolbox-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path (Join-Path $present 'native\bin') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $present 'python\.venv\Scripts') -Force | Out-Null
+    $saved = $env:PATH
+    try {
+        $run = {
+            param($Defs, $Root)
+            . $Defs
+            $env:PATH = 'C:\su-sentinel-one'
+            Sync-EnvPath
+            $env:PATH
+        }
+        $withAbsent = & $run $defs $absent
+        $withPresent = & $run $defs $present
+    } finally { $env:PATH = $saved }
+    $absentEntries = @($withAbsent -split ';')
+    $presentEntries = @($withPresent -split ';')
+    $leaked = @($absentEntries | Where-Object { $_ -like ($absent + '*') })
+    if ($leaked.Count) { Write-Host ("       a directory that does not exist reached PATH: " + ($leaked -join ', ')) -ForegroundColor DarkYellow }
+    # FIRST, not merely present: native\bin exists to shadow an unrelated same-named binary
+    # elsewhere on PATH, and it can only do that from the front.
+    ($leaked.Count -eq 0) -and
+        ($presentEntries[0] -eq (Join-Path $present 'native\bin')) -and
+        ($presentEntries -contains (Join-Path $present 'python\.venv\Scripts'))
+}
+
+Write-Host "`n== the builder writes shims through the shared contract, not its own copy ==" -ForegroundColor Cyan
+
+It "New-CmdWrapper carries no here-string of its own, and writes New-ShimBody's exact bytes" {
+    # It WAS a here-string. lib\ShimFormat.ps1 carried the rule against exactly that while this -
+    # one of the two writers that file was created to reach - broke it. core.autocrlf=true with no
+    # .gitattributes makes a here-string's line endings a property of the CHECKOUT: measured
+    # 2026-09-11 by running the old body out of a CRLF file and an LF file, it emitted 28 bytes and
+    # 27 bytes for the same target. Every reader anchors its regex on $, so the LF column is all 26
+    # wrappers a build writes - counted from a -DryRun the same day - unparseable, and a smoke test
+    # that reports them as zero stale AND zero present. A silent, total loss of the only check that
+    # notices a broken wrapper.
+    #
+    # THE SOURCE HALF IS THE HALF THAT CAN FAIL. On a CRLF checkout the byte comparison passes
+    # with the here-string restored, which is exactly what makes bytes alone a check that cannot
+    # fire. The AST assertions are the guard; the bytes are the positive control that the writer
+    # still works and still agrees with the shared definition.
+    $fn = Get-BuilderFn -Name 'New-CmdWrapper'
+    if (-not $fn) { Write-Host "       New-CmdWrapper is gone" -ForegroundColor DarkYellow; return $false }
+    $heres = @($fn.Body.FindAll({
+        param($n)
+        (($n -is [System.Management.Automation.Language.StringConstantExpressionAst]) -or
+         ($n -is [System.Management.Automation.Language.ExpandableStringExpressionAst])) -and
+        ("$($n.StringConstantType)" -match 'HereString')
+    }, $true))
+    $calls = @($fn.Body.FindAll({
+        param($n)
+        ($n -is [System.Management.Automation.Language.CommandAst]) -and
+        ($n.GetCommandName() -eq 'New-ShimBody')
+    }, $true))
+    if ($heres.Count) {
+        foreach ($h in $heres) { Write-Host ("       line {0}: here-string in the shim writer" -f $h.Extent.StartLineNumber) -ForegroundColor DarkYellow }
+    }
+    if (-not $calls.Count) { Write-Host "       New-ShimBody is not called - the format has been re-inlined" -ForegroundColor DarkYellow }
+
+    $defs = Get-BuilderFnScope -Name 'New-CmdWrapper'
+    $wrapRoot = Join-Path $bdRoot ('wrap-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path (Join-Path $wrapRoot 'native\bin') -Force | Out-Null
+    # The same target the byte-exact New-ShimBody test above uses, so both pin the same 28 bytes.
+    $target = 'C:\x\y.exe'
+    $ok = & {
+        param($Defs, $Root, $Target)
+        $DryRun = $false
+        . $Defs
+        New-CmdWrapper -Name 'zzprobe' -Target $Target
+    } $defs $wrapRoot $target
+    $wrapper = Join-Path $wrapRoot 'native\bin\zzprobe.cmd'
+    if (-not (Test-Path -LiteralPath $wrapper)) { Write-Host "       no wrapper was written" -ForegroundColor DarkYellow; return $false }
+    $bytes = [IO.File]::ReadAllBytes($wrapper)
+    $want = [Text.Encoding]::ASCII.GetBytes((New-ShimBody -Target $target))
+    if (@(Compare-Object $bytes $want -SyncWindow 0).Count) {
+        Write-Host ("       wrote {0} bytes, New-ShimBody says {1}" -f $bytes.Count, $want.Count) -ForegroundColor DarkYellow
+    }
+    ($heres.Count -eq 0) -and ($calls.Count -eq 1) -and ($ok -eq $true) -and
+        ($bytes.Count -eq 28) -and (@(Compare-Object $bytes $want -SyncWindow 0).Count -eq 0)
+}
+
+It 'the builder dot-sources EXACTLY ONE file, and keeps no private copy of the shim contract' {
+    # Its standalone-ness is load-bearing rather than stylistic: bootstrap.ps1 invokes it as a
+    # CHILD PROCESS, so anything it dot-sources must be reachable and side-effect-free on its own.
+    # That same constraint is what let it keep a private, wrong shim format for as long as it did -
+    # the cheap fix was always "copy the two functions in", and the cheap fix is the bug.
+    #
+    # lib\ShimFormat.ps1 is the one exception, added 2026-09-11: functions only, no side effects on
+    # load, no dot-sources of its own. The count is PINNED AT ONE so the next convenient import -
+    # lib\common.ps1 for Sync-EnvPath, lib\ShimPlan.ps1 for the planner - has to argue for itself
+    # here instead of arriving as a diff nobody read. `&` invocations are not counted; 20 of those
+    # are native-command call sites and none of them import anything.
+    #
+    # The second assertion is the other direction, and it is why removing Get-WrapperTarget was
+    # not enough on its own: a re-added private reader or writer passes the dot-source count and
+    # passes the "all copies agree" drift test above, because an identical copy agrees with itself.
+    # `" %*` (writer) and `" %\*` (reader regex) are the shim's target-line shape and appear
+    # nowhere else in the file - Write-ActivationHelpers' `@echo off` block writes
+    # activate-toolbox.cmd, which has no target line at all.
+    #
+    # SCOPED TO EVERYTHING OUTSIDE New-CmdWrapper, which is the test above's jurisdiction. Measured
+    # while mutation-testing this suite: with the whole file in scope, restoring the here-string
+    # failed BOTH tests, because a here-string body is itself a private copy of the target line.
+    # One defect lighting up two names is how people learn to read the failure count instead of
+    # the failure, so the two are separated by extent - the writer's own body is excised by text
+    # rather than by offset, so a BOM cannot shift the cut.
+    $dots = @($builderAst.FindAll({
+        param($n)
+        ($n -is [System.Management.Automation.Language.CommandAst]) -and
+        ($n.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Dot)
+    }, $true))
+    foreach ($d in $dots) {
+        if ($d.Extent.Text -notmatch 'ShimFormat\.ps1') {
+            Write-Host ("       line {0}: {1}" -f $d.Extent.StartLineNumber, $d.Extent.Text) -ForegroundColor DarkYellow
+        }
+    }
+    $src = Get-Content -LiteralPath $builderPs1 -Raw
+    $writer = Get-BuilderFn -Name 'New-CmdWrapper'
+    $outside = $src
+    if ($writer) {
+        $outside = $src.Replace($writer.Extent.Text, '')
+        if ($outside.Length -eq $src.Length) {
+            # The excision silently missed, so the scope is wrong and every result below is about
+            # a different file than the one this test claims to read. Say so rather than pass.
+            Write-Host "       could not excise New-CmdWrapper from the source - scope is wrong" -ForegroundColor DarkYellow
+            return $false
+        }
+    }
+    $private = [regex]::Matches($outside, '" %\\?\*')
+    if ($private.Count) {
+        Write-Host ("       {0} private shim target-line(s) outside New-CmdWrapper - the contract lives in lib\ShimFormat.ps1" -f $private.Count) -ForegroundColor DarkYellow
+    }
+    ($dots.Count -eq 1) -and ($dots[0].Extent.Text -match 'ShimFormat\.ps1') -and ($private.Count -eq 0)
+}
+
+Write-Host "`n== one tree walk per package, and it still resolves the same file ==" -ForegroundColor Cyan
+
+It 'Find-Executable walks each winget package tree ONCE, not once per extension' {
+    # Two -Filter passes over the same $packageDir.FullName, one for *.exe and one for *.cmd, and
+    # on the expensive path - a name no package supplies - BOTH walked the whole tree. Measured
+    # 2026-09-11 over this box's 27 packages / 1,241 files, 7 runs each: 76.6 ms per miss for two
+    # passes, 37.9 ms for one -Filter "<name>*" walk. BACKLOG has carried the item since 2026-09-10.
+    #
+    # The assertion is the COUNT of recursive walks inside the loop, not the presence of one. A
+    # check for "there is a Get-ChildItem here" passes with the second pass restored, which is the
+    # whole failure shape this suite keeps closing.
+    $fn = Get-BuilderFn -Name 'Find-Executable'
+    if (-not $fn) { Write-Host "       Find-Executable is gone" -ForegroundColor DarkYellow; return $false }
+    $loop = @($fn.Body.FindAll({
+        param($n)
+        ($n -is [System.Management.Automation.Language.ForEachStatementAst]) -and
+        ($n.Condition.Extent.Text -match '\$packageDirs')
+    }, $true)) | Select-Object -First 1
+    if (-not $loop) { Write-Host "       no foreach over `$packageDirs" -ForegroundColor DarkYellow; return $false }
+    $walks = @($loop.Body.FindAll({
+        param($n)
+        ($n -is [System.Management.Automation.Language.CommandAst]) -and
+        ($n.GetCommandName() -eq 'Get-ChildItem') -and
+        (@($n.CommandElements | Where-Object {
+            ($_ -is [System.Management.Automation.Language.CommandParameterAst]) -and ($_.ParameterName -eq 'Recurse') }).Count -gt 0)
+    }, $true))
+    # -Include is REJECTED, measured, not a style opinion: with -LiteralPath it is silently
+    # IGNORED. Asked for -Include 'uv.exe','uv.cmd' it returned every file in the package -
+    # AUTHORS, ChangeLog, README.html - which is the same trap that would have written a README.cmd
+    # shim in Get-ShimCandidates. It benchmarked at 19.4 ms only because the filter was inert.
+    $includes = @($loop.Body.FindAll({
+        param($n)
+        ($n -is [System.Management.Automation.Language.CommandParameterAst]) -and ($n.ParameterName -eq 'Include')
+    }, $true))
+    if ($walks.Count -ne 1) {
+        foreach ($w in $walks) { Write-Host ("       line {0}: recursive walk #{1} of the same tree" -f $w.Extent.StartLineNumber, (1 + $walks.IndexOf($w))) -ForegroundColor DarkYellow }
+    }
+    if ($includes.Count) { Write-Host "       -Include is inert under -LiteralPath; use -Filter" -ForegroundColor DarkYellow }
+    ($walks.Count -eq 1) -and ($includes.Count -eq 0)
+}
+
+It 'and one walk still prefers .exe over .cmd, finds a sole .cmd, and never resolves a README' {
+    # THE POSITIVE CONTROL for the walk above, and the only place the .exe preference is checked at
+    # all. Two sequential -Filter passes expressed that preference as ORDER; one walk has to state
+    # it, and a tie-break written the other way round is invisible - both binaries run, and a shim
+    # pointing at the .cmd instead of the .exe looks exactly like a working one.
+    #
+    # Driven entirely off a TEMP fixture: $env:LOCALAPPDATA carries the fake Packages root, and
+    # $env:ProgramFiles / ${env:ProgramFiles(x86)} are pointed at it too so the exhaustive
+    # fallback cannot reach this box on the README case. All three are process-wide, so they are
+    # restored in the finally.
+    $defs = Get-BuilderFnScope -Name 'Find-Executable'
+    if (-not $defs) { Write-Host "       Find-Executable is gone" -ForegroundColor DarkYellow; return $false }
+    $fix = Join-Path $bdRoot ('fe-' + [guid]::NewGuid().ToString('N'))
+    # The real disk layout: a version-stamped subfolder under the package root, so the walk has to
+    # actually recurse rather than read the package directory.
+    $pkg = Join-Path $fix 'Microsoft\WinGet\Packages\Test.Tool_Microsoft.Winget.Source_8wekyb3d8bbwe\v1.2.3\bin'
+    New-Item -ItemType Directory -Path $pkg -Force | Out-Null
+    foreach ($leaf in @('zzboth.exe', 'zzboth.cmd', 'zzsole.cmd', 'README.md')) {
+        Set-Content -LiteralPath (Join-Path $pkg $leaf) -Value 'fixture' -Encoding ASCII
+    }
+    $savedLocal = $env:LOCALAPPDATA; $savedPf = $env:ProgramFiles; $savedPf86 = ${env:ProgramFiles(x86)}
+    try {
+        $got = & {
+            param($Defs, $Fix)
+            . $Defs
+            $Root = Join-Path $Fix 'toolbox'
+            $CommandSearchPatterns = @{}
+            $env:LOCALAPPDATA = $Fix
+            $env:ProgramFiles = $Fix
+            ${env:ProgramFiles(x86)} = $Fix
+            [pscustomobject]@{
+                Both   = (Find-Executable -Name 'zzboth' -WingetId 'Test.Tool')
+                Sole   = (Find-Executable -Name 'zzsole' -WingetId 'Test.Tool')
+                Readme = (Find-Executable -Name 'README' -WingetId 'Test.Tool')
+            }
+        } $defs $fix
+    } finally {
+        $env:LOCALAPPDATA = $savedLocal; $env:ProgramFiles = $savedPf; ${env:ProgramFiles(x86)} = $savedPf86
+    }
+    if ($got.Both -ne (Join-Path $pkg 'zzboth.exe')) { Write-Host ("       a package shipping both resolved to: {0}" -f $got.Both) -ForegroundColor DarkYellow }
+    if ($got.Readme) { Write-Host ("       README resolved to: {0}" -f $got.Readme) -ForegroundColor DarkYellow }
+    ($got.Both -eq (Join-Path $pkg 'zzboth.exe')) -and
+        ($got.Sole -eq (Join-Path $pkg 'zzsole.cmd')) -and
+        ($null -eq $got.Readme)
+}
+
+Remove-Item -LiteralPath $bdRoot -Recurse -Force -ErrorAction SilentlyContinue
+
 if (-not (Assert-SUSuiteFloor -SuiteFile $PSCommandPath -Ran ($script:Pass + $script:Fail))) { $script:Fail++ }
 Show-SUGuardSummary
 
