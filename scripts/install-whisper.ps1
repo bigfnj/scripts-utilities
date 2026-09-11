@@ -47,9 +47,42 @@ $sevenZip = @(
     (Join-Path $env:ProgramFiles "7-Zip\7z.exe")
 ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 
+function Invoke-Native {
+    <#
+        Run a native command with its output captured and its stderr survivable, returning the
+        exit code beside the captured lines. Same shape and name as the wrapper in
+        install-deletion-forensics.ps1; see build-devtoolbox.ps1's Invoke-NativeCapture for the
+        measurement this is all based on.
+
+        Under this file's $ErrorActionPreference = 'Stop', 5.1 promotes a native command's stderr
+        to a TERMINATING NativeCommandError once PowerShell has redirected that stream - which an
+        enclosing capture does for every command inside it, whether or not the call site itself
+        redirects.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @()
+    )
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $FilePath @Arguments 2>&1
+        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = @($out) }
+    } finally { $ErrorActionPreference = $prev }
+}
+
 function Expand-ZipTo {
     param([string]$Zip, [string]$Dest)
-    if ($sevenZip) { & $sevenZip x $Zip "-o$Dest" -y | Out-Null }
+    if ($sevenZip) {
+        # The exit code was never read. 7z reports a partial extraction as exit 1 (WARNING) and a
+        # refusal as 2, on stderr, so a truncated whisper.cpp archive produced a bin\ directory
+        # missing the exe and the run continued to the model download as though it had one.
+        $x = Invoke-Native -FilePath $sevenZip -Arguments @('x', $Zip, "-o$Dest", '-y')
+        if ($x.ExitCode -ne 0) {
+            foreach ($line in $x.Output) { Write-Host "    $line" -ForegroundColor DarkGray }
+            throw "7z extraction failed (exit $($x.ExitCode)): $Zip -> $Dest"
+        }
+    }
     else { Expand-Archive -LiteralPath $Zip -DestinationPath $Dest -Force }
 }
 

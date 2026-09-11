@@ -46,6 +46,41 @@ function Test-IsElevated {
         [System.Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Invoke-Native {
+    <#
+        Run a native uninstaller with its output captured and its stderr survivable, and return
+        the exit code beside the captured lines.
+
+        THIS SCRIPT IS THE ONE THAT CANNOT AFFORD TO DIE HALFWAY. Under this file's
+        $ErrorActionPreference = 'Stop', PowerShell 5.1 turns a native command's stderr into a
+        TERMINATING NativeCommandError whenever it has redirected that stream - which an outer
+        capture does even when the call site itself has no redirection. A package that REFUSES
+        to uninstall (in use, needs elevation, no matching install) writes the refusal to
+        stderr, so the exact case section 1 checks for was the case that killed the run, and it
+        died before sections 2-4 had reversed the PATH entries, cleared the env vars or stripped
+        the agent blocks. Half-uninstalled, with the machine-state reversal still pending.
+
+        Measured 2026-09-11 under 5.1: a merged or 2>$null-redirected native stderr throws under
+        Stop in every host-stream condition tested, and so does an unredirected one as soon as
+        any enclosing call applies 2>&1 - which is how this script is run from a log-capturing
+        parent. Setting Continue for the one statement is the only shape that holds in both.
+
+        Rejected: `| Out-Null`. It addresses a different problem (native stdout leaking into a
+        function's return value) and does nothing about stderr; see build-devtoolbox.ps1's
+        Invoke-NativeCapture, which this mirrors.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @()
+    )
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $FilePath @Arguments 2>&1
+        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = @($out) }
+    } finally { $ErrorActionPreference = $prev }
+}
+
 # Anything that could not be reversed. Non-empty at the end means the uninstall is INCOMPLETE
 # and the exit code says so; "toolbox uninstall complete" is reserved for a clean run.
 $problems = @()
@@ -134,13 +169,24 @@ if ($RemoveWingetTools) {
                     }
                     if ($DryRun) { Write-Info "[DRY-RUN] would: winget uninstall --id $($t.winget_id)"; continue }
                     Write-Info "winget uninstall $($t.winget_id)"
-                    # Out-Null hides the output, not the outcome. Without this check a package
+                    # The check below hides the output, not the outcome. Without it a package
                     # that refused to uninstall (in use, needs elevation, no matching install)
                     # left no trace at all and the run still ended in "uninstall complete".
-                    winget uninstall --id $t.winget_id -e --silent --accept-source-agreements | Out-Null
-                    if ($LASTEXITCODE -ne 0) {
-                        Write-Err "winget uninstall failed for $($t.name) [$($t.winget_id)]: exit $LASTEXITCODE"
-                        $problems += "$($t.name): winget uninstall exit $LASTEXITCODE"
+                    #
+                    # It was unreachable until 2026-09-11 whenever this script ran under a parent
+                    # capturing its output, which is the normal case. Measured that day: an
+                    # enclosing 2>&1 makes PowerShell redirect THIS command's stderr too, and
+                    # winget's refusal - written to stderr - then terminated the run before the
+                    # exit code could be read. The `| Out-Null` that used to sit here neither
+                    # prevented that nor caused it; it simply was not the guard it was taken for.
+                    $wu = Invoke-Native -FilePath 'winget' -Arguments @(
+                        'uninstall', '--id', $t.winget_id, '-e', '--silent', '--accept-source-agreements')
+                    if ($wu.ExitCode -ne 0) {
+                        # Only worth reading on this path, which is why they are captured rather
+                        # than discarded: winget's refusal REASON is the thing that was missing.
+                        foreach ($line in $wu.Output) { Write-Host "    $line" -ForegroundColor DarkGray }
+                        Write-Err "winget uninstall failed for $($t.name) [$($t.winget_id)]: exit $($wu.ExitCode)"
+                        $problems += "$($t.name): winget uninstall exit $($wu.ExitCode)"
                     } else {
                         Write-Ok "uninstalled $($t.name)"
                     }
@@ -149,10 +195,15 @@ if ($RemoveWingetTools) {
                     if (-not (Test-CommandAvailable 'npm')) { Write-Warn "npm not found - skipping $($t.name)"; continue }
                     if ($DryRun) { Write-Info "[DRY-RUN] would: npm uninstall -g $($t.name)"; continue }
                     Write-Info "npm uninstall -g $($t.name)"
-                    npm uninstall -g $t.name | Out-Null
-                    if ($LASTEXITCODE -ne 0) {
-                        Write-Err "npm uninstall -g failed for $($t.name): exit $LASTEXITCODE"
-                        $problems += "$($t.name): npm uninstall exit $LASTEXITCODE"
+                    # Worse than the winget site above, because npm writes `npm WARN` and
+                    # `npm notice` to stderr on ORDINARY SUCCESSFUL runs - one deprecation notice
+                    # is enough - so under a capturing parent this needed no failure at all to
+                    # take the script down before its PATH and env-var reversal.
+                    $nu = Invoke-Native -FilePath 'npm' -Arguments @('uninstall', '-g', $t.name)
+                    if ($nu.ExitCode -ne 0) {
+                        foreach ($line in $nu.Output) { Write-Host "    $line" -ForegroundColor DarkGray }
+                        Write-Err "npm uninstall -g failed for $($t.name): exit $($nu.ExitCode)"
+                        $problems += "$($t.name): npm uninstall exit $($nu.ExitCode)"
                     } else {
                         Write-Ok "uninstalled $($t.name)"
                     }

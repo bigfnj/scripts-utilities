@@ -498,12 +498,52 @@ was found and fixed by hand on 2026-09-11; nothing would have caught the next on
 ### Interesting, not actionable
 
 Every failure in this round's rebuild was a **native command's stderr under a global
-`$ErrorActionPreference = 'Stop'`**, and the trigger is the PIPE, not the redirection: PowerShell
-promotes stderr to ErrorRecords whenever a native command's output flows into another command.
-Three different commands, three different disguises - uv's *success* message, Node's CA-bundle
-warning, and aria2's real error. `lib/common.ps1` had the lesson written down and applied at some
-call sites and not others. The generalisation now lives in `Invoke-NativeCapture`, and an AST test
-asserts no native command in the builder is piped.
+`$ErrorActionPreference = 'Stop'`**. Three different commands, three different disguises - uv's
+*success* message, Node's CA-bundle warning, and aria2's real error. `lib/common.ps1` had the
+lesson written down and applied at some call sites and not others. The generalisation now lives in
+`Invoke-NativeCapture`, and an AST test asserts no native command in the builder is piped.
+
+**Correction, measured 2026-09-11.** This entry used to say "the trigger is the PIPE, not the
+redirection". That is backwards. Probed under 5.1 with `Stop`, across three host-stream conditions
+(console inherited, parent-captured with `2>&1 | Out-String`, `Start-Process` with both standard
+streams redirected to files), the result was identical in all three:
+
+| shape | result |
+|---|---|
+| `$x = & cmd /c "echo e 1>&2 & exit /b 0" 2>&1` | **THREW** `NativeCommandError` |
+| `$x = & cmd /c "echo e 1>&2 & exit /b 0" 2>$null` | **THREW** - `2>$null` does not discard it |
+| `& cmd /c "echo e 1>&2 & exit /b 0" \| Out-Null` | survived |
+| `& cmd /c "echo e 1>&2 & exit /b 0" > $null` | survived |
+
+The **redirection** promotes stderr to ErrorRecords; a pipe on its own does not. The pipe still
+has to be barred, for a second measured reason that explains the original confusion: an
+**enclosing** `2>&1` - which is what every log-capturing parent applies - makes PowerShell
+redirect the inner command's stderr too, and then even an unpiped, unredirected native call raises
+the record. So `| Out-Null` is a latent form of the same defect rather than a different one, and
+the uv failure was almost certainly observed under exactly such a parent.
+
+### Native stderr sites left OPEN in library and module files
+
+The 2026-09-11 sweep fixed the thirteen sites in scripts that set `Stop` *themselves*, and the AST
+gate covers that set. Six more are the same defect reached by **dynamic scoping** and are
+deliberately not fixed here, because they belong to the bootstrap install path this round was told
+not to run:
+
+- `lib/common.ps1` - `Install-WingetTool` (`winget list ... 2>&1`, `winget @args 2>&1`) and
+  `Install-NpmGlobal` (`npm install -g ... 2>&1`, `& npm config get prefix | Select-Object`).
+- `modules/security.ps1` - `& fsutil usn queryjournal C: 2>&1 | ...` and
+  `winget list --id Microsoft.WinDbg -e ... 2>&1`.
+
+Neither file assigns `$ErrorActionPreference` itself, which is why the gate does not see them - but
+`bootstrap.ps1` dot-sources `lib/common.ps1` at `:27` under `Stop`, so every one of those calls runs
+under it. `Install-WingetTool`'s is the same shape as the uv failure, in the most-travelled install
+path in the repo. The fix is mechanical (give each file the same `Invoke-Native`); the risk is that
+it cannot be validated without a real bootstrap run.
+
+`scripts/smoke-test.ps1` has seven more of the shape and is **not** exposed: it never sets `Stop`,
+and `run-gate.ps1` runs it as a child process, which starts at the default `Continue`. Widening the
+gate to files that do not set `Stop` would flag those seven for no reason, which is why the rule is
+scoped the way it is rather than being scoped to "every file".
 
 ## Features
 

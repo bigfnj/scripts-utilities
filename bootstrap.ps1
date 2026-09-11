@@ -114,12 +114,49 @@ function Remove-GeneratedManifest {
     Write-Ok "removed generated manifest: $manifestPath"
 }
 
+function Invoke-Native {
+    <#
+        Run a native command with its output captured and its stderr survivable, returning the
+        exit code beside the captured lines. Same shape and name as the wrapper in
+        install-deletion-forensics.ps1.
+
+        MEASURED, not assumed, on 2026-09-11 under Windows PowerShell 5.1, because 2>$null looks
+        like it should discard the stderr rather than promote it. It does not:
+
+            $ErrorActionPreference = 'Stop'
+            $o = & cmd /c "echo e 1>&2 & exit /b 0" 2>$null
+            -> THREW  [NativeCommandError]
+
+        Identical result for 2>&1, and identical in all three host-stream conditions tested
+        (console inherited, parent-captured with 2>&1 | Out-String, Start-Process with both
+        standard streams redirected to files). The same probe with NO redirection at all - bare,
+        assigned, or `| Out-Null` - survived in every condition. The REDIRECTION is the trigger.
+        This confirms the claim already written at lib\common.ps1:405-408.
+
+        The two callers below are the whole reason this matters: both guard Remove-OldRepositoryClone,
+        which deletes a directory tree. `git status --short` on a repo with an unreadable index,
+        or `git remote -v` on a path git dislikes, wrote to stderr and threw - so the refusal
+        this function exists to produce ("not a recognized clone", "has local changes") was
+        replaced by a bootstrap that died mid-run.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @()
+    )
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $FilePath @Arguments 2>&1
+        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = @($out) }
+    } finally { $ErrorActionPreference = $prev }
+}
+
 function Test-RepositoryLooksOwned {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath (Join-Path $Path ".git"))) { return $false }
-    $remotes = & git -C $Path remote -v 2>$null
-    if ($LASTEXITCODE -ne 0) { return $false }
-    return ($remotes -match "bigfnj/scripts-utilities")
+    $remotes = Invoke-Native -FilePath 'git' -Arguments @('-C', $Path, 'remote', '-v')
+    if ($remotes.ExitCode -ne 0) { return $false }
+    return ($remotes.Output -match "bigfnj/scripts-utilities")
 }
 
 function Remove-OldRepositoryClone {
@@ -131,11 +168,22 @@ function Remove-OldRepositoryClone {
     if (-not (Test-RepositoryLooksOwned -Path $resolved)) {
         throw "Refusing to remove old repo candidate that is not a recognized scripts-utilities clone: $resolved"
     }
-    $status = & git -C $resolved status --short 2>$null
-    if ($LASTEXITCODE -ne 0) {
+    $status = Invoke-Native -FilePath 'git' -Arguments @('-C', $resolved, 'status', '--short')
+    if ($status.ExitCode -ne 0) {
         throw "Could not inspect old repo candidate: $resolved"
     }
-    if ($status) {
+    # Counted, not truthiness-tested, and the difference is worth measuring before trusting:
+    # a native command that printed nothing does NOT assign $null, it assigns AutomationNull.
+    # Measured 2026-09-11 under 5.1 - @($literalNull).Count is 1, @($nativeWithNoOutput).Count
+    # is 0 - so a clean tree correctly counts 0 here, while writing the same guard against a
+    # literal $null would refuse every clean repo and turn -CleanLegacyState into a no-op that
+    # reports a refusal.
+    #
+    # The wrapper's 2>&1 also puts stderr lines in Output, so a git that warned while exiting 0
+    # now blocks the delete where the old 2>$null discarded the warning and could reach
+    # Remove-Item with an empty $status. That is a behaviour change, and it is the one worth
+    # having: it fails in the direction that KEEPS the directory.
+    if (@($status.Output).Count -gt 0) {
         throw "Refusing to remove old scripts-utilities clone with local changes: $resolved"
     }
     if ($DryRun) {

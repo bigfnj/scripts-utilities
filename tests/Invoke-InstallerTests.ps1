@@ -1227,32 +1227,190 @@ Write-Host "`n== a native command's stderr must not be able to fail the build ==
 $builderFile = Join-Path $repoRoot 'scripts\build-devtoolbox.ps1'
 $builderAst = [System.Management.Automation.Language.Parser]::ParseFile($builderFile, [ref]$null, [ref]$null)
 
-It 'no native command in the builder is piped, because the pipe is what makes its stderr fatal' {
+# Repo-relative worktree exclusion, and it is deliberately not the absolute
+# `-notlike '*\.claude\worktrees\*'` used higher up in this file. Three full copies of this tree
+# live under .claude\worktrees\ during parallel agent work, so they have to be skipped - but an
+# absolute pattern matches EVERY file when the suite is itself run from a worktree, which is why
+# the shim-regex test at :700 finds 0 hits and fails there (measured 2026-09-11: 80 passed / 1
+# failed from a worktree, 81 / 0 from the main checkout). Relative means "a worktree nested under
+# this repo", never "this repo".
+#
+# Hoisted above the native-stderr section on 2026-09-11 so that section can share it instead of
+# carrying a fourth copy of a filter whose wrong form silently greens the whole sweep.
+$suRepoPrefix = $repoRoot.TrimEnd('\') + '\'
+function Get-SURepoScripts {
+    Get-ChildItem -LiteralPath $repoRoot -Recurse -Filter *.ps1 -File -ErrorAction SilentlyContinue |
+        Where-Object { -not ($_.FullName.Substring($suRepoPrefix.Length) -like '.claude\worktrees\*') }
+}
+
+# THE ALLOW-LIST, by name, and it is the part of this rule most able to silently repeal it - so
+# the second test below re-derives the exemption instead of trusting the name. Three entries:
+# two that predate this commit (build-devtoolbox.ps1, install-deletion-forensics.ps1) and one
+# added with it for run-gate.ps1's suite runner, which cannot drop its 2>&1 without blinding the
+# gate to a suite's dying words.
+$suNativeWrappers = @('Invoke-Native', 'Invoke-NativeCapture', 'Invoke-GateSuite')
+
+# `& <anything that is not a scriptblock>` is caught structurally and needs no list. This covers
+# only the bare form - `winget list ... 2>&1`, `npm uninstall -g x | Out-Null` - which parses as
+# an ordinary command and is indistinguishable from a cmdlet call without knowing the name.
+$suNativeNames = @('winget', '7z', 'aria2c', 'uv', 'npm', 'py', 'curl', 'git', 'sc.exe',
+                   'wevtutil', 'fsutil', 'tshark', 'cmd', 'cmd.exe', 'reg', 'reg.exe', 'robocopy')
+
+function Get-SUEnclosingFunctionName {
+    param($Node)
+    $p = $Node.Parent
+    while ($p) {
+        if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst]) { return $p.Name }
+        $p = $p.Parent
+    }
+    return $null
+}
+
+function Get-SUExposedNativeCalls {
+    <#
+        Every native call site in a Stop-setting script whose stderr PowerShell will redirect,
+        with the enclosing function name attached so the caller can apply the allow-list.
+
+        Over-inclusive on purpose in two places. A file counts as Stop-setting if it assigns
+        'Stop' ANYWHERE, not just at file scope, because the preference is dynamically scoped and
+        a nested assignment opens a real region. And `& $var` counts as native whatever $var
+        holds, because nothing at parse time can tell an exe path from a scriptblock variable -
+        the false positive is a call that did not need a wrapper, which is cheap; the false
+        negative is the bug this whole section exists for.
+    #>
+    $out = @()
+    foreach ($f in (Get-SURepoScripts)) {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+        if (-not $ast) { continue }
+        $setsStop = @($ast.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $n.Left.Extent.Text -eq '$ErrorActionPreference' -and
+            $n.Right.Extent.Text -match "^['`"]Stop['`"]$" }, $true)).Count -gt 0
+        if (-not $setsStop) { continue }
+
+        foreach ($c in $ast.FindAll({ param($n)
+                $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+            $amp = ($c.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Ampersand)
+            $isSb = (@($c.CommandElements)[0] -is [System.Management.Automation.Language.ScriptBlockExpressionAst])
+            $nm = $c.GetCommandName()
+            if (-not ((($amp) -and (-not $isSb)) -or ($nm -and $suNativeNames -contains $nm))) { continue }
+
+            $redirects = @($c.Redirections | Where-Object {
+                $_.FromStream -eq [System.Management.Automation.Language.RedirectionStream]::Error -or
+                $_.FromStream -eq [System.Management.Automation.Language.RedirectionStream]::All })
+            $piped = $false
+            if ($c.Parent -is [System.Management.Automation.Language.PipelineAst]) {
+                $els = @($c.Parent.PipelineElements)
+                if ($els.Count -ge 2 -and $els[-1] -ne $c) { $piped = $true }
+            }
+            if ($redirects.Count -eq 0 -and -not $piped) { continue }
+
+            $why = @()
+            if ($redirects.Count) { $why += 'stderr redirected' }
+            if ($piped)           { $why += 'piped downstream' }
+            $out += [pscustomobject]@{
+                File     = $f.FullName.Substring($suRepoPrefix.Length)
+                Line     = $c.Extent.StartLineNumber
+                Function = (Get-SUEnclosingFunctionName -Node $c)
+                Why      = ($why -join ' + ')
+            }
+        }
+    }
+    return @($out)
+}
+
+It 'no native command in a Stop script is piped or stderr-redirected outside a named wrapper' {
     # The defect, verbatim from the failed run:
     #   & $uv python install 3.11 | Out-Null
     #   uv.exe : Installed Python 3.11.15 in 103ms
     #   + FullyQualifiedErrorId : NativeCommandError
-    # uv SUCCEEDED and the build died. `| Out-Null` did not fail to prevent that, it caused it -
-    # Out-Null solves the unrelated problem of native stdout leaking into a function's return
-    # value, and the two are confusable enough that the comment at that call site named the right
-    # hazard and drew the opposite conclusion from it.
+    # uv SUCCEEDED and the build died.
     #
-    # Asserts the CONDITION (no native command has a downstream pipeline element), not the
-    # presence of Invoke-NativeCapture: a file could call the helper in ten places and still pipe
-    # an eleventh command, which is precisely how this shipped.
-    $nativeNames = @('winget', '7z', 'aria2c', 'uv', 'npm', 'py', 'curl')
-    $bad = @()
-    foreach ($p in $builderAst.FindAll({ param($n)
-            $n -is [System.Management.Automation.Language.PipelineAst] }, $true)) {
-        if (@($p.PipelineElements).Count -lt 2) { continue }
-        $first = $p.PipelineElements[0]
-        if ($first -isnot [System.Management.Automation.Language.CommandAst]) { continue }
-        $amp = ($first.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Ampersand)
-        $nm = $first.GetCommandName()
-        if ($amp -or ($nm -and $nativeNames -contains $nm)) { $bad += $p.Extent.StartLineNumber }
+    # WIDENED from scripts\build-devtoolbox.ps1 to the whole repo on 2026-09-11, after an AST
+    # sweep found thirteen more sites in eight other files - including run-gate.ps1's own suite
+    # runner, which made the gate's NO TALLY / FAILED / EXIT<>0 classifier unreachable in exactly
+    # the case it exists for, and uninstall-toolbox.ps1's winget call, which died before the PATH
+    # and env-var reversal in sections 2-4. A one-file check for a repo-wide rule reads as
+    # coverage and is not.
+    #
+    # It also catches the REDIRECTION half, which the builder-only version did not test for and
+    # which measurement says is the stronger trigger. Under 5.1 with Stop, across three
+    # host-stream conditions (console inherited, parent-captured, Start-Process -Redirect*):
+    #   $x = & cmd /c "echo e 1>&2 & exit /b 0" 2>&1    -> THREW
+    #   $x = & cmd /c "echo e 1>&2 & exit /b 0" 2>$null -> THREW   (2>$null does NOT discard it)
+    #        & cmd /c "echo e 1>&2 & exit /b 0" | Out-Null -> survived
+    # The bare pipe is still barred because it is a LATENT form of the same thing: measured in
+    # the same session, an enclosing 2>&1 - which is how every one of these scripts is run from a
+    # log-capturing parent - makes PowerShell redirect the inner command's stderr too, and then
+    # even an unpiped, unredirected native call raises the record.
+    #
+    # Asserts the CONDITION, not the presence of a wrapper call: a file can call Invoke-Native in
+    # ten places and pipe an eleventh command, which is precisely how this shipped.
+    $all = Get-SUExposedNativeCalls
+    $bad = @($all | Where-Object { $suNativeWrappers -notcontains $_.Function })
+    if ($all.Count -lt 5) {
+        Write-Host "     swept only $($all.Count) site(s) - the walk is not reaching the tree (no -Recurse, or an ABSOLUTE worktree filter, which excludes everything when the suite is run from a worktree)" -ForegroundColor Red
     }
-    if ($bad.Count) { Write-Host "     piped native command(s) at line(s): $($bad -join ', ')" -ForegroundColor Red }
-    $bad.Count -eq 0
+    foreach ($b in $bad) {
+        Write-Host ("     {0}:{1} {2} - {3}" -f $b.File, $b.Line,
+            $(if ($b.Function) { "in $($b.Function)" } else { 'at script scope' }), $b.Why) -ForegroundColor Red
+    }
+    # The floor is the arm-time control: the nine sanctioned sites inside the wrappers must show
+    # up, or this passed by sweeping nothing.
+    ($bad.Count -eq 0) -and ($all.Count -ge 5)
+}
+
+It 'every allow-listed native wrapper earns the exemption, and the list stays short' {
+    # AN ALLOW-LIST IS A HOLE IN THE RULE ABOVE. Naming a function exempts every native call
+    # inside it, so `function Invoke-Native { & $x 2>&1 }` with no preference handling at all
+    # would pass the first test while reintroducing the exact defect - and would look like a fix
+    # in review, because the name is the part people read.
+    #
+    # So the exemption is re-derived from the body: set Continue, and restore in a FINALLY. The
+    # finally is not style. scripts\New-ForensicsReport.ps1 carried the save/set/restore inline
+    # with the restore INSIDE the try and an empty catch under it, so the first throw skipped the
+    # restore and silently downgraded the rest of that script - including its retention prune -
+    # from Stop to Continue.
+    #
+    # Bounded at three: a list that can grow without limit is a rule that can be repealed one
+    # name at a time.
+    if ($suNativeWrappers.Count -gt 3) {
+        Write-Host "     allow-list has grown to $($suNativeWrappers.Count) names: $($suNativeWrappers -join ', ')" -ForegroundColor Red
+        return $false
+    }
+    $defs = @()
+    foreach ($f in (Get-SURepoScripts)) {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+        if (-not $ast) { continue }
+        foreach ($fn in $ast.FindAll({ param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+            if ($suNativeWrappers -notcontains $fn.Name) { continue }
+            $setsContinue = @($fn.FindAll({ param($n)
+                $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                $n.Left.Extent.Text -eq '$ErrorActionPreference' -and
+                $n.Right.Extent.Text -match "^['`"]Continue['`"]$" }, $true)).Count -gt 0
+            $restoresInFinally = @($fn.FindAll({ param($n)
+                $n -is [System.Management.Automation.Language.TryStatementAst] -and
+                $n.Finally -and
+                @($n.Finally.FindAll({ param($m)
+                    $m -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                    $m.Left.Extent.Text -eq '$ErrorActionPreference' }, $true)).Count -gt 0 }, $true)).Count -gt 0
+            $defs += [pscustomobject]@{
+                File = $f.FullName.Substring($suRepoPrefix.Length); Name = $fn.Name
+                Line = $fn.Extent.StartLineNumber; Ok = ($setsContinue -and $restoresInFinally)
+                SetsContinue = $setsContinue; RestoresInFinally = $restoresInFinally
+            }
+        }
+    }
+    # A name on the list that defines nothing is dead weight that hides the next typo.
+    $unbacked = @($suNativeWrappers | Where-Object { $n = $_; -not @($defs | Where-Object { $_.Name -eq $n }).Count })
+    $broken = @($defs | Where-Object { -not $_.Ok })
+    foreach ($u in $unbacked) { Write-Host "     allow-listed '$u' defines no function anywhere in the repo" -ForegroundColor Red }
+    foreach ($b in $broken) {
+        Write-Host ("     {0}:{1} {2} - sets Continue: {3}, restores in finally: {4}" -f `
+            $b.File, $b.Line, $b.Name, $b.SetsContinue, $b.RestoresInFinally) -ForegroundColor Red
+    }
+    ($unbacked.Count -eq 0) -and ($broken.Count -eq 0) -and ($defs.Count -ge 3)
 }
 
 It 'aria2c is invoked with IPv6 disabled, on the call itself' {
@@ -1994,19 +2152,6 @@ It 'and one walk still prefers .exe over .cmd, finds a sole .cmd, and never reso
 Remove-Item -LiteralPath $bdRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host "`n== the shim writers and the gates that notice when one stops running ==" -ForegroundColor Cyan
-
-# Repo-relative worktree exclusion, and it is deliberately not the absolute
-# `-notlike '*\.claude\worktrees\*'` used higher up in this file. Three full copies of this tree
-# live under .claude\worktrees\ during parallel agent work, so they have to be skipped - but an
-# absolute pattern matches EVERY file when the suite is itself run from a worktree, which is why
-# the shim-regex test at :700 finds 0 hits and fails there (measured 2026-09-11: 80 passed / 1
-# failed from a worktree, 81 / 0 from the main checkout). Relative means "a worktree nested under
-# this repo", never "this repo".
-$suRepoPrefix = $repoRoot.TrimEnd('\') + '\'
-function Get-SURepoScripts {
-    Get-ChildItem -LiteralPath $repoRoot -Recurse -Filter *.ps1 -File -ErrorAction SilentlyContinue |
-        Where-Object { -not ($_.FullName.Substring($suRepoPrefix.Length) -like '.claude\worktrees\*') }
-}
 
 It 'every pipeline that starts with New-ShimBody ends in Set-Content -NoNewline' {
     # THE byte guard, and the only new check here with teeth on live machine state.
