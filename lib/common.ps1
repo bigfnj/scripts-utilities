@@ -43,6 +43,13 @@ PowerShell window and confirm 'winget --version' works before running bootstrap.
 
 # Refresh PATH from registry so newly-installed tools are visible in the current
 # session without restarting PowerShell.
+#
+# THE ONE PLACE [Environment]::GetEnvironmentVariable IS THE RIGHT CALL, and it is not an
+# oversight that it survived the 2026-09-11 migration of every other PATH reader onto Get-RawPath.
+# This builds $env:PATH for the RUNNING PROCESS, which has to be expanded: a literal
+# '%SystemRoot%\system32' in a process environment block resolves to nothing, so the raw value is
+# the wrong input here. The prohibition is on the round trip - reading expanded and WRITING that
+# back - and nothing below writes.
 function Sync-EnvPath {
     $machine = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
     $user    = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
@@ -60,6 +67,26 @@ function Sync-EnvPath {
     $env:PATH = ($paths | Where-Object { $_ } | Select-Object -Unique) -join ';'
 }
 
+# Append an entry to the persistent user PATH. Returns $true unless the directory is missing.
+#
+# THROUGH Get-RawPath / Set-RawPath, never [Environment]::Get/SetEnvironmentVariable - the same
+# prohibition Remove-MachinePathEntry states below, applied to the hive where it had been ignored.
+# Both halves of that API are wrong for an edit and the second is permanent: Get EXPANDS %VAR% on
+# read, Set writes the value back as REG_SZ, and a REG_SZ PATH never expands a %VAR% again.
+#
+# The user hive looks like it has nothing to lose - measured 2026-09-11, 3 entries, none of them
+# %VAR%-based - but its value KIND is RegistryValueKind::ExpandString, exactly like the machine
+# hive's. One write through the framework API demotes it, and the damage is then silent and
+# deferred: the next %VAR% entry anyone adds by hand simply never expands, in a hive that looks
+# fine and whose kind nobody thinks to check.
+#
+# NO -DryRun BRANCH, and that is the shape this function already had rather than a decision taken
+# here. bootstrap.ps1's Register-ToolboxUserPath guards its own call site (:335), but
+# lib\catalog.ps1:94 and :104 do not - under -DryRun Install-WingetTool returns $true WITHOUT
+# installing, so a path_fallback tool whose binary is absent reaches this function and writes the
+# user PATH during a run that promised to change nothing. Deliberately left open: this change is
+# confined to the registry MECHANISM, and closing that gap is a behaviour change belonging either
+# to the catalog call sites or to a guard here. Recorded so the next reader need not rediscover it.
 function Add-UserPathEntry {
     param([string]$Path)
     if (-not (Test-Path $Path)) {
@@ -67,12 +94,19 @@ function Add-UserPathEntry {
         return $false
     }
     $resolved = (Resolve-Path $Path).Path
-    $userPath = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
-    $entries = @($userPath -split ';' | Where-Object { $_ })
-    $exists = $entries | Where-Object { $_.TrimEnd('\') -ieq $resolved.TrimEnd('\') } | Select-Object -First 1
+    $raw = Get-RawPath -Scope User
+    $entries = Split-PathList $raw
+    # EXPANDED TO COMPARE, RAW TO RE-EMIT. Reading through the framework API used to expand every
+    # entry for free, so a hand-written '%LOCALAPPDATA%\DevToolbox\native\bin' was recognised as
+    # already present. Comparing the literal text alone would miss it and append a second,
+    # equivalent entry - a duplicate introduced by the very change that was meant to stop the
+    # registry being rewritten. Expansion is a property of the COMPARISON only; what goes back is
+    # the untouched raw text plus $resolved.
+    $exists = $entries | Where-Object {
+        ([System.Environment]::ExpandEnvironmentVariables($_)).TrimEnd('\') -ieq $resolved.TrimEnd('\')
+    } | Select-Object -First 1
     if (-not $exists) {
-        $entries += $resolved
-        [System.Environment]::SetEnvironmentVariable('PATH', ($entries -join ';'), 'User')
+        Set-RawPath -Scope User -Value ((@($entries) + $resolved) -join ';')
         Write-Ok "added user PATH entry: $resolved"
     }
     Sync-EnvPath
@@ -81,19 +115,30 @@ function Add-UserPathEntry {
 
 # Remove an entry from the persistent user PATH (mirror of Add-UserPathEntry).
 # Matches case-insensitively, ignoring a trailing backslash. Idempotent.
+#
+# Same registry mechanism and the same expand-to-compare rule as Add-UserPathEntry above; see
+# there for why the framework API cannot be used for either half. The argument is expanded too,
+# because uninstall-toolbox.ps1:180 already hands this function an
+# ExpandEnvironmentVariables'd path - comparing an expanded argument against raw entries would
+# make the uninstaller silently fail to undo an entry it can plainly see.
 function Remove-UserPathEntry {
     param([string]$Path)
-    $target = $Path.TrimEnd('\')
-    $userPath = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
-    if (-not $userPath) { return }
-    $entries = @($userPath -split ';' | Where-Object { $_ })
-    $kept = @($entries | Where-Object { $_.TrimEnd('\') -ine $target })
-    if ($kept.Count -eq $entries.Count) { return }   # nothing matched
+    $raw = Get-RawPath -Scope User
+    if (-not $raw) { return }
+    $target = ([System.Environment]::ExpandEnvironmentVariables($Path)).TrimEnd('\')
+    $drop = @(Split-PathList $raw | Where-Object {
+        ([System.Environment]::ExpandEnvironmentVariables($_)).TrimEnd('\') -ieq $target
+    })
+    if ($drop.Count -eq 0) { return }   # nothing matched
     if ($script:DryRun) {
         Write-Info "[DRY-RUN] would remove user PATH entry: $Path"
         return
     }
-    [System.Environment]::SetEnvironmentVariable('PATH', ($kept -join ';'), 'User')
+    # The matching above decides WHICH raw entries go; Remove-PathEntryFromString does the string
+    # surgery and Set-RawPath the write. Splitting it that way keeps the rebuild in the one pure,
+    # tested function instead of growing a third hand-rolled -join ';' in this file.
+    $res = Remove-PathEntryFromString -Value $raw -Remove $drop
+    Set-RawPath -Scope User -Value $res.Value
     Write-Ok "removed user PATH entry: $Path"
     Sync-EnvPath
 }
@@ -326,7 +371,20 @@ function New-VenvCliWrappers {
     foreach ($exe in Get-ChildItem -LiteralPath $venvScripts -Filter *.exe -ErrorAction SilentlyContinue) {
         if ($exe.BaseName -match $skip) { continue }
         if ($script:DryRun) { Write-Info "[DRY-RUN] would wrap venv CLI: $($exe.BaseName)"; continue }
-        "@echo off`r`n`"$($exe.FullName)`" %*" | Set-Content -Path (Join-Path $binDir "$($exe.BaseName).cmd") -Encoding ASCII
+        # New-ShimBody (lib\ShimFormat.ps1) rather than a seventh inline copy of the byte shape.
+        # This writer produced the right bytes; it produced them from its own private literal,
+        # which is how the six copies drifted apart in the first place.
+        #
+        # -NoNewline IS LOAD-BEARING, and the pairing is the opposite of the obvious one. Measured
+        # under 5.1: the old inline string had NO trailing CRLF and Set-Content appended one, for
+        # 28 bytes. New-ShimBody supplies that CRLF itself, so keeping the bare Set-Content would
+        # emit 30 bytes with a blank third line - readable by every reader, and a silent change to
+        # bytes this repo pins deliberately. Same call shape as lib\ShimPlan.ps1:547.
+        #
+        # -LiteralPath, not -Path: a venv console script is free to contain '[', and -Path would
+        # treat it as a wildcard and silently write nothing at all.
+        New-ShimBody -Target $exe.FullName |
+            Set-Content -LiteralPath (Join-Path $binDir "$($exe.BaseName).cmd") -Encoding ASCII -NoNewline
     }
 }
 

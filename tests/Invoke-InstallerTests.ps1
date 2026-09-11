@@ -1294,6 +1294,236 @@ It 'a START marker with no matching END is refused, not guessed at' {
     $threw -and ($after -eq $before)
 }
 
+Write-Host "`n== a PATH edit goes through the registry, or it is not an edit ==" -ForegroundColor Cyan
+
+# SOURCE-LEVEL, because there is no reachable seam. bootstrap.ps1 cannot be dot-sourced - its top
+# level installs software and rewrites PATH - and gate.yml's "No test reaches a writer that cannot
+# be redirected" step forbids this suite from CALLING Add-UserPathEntry or Remove-UserPathEntry at
+# all, since both write the real user hive and take no path to redirect. Those three functions are
+# the least testable code in the repo, which is precisely why they were the three still carrying
+# the bug the rest of the repo had already written down and fixed.
+$pathEditorFiles = @('bootstrap.ps1', 'lib\common.ps1')
+$pathEditorAsts = @{}
+foreach ($rel in $pathEditorFiles) {
+    $pathEditorAsts[$rel] = [System.Management.Automation.Language.Parser]::ParseFile(
+        (Join-Path $repoRoot $rel), [ref]$null, [ref]$null)
+}
+
+function Get-SUFunctionAst {
+    # Filtered OUTSIDE FindAll on purpose: the predicate scriptblock is invoked by the AST walker,
+    # and every other FindAll in this suite keeps its predicate free of captured locals for the
+    # same reason. Where-Object runs in this scope, so $Name binds.
+    param($Ast, [string]$Name)
+    @($Ast.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+        Where-Object { $_.Name -eq $Name }) | Select-Object -First 1
+}
+
+function Get-SUEnvApiCall {
+    <#
+        Every [Environment]::<Member>(...) invocation under $Ast, as @{ Arg0; Line }.
+
+        Arg0 is $null when the first argument is not a literal string, and the callers treat that
+        as UNPROVEN rather than safe. A variable variable-name is exactly the shape a banned call
+        would come back in, and neither file has one today, so failing closed costs nothing.
+    #>
+    param($Ast, [string]$Member)
+    @($Ast.FindAll({ param($n)
+        ($n -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) -and
+        ($n.Expression -is [System.Management.Automation.Language.TypeExpressionAst]) -and
+        ($n.Expression.TypeName.Name -match '^(System\.)?Environment$') }, $true) |
+        Where-Object { [string]$_.Member.Extent.Text -eq $Member } |
+        ForEach-Object {
+            $a0 = $null
+            if ((@($_.Arguments).Count -ge 1) -and
+                ($_.Arguments[0] -is [System.Management.Automation.Language.StringConstantExpressionAst])) {
+                $a0 = [string]$_.Arguments[0].Value
+            }
+            [pscustomobject]@{ Arg0 = $a0; Line = $_.Extent.StartLineNumber }
+        })
+}
+
+It 'no PATH WRITE in bootstrap.ps1 or lib\common.ps1 goes through [Environment]::SetEnvironmentVariable' {
+    # THE check this commit exists for. bootstrap.ps1:189/211 read PATH with
+    # GetEnvironmentVariable - which EXPANDS %VAR% - and wrote the result back with
+    # SetEnvironmentVariable, which writes REG_SZ and destroys the REG_EXPAND_SZ value kind. A
+    # REG_SZ PATH never expands a %VAR% again, so one -CleanLegacyState run baked this box's 6
+    # %VAR% machine entries (%SystemRoot%\system32 among them) into literal text permanently.
+    # Add-UserPathEntry and Remove-UserPathEntry had the same round trip in the user hive, which
+    # is also ExpandString and so had exactly as much to lose the moment anyone added a %VAR%.
+    #
+    # Asserts the CONDITION - no such call exists - never that a comment says so. Delete the
+    # prohibition comment from either file and this still passes; put one line of the old code
+    # back and it fails, naming file and line.
+    #
+    # SetEnvironmentVariable ONLY. Sync-EnvPath's two GetEnvironmentVariable('PATH', ...) reads are
+    # correct and deliberate - they build $env:PATH for the running process, which MUST be
+    # expanded, and they write nothing. A ban that covered them would have to be argued away
+    # immediately, and a rule with a standing exception is not a rule.
+    $bad = @()
+    foreach ($rel in $pathEditorFiles) {
+        foreach ($c in (Get-SUEnvApiCall -Ast $pathEditorAsts[$rel] -Member 'SetEnvironmentVariable')) {
+            $shown = if ($null -eq $c.Arg0) { '<first arg is not a literal>' } else { $c.Arg0 }
+            if (($null -eq $c.Arg0) -or ($c.Arg0 -imatch '^path$')) {
+                $bad += ("{0}:{1} sets '{2}'" -f $rel, $c.Line, $shown)
+            }
+        }
+    }
+    foreach ($b in $bad) { Write-Host "     $b" -ForegroundColor Red }
+    $bad.Count -eq 0
+}
+
+It 'the three PATH editors reach Get-RawPath/Set-RawPath and the framework API not at all' {
+    # PER FUNCTION, not per file: Sync-EnvPath lives in lib\common.ps1 and legitimately calls
+    # GetEnvironmentVariable, so a file-wide ban would either fail on correct code or be watered
+    # down until it meant nothing.
+    #
+    # BOTH HALVES OF THE API, not just the writer. Writing REG_SZ is the permanent damage, but
+    # READING through the framework API is what makes an edit lossy in the first place: it returns
+    # 'C:\WINDOWS\system32' where the registry holds '%SystemRoot%\system32', and a value rebuilt
+    # from that text re-emits the expansion no matter how carefully it is finally written.
+    #
+    # The Get-RawPath/Set-RawPath presence half is the weaker assertion, and it is here for one
+    # specific failure: deleting the write outright would satisfy the ban above while quietly
+    # turning a PATH editor into a no-op. Each of these three functions must still both read and
+    # write, and the registry helpers are now the only route left.
+    $want = @{
+        'bootstrap.ps1'  = @('Remove-StalePathEntries')
+        'lib\common.ps1' = @('Add-UserPathEntry', 'Remove-UserPathEntry')
+    }
+    $bad = @()
+    foreach ($rel in $pathEditorFiles) {
+        foreach ($name in $want[$rel]) {
+            $fn = Get-SUFunctionAst -Ast $pathEditorAsts[$rel] -Name $name
+            if (-not $fn) { $bad += "$rel is missing $name"; continue }
+            foreach ($member in @('GetEnvironmentVariable', 'SetEnvironmentVariable')) {
+                foreach ($c in (Get-SUEnvApiCall -Ast $fn.Body -Member $member)) {
+                    $bad += ("{0}:{1} {2} calls [Environment]::{3}" -f $rel, $c.Line, $name, $member)
+                }
+            }
+            $calls = @($fn.Body.FindAll({ param($n)
+                $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
+                ForEach-Object { $_.GetCommandName() })
+            foreach ($helper in @('Get-RawPath', 'Set-RawPath')) {
+                if ($calls -notcontains $helper) { $bad += "$name never calls $helper" }
+            }
+        }
+    }
+    foreach ($b in $bad) { Write-Host "     $b" -ForegroundColor Red }
+    $bad.Count -eq 0
+}
+
+It 'Remove-StalePathEntries refuses the machine hive unelevated rather than throwing at it' {
+    # TWO conditions, because either alone is satisfied by broken code. The function must CONSULT
+    # Test-PathAdmin before it writes HKLM, and it must contain no throw.
+    #
+    # The old code had neither. It called SetEnvironmentVariable blind and converted the resulting
+    # SecurityException into a throw, which killed bootstrap in the middle of -CleanLegacyState -
+    # after Remove-OldRepositoryClone and Remove-DirectorySafely had already deleted the old clone
+    # and the old toolbox tree. Loudest at exactly the point where the least state was recoverable.
+    #
+    # Dropping the throw costs no strictness, which is why "warn and continue" is allowed to be the
+    # answer here: Assert-OldToolchainClean re-reads the machine PATH a few lines later and throws
+    # on the very entry the warning names, so an unelevated run still ends red - in one piece.
+    $fn = Get-SUFunctionAst -Ast $pathEditorAsts['bootstrap.ps1'] -Name 'Remove-StalePathEntries'
+    if (-not $fn) { Write-Host "     Remove-StalePathEntries is gone" -ForegroundColor Red; return $false }
+    $calls = @($fn.Body.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
+        ForEach-Object { $_.GetCommandName() })
+    $throws = @($fn.Body.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.ThrowStatementAst] }, $true))
+    if ($throws.Count) {
+        Write-Host ("     line {0}: throws instead of reporting" -f $throws[0].Extent.StartLineNumber) -ForegroundColor Red
+    }
+    if ($calls -notcontains 'Test-PathAdmin') {
+        Write-Host "     writes the machine hive without consulting Test-PathAdmin" -ForegroundColor Red
+    }
+    ($calls -contains 'Test-PathAdmin') -and ($throws.Count -eq 0)
+}
+
+It 'Remove-StalePathEntries backs the PATH up BEFORE its first Set-RawPath, never after' {
+    # ORDER, not presence. A Backup-PathRegistry call sitting after the write is still a call, and
+    # a check that only asked "is it there" would pass the single arrangement that makes the backup
+    # worthless. -CleanLegacyState is opt-in and destructive, and
+    # logs\path-backup-20260909-203021.json is the only reason the 2026-09-09 outage was
+    # recoverable - it is still the only surviving record of that machine PATH's original order.
+    $fn = Get-SUFunctionAst -Ast $pathEditorAsts['bootstrap.ps1'] -Name 'Remove-StalePathEntries'
+    if (-not $fn) { Write-Host "     Remove-StalePathEntries is gone" -ForegroundColor Red; return $false }
+    $backups = @($fn.Body.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
+        Where-Object { $_.GetCommandName() -eq 'Backup-PathRegistry' })
+    $writes = @($fn.Body.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
+        Where-Object { $_.GetCommandName() -eq 'Set-RawPath' })
+    if (-not $backups.Count) { Write-Host "     no Backup-PathRegistry call at all" -ForegroundColor Red; return $false }
+    if (-not $writes.Count) { Write-Host "     no Set-RawPath call at all" -ForegroundColor Red; return $false }
+    $firstBackup = ($backups | ForEach-Object { $_.Extent.StartOffset } | Measure-Object -Minimum).Minimum
+    $firstWrite = ($writes | ForEach-Object { $_.Extent.StartOffset } | Measure-Object -Minimum).Minimum
+    if ($firstBackup -ge $firstWrite) {
+        Write-Host "     the backup is taken after the first registry write" -ForegroundColor Red
+    }
+    $firstBackup -lt $firstWrite
+}
+
+Write-Host "`n== the venv wrapper writer emits the shared byte contract, not its own ==" -ForegroundColor Cyan
+
+It 'New-VenvCliWrappers writes exactly the ShimFormat bytes, and still skips the interpreter' {
+    # THE REAL WRITER, end to end, against a fixture toolbox under TEMP - not a re-implementation
+    # of the line, which would pass whatever lib\common.ps1 actually did. That function built its
+    # wrapper from a private "@echo off`r`n..." literal until 2026-09-11, one of the seven private
+    # copies of the format that lib\ShimFormat.ps1 exists to collapse.
+    #
+    # -NoNewline IS THE SUBTLE HALF, and this is what pins it. Measured under 5.1: the old inline
+    # string carried NO trailing CRLF and Set-Content appended one, for 28 bytes. New-ShimBody
+    # supplies that CRLF itself, so the same Set-Content WITHOUT -NoNewline emits 30 bytes with a
+    # blank third line. Both spellings still parse, every reader still resolves the target, and
+    # nothing else in this repo would ever have noticed the bytes move.
+    $tb = Join-Path ([IO.Path]::GetTempPath()) ("venvwrap-" + [guid]::NewGuid().ToString('N'))
+    $venvScripts = Join-Path $tb 'python\.venv\Scripts'
+    New-Item -ItemType Directory -Path $venvScripts -Force | Out-Null
+    foreach ($n in @('frida.exe', 'sqlite-utils.exe', 'python.exe', 'pip.exe')) {
+        Set-Content -LiteralPath (Join-Path $venvScripts $n) -Value 'not a real exe' -Encoding ASCII
+    }
+    $prevToolbox = $env:CODEX_TOOLBOX
+    $ok = $false
+    try {
+        $env:CODEX_TOOLBOX = $tb
+        # REFUSING rather than failing: New-VenvCliWrappers derives its output directory from
+        # $env:CODEX_TOOLBOX alone, so if this override did not take it would wrap the REAL
+        # toolbox venv into the REAL native\bin. Same shape and same one-assignment margin as the
+        # $script:MANIFEST refusal at the top of this file.
+        if (-not $env:CODEX_TOOLBOX.StartsWith($script:SUTempRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            Write-Host "     REFUSING: CODEX_TOOLBOX is '$env:CODEX_TOOLBOX', outside $($script:SUTempRoot)" -ForegroundColor Red
+            return $false
+        }
+        New-VenvCliWrappers
+        $binDir = Join-Path $tb 'native\bin'
+        $written = @(Get-ChildItem -LiteralPath $binDir -Filter *.cmd -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.Name } | Sort-Object)
+        # The target is read back off the FileInfo the writer itself enumerated, so a difference
+        # here is a difference in the BODY and never in how this test spelled the path.
+        $exe = Get-Item -LiteralPath (Join-Path $venvScripts 'frida.exe')
+        $got = [IO.File]::ReadAllBytes((Join-Path $binDir 'frida.cmd'))
+        $want = [Text.Encoding]::ASCII.GetBytes((New-ShimBody -Target $exe.FullName))
+        if ($got.Count -ne $want.Count) {
+            Write-Host ("     wrapper is {0} bytes, the contract is {1}" -f $got.Count, $want.Count) -ForegroundColor Red
+        }
+        # python.exe and pip.exe must NOT be wrapped. Keeping a 3.11 interpreter off PATH is the
+        # entire reason this wrapper layer exists instead of a PATH entry for the venv Scripts dir
+        # - see the function's own comment and docs\agent-rules.md on compliance scanners.
+        if (($written -join ',') -ne 'frida.cmd,sqlite-utils.cmd') {
+            Write-Host ("     wrapped: {0}" -f ($written -join ', ')) -ForegroundColor Red
+        }
+        $ok = ($got.Count -eq $want.Count) -and
+              (@(Compare-Object $got $want -SyncWindow 0).Count -eq 0) -and
+              (($written -join ',') -eq 'frida.cmd,sqlite-utils.cmd')
+    } finally {
+        $env:CODEX_TOOLBOX = $prevToolbox
+        Remove-Item -LiteralPath $tb -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $ok
+}
+
 if (-not (Assert-SUSuiteFloor -SuiteFile $PSCommandPath -Ran ($script:Pass + $script:Fail))) { $script:Fail++ }
 Show-SUGuardSummary
 
