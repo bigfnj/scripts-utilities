@@ -6,6 +6,11 @@ if (-not (Get-Variable -Name DryRun -Scope Script -ErrorAction SilentlyContinue)
 }
 $script:MANIFEST = Join-Path $PSScriptRoot "..\manifest\tools.json"
 
+# Get-RawPath / Set-RawPath / Remove-PathEntryFromString, for Remove-MachinePathEntry below.
+# That file defines NO logging functions on purpose: its Write-Ok would otherwise fight the one
+# defined a few lines down, which takes -Msg where consolidate-path.ps1's takes a positional $t.
+. (Join-Path $PSScriptRoot "path-registry.ps1")
+
 # -- Logging -------------------------------------------------------------------
 function Write-Info  { param([string]$Msg) Write-Host "  $Msg" -ForegroundColor Cyan }
 function Write-Ok    { param([string]$Msg) Write-Host "OK $Msg" -ForegroundColor Green }
@@ -84,6 +89,46 @@ function Remove-UserPathEntry {
     [System.Environment]::SetEnvironmentVariable('PATH', ($kept -join ';'), 'User')
     Write-Ok "removed user PATH entry: $Path"
     Sync-EnvPath
+}
+
+# Remove an entry from the persistent MACHINE PATH. Returns a STATUS STRING, one of
+# 'Removed' | 'NotPresent' | 'DryRun' | 'NeedsElevation', because the caller has to be able to
+# tell "there was nothing to do" from "I was not allowed to do it".
+#
+# WHY THIS EXISTS. uninstall-toolbox.ps1:167-170 reversed the toolbox's PATH side effects by
+# calling Remove-UserPathEntry for entries that consolidate-path.ps1 puts in HKLM, so the
+# uninstaller could not undo its own change and still reported a clean run. That is not a
+# theory: the two dead ...\DevToolbox\native\bin and ...\DevToolbox\sysinternals entries sitting
+# in this box's machine PATH right now ARE that gap, left behind by the 2026-09-10 uninstall.
+#
+# IT MUST NOT SELF-ELEVATE, and that is a deliberate refusal rather than an omission. Every
+# caller is mid-way through mutating HKCU and the filesystem, and UAC on a standard-user account
+# accepts a DIFFERENT administrator's credentials - the elevated child's HKCU would then be that
+# administrator's hive, so it would finish "successfully" having edited the wrong account and
+# left this one exactly as broken. consolidate-path.ps1 carries the same warning at its
+# -ElevatedFor parameter and guards it with a SID comparison, which is only possible because
+# that script owns its whole run. A helper called from the middle of one does not.
+# Unelevated, this writes NOTHING and says so; the caller reports the run INCOMPLETE.
+function Remove-MachinePathEntry {
+    param([Parameter(Mandatory)][string]$Path)
+    $raw = Get-RawPath -Scope Machine
+    $res = Remove-PathEntryFromString -Value $raw -Remove @($Path)
+    if (@($res.Removed).Count -eq 0) { return 'NotPresent' }
+    if ($script:DryRun) {
+        Write-Info "[DRY-RUN] would remove machine PATH entry: $Path"
+        return 'DryRun'
+    }
+    if (-not (Test-PathAdmin)) {
+        Write-Warn "machine PATH entry NOT removed (needs elevation): $Path"
+        return 'NeedsElevation'
+    }
+    # Set-RawPath, never [Environment]::SetEnvironmentVariable: 5 of this box's 43 machine
+    # entries are %VAR%-based and the framework API silently rewrites the value as REG_SZ, after
+    # which %SystemRoot%\system32 never expands again.
+    Set-RawPath -Scope Machine -Value $res.Value
+    Write-Ok "removed machine PATH entry: $Path"
+    Sync-EnvPath
+    return 'Removed'
 }
 
 # Strip fenced agent-discovery blocks (WIN_DEVTOOLS and/or legacy CODEX_TOOLBOX)

@@ -1,6 +1,6 @@
 {
   "$comment": "Declarative source of truth for scripts-utilities. Consumed by modules/*.ps1 (via lib/catalog.ps1), scripts/install-machine-scope.ps1, gui/toolbox-gui.ps1, and (later) the uninstaller. Stage-1 toolbox contents live in scripts/build-devtoolbox.ps1 and are NOT described here (the toolbox_layers block that claimed to was never read by anything - the real switches are -SkipHeavy and -SkipPlaywrightBrowsers on that script). Keep machine_scope_ids in sync with the machineScope entries in build-devtoolbox.ps1. schema_version is validated by Get-Catalog in lib/catalog.ps1: bump both together.",
-  "schema_version": 1,
+  "schema_version": 2,
   "tools": [
     {
       "name": "gh", "group": "cli-tools", "channel": "winget-user",
@@ -181,6 +181,11 @@
     "path_entries_relative": [
       "native\\bin",
       "python\\.venv\\Scripts",
+      "sysinternals"
+    ],
+    "$comment_machine": "Entries scripts\\consolidate-path.ps1 moves into the MACHINE hive. They are listed SEPARATELY from path_entries_relative because reversing them needs a different API and elevation: Remove-UserPathEntry silently does nothing to an HKLM entry, which is why the uninstaller used to claim a clean reversal while leaving both of these behind. Removing them is idempotent - the uninstaller asks for both regardless of scope, and an entry present only in the user hive is reported NotPresent here and removed by path_entries_relative above.",
+    "path_entries_machine_relative": [
+      "native\\bin",
       "sysinternals"
     ],
     "path_entries_absolute": [

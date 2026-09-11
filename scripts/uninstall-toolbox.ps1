@@ -55,6 +55,16 @@ Write-Group "uninstall toolbox"
 Write-Info "toolbox root:      $toolboxRoot"
 Write-Info "remove winget tools: $([bool]$RemoveWingetTools)"
 Write-Info "mode:              $(if ($DryRun) { 'DRY-RUN (no changes)' } else { 'LIVE' })"
+# BEFORE the REMOVE prompt, not after. The toolbox's native\bin and sysinternals entries live in
+# the MACHINE hive once consolidate-path.ps1 has run, and this script will not elevate to take
+# them out - so an unelevated operator needs to know the reversal will be partial while they can
+# still answer no. Step 2 reports the same gap afterwards and exits non-zero; by then they have
+# already typed REMOVE.
+if (-not (Test-IsElevated)) {
+    Write-Warn "this session is NOT elevated: the MACHINE PATH entries (native\bin, sysinternals)"
+    Write-Warn "cannot be removed and the run will report INCOMPLETE. Re-run elevated for a full"
+    Write-Warn "reversal, or expect to remove those two entries by hand."
+}
 
 # -- 0. Validate the toolbox root BEFORE touching anything ----------------------
 # This check used to live in step 5, next to the Remove-Item it guards. By the time it fired,
@@ -168,6 +178,22 @@ foreach ($rel in @($se.path_entries_relative)) {
 }
 foreach ($abs in @($se.path_entries_absolute)) {
     Remove-UserPathEntry ([System.Environment]::ExpandEnvironmentVariables($abs))
+}
+# The MACHINE hive, which the three loops above cannot touch. consolidate-path.ps1 moves
+# native\bin and sysinternals there, so Remove-UserPathEntry looked for them in HKCU, found
+# nothing, returned quietly, and this script printed "toolbox uninstall complete" - which is how
+# the two dead DevToolbox entries got into this box's machine PATH and stayed there.
+# Remove-MachinePathEntry deliberately does not self-elevate (see its comment in lib\common.ps1:
+# raising UAC here can land in a different administrator's hive while we are half-way through
+# mutating this one), so an unelevated run records the gap and exits non-zero instead of
+# claiming a reversal it did not perform.
+if ($se.PSObject.Properties.Name -contains 'path_entries_machine_relative') {
+    foreach ($rel in @($se.path_entries_machine_relative)) {
+        $full = Join-Path $toolboxRoot $rel
+        if ((Remove-MachinePathEntry -Path $full) -eq 'NeedsElevation') {
+            $problems += "machine PATH entry still present (needs elevation): $full"
+        }
+    }
 }
 foreach ($var in @($se.env_vars)) {
     $val = [System.Environment]::GetEnvironmentVariable($var, "User")

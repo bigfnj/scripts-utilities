@@ -607,7 +607,537 @@ It 'bootstrap weighs tessdata by size and requires eng' {
         ($null -ne $gate.ElseClause)
 }
 
+# =============================================================================================
+# lib\ShimPlan.ps1 + lib\path-registry.ps1 - shim recovery and PATH editing
+#
+# WHY THESE EXIST AT ALL. On 2026-09-10 %LOCALAPPDATA%\DevToolbox was deleted. Its native\bin
+# held the .cmd shims that were the ONLY PATH route to 27 winget portable packages, because
+# consolidate-path.ps1 had already taken those packages' own directories OFF the PATH in favour
+# of the shims. Nothing could rebuild them: discovery was two lines filtering the CURRENT PATH,
+# so on a correctly-consolidated box it found zero candidates - and then fell through into the
+# PATH rewrite anyway. 13 tools had no recovery route.
+#
+# THE DECISION UNDER TEST is WHICH executable each shim points at, and the failure mode is
+# silent: a shim that resolves and runs the wrong ffmpeg looks exactly like a working one. So
+# these are behavioural tests over seams, not source greps, and the fixtures live on P:\ - a
+# drive that does not exist - so a test that accidentally reaches the real filesystem FAILS
+# instead of passing on whatever this box happens to hold.
+#
+# Dot-sourced here rather than at the top of the file because these two are the only functions
+# the section below needs; lib\common.ps1 (line 34) already pulls in path-registry.ps1 for
+# Remove-MachinePathEntry.
+. (Join-Path $repoRoot 'lib\ShimPlan.ps1')
+
+function New-FakeExe {
+    # Stands in for a FileInfo. Get-ShimCandidates reads .FullName and nothing else.
+    param([string]$Path)
+    return [pscustomobject]@{ FullName = $Path }
+}
+function New-FakeWalk {
+    # An -Enumerate seam over a described filesystem. Honours -Filter per extension and the
+    # recurse flag, because getting either wrong is a real bug this seam has to be able to show:
+    # -Include instead of -Filter once matched README.md and would have written README.cmd.
+    param([string[]]$Files)
+    return {
+        param($Path, $Filter, $Recurse)
+        $ext = ([string]$Filter).TrimStart('*')
+        $root = ([string]$Path).TrimEnd('\').ToLowerInvariant()
+        $hits = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($f in @($Files)) {
+            $lf = $f.ToLowerInvariant()
+            if (-not $lf.EndsWith($ext)) { continue }
+            $under = if ($Recurse) { $lf.StartsWith($root + '\') }
+                     else { ([IO.Path]::GetDirectoryName($f)).TrimEnd('\').ToLowerInvariant() -eq $root }
+            if ($under) { $hits.Add((New-FakeExe $f)) }
+        }
+        return @($hits.ToArray())
+    }.GetNewClosure()
+}
+function New-FakeCand {
+    param([string]$Name, [string]$Target, [string]$PackageId, [string]$Package)
+    return [pscustomobject]@{ Name = $Name; Target = $Target; Package = $Package; PackageId = $PackageId; Dir = [IO.Path]::GetDirectoryName($Target) }
+}
+function New-FakeWrapper {
+    param([string]$Name, [string]$Target, [bool]$Parsed = $true)
+    return [pscustomobject]@{ Name = $Name; Wrapper = "P:\tb\native\bin\$Name.cmd"; Target = $Target; Parsed = $Parsed }
+}
+
+$pkgRoot = 'P:\pkgs'
+$btbn = "$pkgRoot\BtbN.FFmpeg.GPL.Shared.7.1_Microsoft.Winget.Source_8wekyb3d8bbwe"
+$gyan = "$pkgRoot\Gyan.FFmpeg.Essentials_Microsoft.Winget.Source_8wekyb3d8bbwe"
+# The real disk layout: a version-stamped subfolder under each package root, which is what makes
+# the package root - not the directory holding the .exe - the only stable thing to rank on.
+$ffFiles = @(
+    "$btbn\ffmpeg-n7.1.5-win64-gpl-shared\bin\ffmpeg.exe",
+    "$btbn\ffmpeg-n7.1.5-win64-gpl-shared\bin\ffprobe.exe",
+    "$gyan\ffmpeg-8.1.1-essentials_build\bin\ffmpeg.exe",
+    "$gyan\ffmpeg-8.1.1-essentials_build\bin\ffprobe.exe",
+    "$pkgRoot\GitHub.cli_Microsoft.Winget.Source_8wekyb3d8bbwe\bin\gh.exe",
+    "$pkgRoot\junegunn.fzf_Microsoft.Winget.Source_8wekyb3d8bbwe\fzf.exe",
+    # A .cmd and a .bat, because the real tree has them (cURL ships wcurl.bat) and a walk that
+    # quietly covers only *.exe loses them with no error. And a README, because -Include once
+    # matched it and would have written README.cmd.
+    "$pkgRoot\some.cmdtool_Microsoft.Winget.Source_8wekyb3d8bbwe\wincmd.cmd",
+    "$pkgRoot\some.battool_Microsoft.Winget.Source_8wekyb3d8bbwe\winbat.bat",
+    "$pkgRoot\junegunn.fzf_Microsoft.Winget.Source_8wekyb3d8bbwe\README.md"
+)
+$alwaysThere = { param($p) $true }
+$neverThere = { param($p) $false }
+
+Write-Host "`n== a shim's bytes are a property of the code, not of the checkout ==" -ForegroundColor Cyan
+
+It 'New-ShimBody emits exactly  @echo off<CRLF>"<target>" %*<CRLF>  in ASCII' {
+    # The bytes, not a regex over them. The repo has core.autocrlf=true and no .gitattributes,
+    # so a here-string or [Environment]::NewLine would make the line endings a property of the
+    # working copy. Three separate readers anchor their regex on $ (build-devtoolbox.ps1:336,
+    # smoke-test.ps1:280, Get-ShimTarget), so a lone LF makes every shim unparseable and the
+    # smoke test reports 47 healthy shims as zero stale AND zero present.
+    $b = [Text.Encoding]::ASCII.GetBytes((New-ShimBody -Target 'C:\x\y.exe'))
+    $want = [Text.Encoding]::ASCII.GetBytes("@echo off") + @(13, 10) +
+            [Text.Encoding]::ASCII.GetBytes('"C:\x\y.exe" %*') + @(13, 10)
+    (@(Compare-Object $b $want -SyncWindow 0).Count -eq 0) -and ($b.Count -eq 28)
+}
+It 'the shim regex is character-identical in all three files that read a wrapper' {
+    # A DRIFT guard, deliberately at source level: the three readers are in three files nothing
+    # forces to agree, and a regex that is merely equivalent today is how they stop agreeing.
+    # modules\security.ps1 writes a THREE-line Ghidra wrapper, so any reader that stops matching
+    # loses Ghidra first and silently.
+    $pat = '\^"\(\[\^"\]\+\)" %\\\*\$'
+    $hits = @()
+    foreach ($f in @('lib\ShimPlan.ps1', 'scripts\build-devtoolbox.ps1', 'scripts\smoke-test.ps1')) {
+        $src = Get-Content (Join-Path $repoRoot $f) -Raw
+        if ($src -match $pat) { $hits += $f }
+    }
+    $hits.Count -eq 3
+}
+It 'Get-ShimTarget reads the THREE-line Ghidra wrapper, not just the two-line one' {
+    # modules\security.ps1:278 emits  @echo off / set "JAVA_HOME=..." / "<target>" %*  - so a
+    # reader that indexes "the second line" returns the JAVA_HOME assignment as Ghidra's target.
+    # Scan for the first line that MATCHES, always.
+    $lines = @('@echo off', 'set "JAVA_HOME=P:\jdk"', '"P:\ghidra\ghidraRun.bat" %*')
+    (Get-ShimTarget -Lines $lines) -eq 'P:\ghidra\ghidraRun.bat'
+}
+It 'Get-ShimTarget returns $null for a wrapper somebody hand-wrote' {
+    # This is what makes rule 3 (unparseable -> never touch) possible. A reader that guesses
+    # here would hand the planner a target that was never in the file.
+    $null -eq (Get-ShimTarget -Lines @('@echo off', 'echo hello', 'pause'))
+}
+
+Write-Host "`n== ENUMERATION ORDER IS NOT A RANK ==" -ForegroundColor Cyan
+
+It 'alphabetical disk order is NOT a priority oracle - a contested name is SKIPPED' {
+    # THE test. A recursive walk of this box yields BtbN before Gyan, and that INVERTS the only
+    # contested decision here: build-devtoolbox.ps1:43 declares Gyan.FFmpeg.Essentials as the
+    # toolbox's ffmpeg, and Gyan is what actually won the 2026-08-27 run. Any code that treats
+    # the walk order as a ranking therefore silently installs the wrong ffmpeg - and both
+    # binaries run, so nothing downstream notices. With no authoritative order, refuse.
+    $cands = Get-ShimCandidates -PackagesRoot $pkgRoot -Enumerate (New-FakeWalk -Files $ffFiles)
+    $plan = Get-ShimPlan -Candidates $cands -TargetExists $alwaysThere -NativeBin 'P:\tb\native\bin'
+    $names = @(@($plan.Contested | ForEach-Object { $_.Name }) | Sort-Object)
+    (@($plan.Contested).Count -eq 2) -and ($names -join ',') -eq 'ffmpeg,ffprobe' -and
+        (@($plan.Write | Where-Object { $_.Name -like 'ff*' }).Count -eq 0)
+}
+It 'and a name only ONE package supplies is still shimmed with no priority order at all' {
+    # The partner control, and the reason the two are separate tests: "refuse when contested"
+    # must not be implemented as "refuse always". 44 of this box's 47 names land here. Asserted
+    # by membership rather than by the exact set, so this control stays valid when the fixture
+    # grows - a control that has to be edited alongside the thing it controls is not one.
+    $cands = Get-ShimCandidates -PackagesRoot $pkgRoot -Enumerate (New-FakeWalk -Files $ffFiles)
+    $plan = Get-ShimPlan -Candidates $cands -TargetExists $alwaysThere -NativeBin 'P:\tb\native\bin'
+    $sole = @(@($plan.Write | Where-Object { $_.Because -eq 'sole' }) | ForEach-Object { $_.Name })
+    ($sole -contains 'fzf') -and ($sole -contains 'gh') -and
+        (@($sole | Where-Object { $_ -like 'ff*' }).Count -eq 0)
+}
+It 'the walk covers .exe, .cmd AND .bat, and a README never becomes a shim' {
+    # THREE -Filter passes, and -Filter rather than -Include. Get-ChildItem silently ignores
+    # -Include unless the path ends in \* or -Recurse is set, so an -Include *.exe matched
+    # README.md and would have generated README.cmd - caught by the first dry run in 2026-08.
+    # The extension list matters just as much: cURL really does ship wcurl.bat, and a walk that
+    # covers only *.exe drops it with no error anywhere.
+    $cands = Get-ShimCandidates -PackagesRoot $pkgRoot -Enumerate (New-FakeWalk -Files $ffFiles)
+    $names = @(@($cands) | ForEach-Object { $_.Name })
+    ($names -contains 'wincmd') -and ($names -contains 'winbat') -and ($names -notcontains 'README')
+}
+It '-Dirs scans the given leaf directories only, and still finds the package ROOT above them' {
+    # The DEFAULT mode's code path: it hands in the WinGet\Packages entries already on PATH,
+    # which are leaf bin directories, and walking those recursively would be wrong. The package
+    # root still has to be derived - two levels up, past the version-stamped subfolder - or
+    # ranking and the sibling rule key on a directory name that changes on every winget upgrade.
+    $cands = @(Get-ShimCandidates -PackagesRoot $pkgRoot -Dirs @("$gyan\ffmpeg-8.1.1-essentials_build\bin") `
+        -Enumerate (New-FakeWalk -Files $ffFiles))
+    $pkgs = @(@($cands) | ForEach-Object { $_.Package } | Select-Object -Unique)
+    ($cands.Count -eq 2) -and ($pkgs.Count -eq 1) -and ($pkgs[0] -eq $gyan) -and
+        (@($cands | Where-Object { $_.Target -like "$btbn\*" }).Count -eq 0)
+}
+It 'an authoritative order beats alphabetical order even when it sorts LAST' {
+    # Gyan sorts after BtbN, and Gyan is the right answer. Ranked from a PATH order, the plan
+    # must say Gyan - which is also the replay of what logs\consolidate-run.log recorded.
+    $cands = Get-ShimCandidates -PackagesRoot $pkgRoot -Enumerate (New-FakeWalk -Files $ffFiles)
+    $plan = Get-ShimPlan -Candidates $cands -TargetExists $alwaysThere -PriorityOrder @($gyan, $btbn) -NativeBin 'P:\tb\native\bin'
+    $ff = @($plan.Write | Where-Object { $_.Name -eq 'ffmpeg' })
+    (@($plan.Contested).Count -eq 0) -and ($ff.Count -eq 1) -and ($ff[0].Target -like "$gyan\*") -and ($ff[0].Because -eq 'rank:0')
+}
+It 'the losing copies are REPORTED shadowed, never silently dropped' {
+    # "shadowed, unchanged" is the only trace that a second ffmpeg exists at all. Without it the
+    # report says 47 shims and gives no hint that 6 executables were passed over.
+    #
+    # Driven by -Pick rather than by rank so that this test and the ranking test above fail
+    # INDEPENDENTLY: a mutation that inverts the rank comparison must not also break the check
+    # on whether the loser gets reported, or one mutation indicts two guards and neither is
+    # pinned.
+    $cands = Get-ShimCandidates -PackagesRoot $pkgRoot -Enumerate (New-FakeWalk -Files $ffFiles)
+    $plan = Get-ShimPlan -Candidates $cands -TargetExists $alwaysThere -Pick 'ffmpeg=BtbN.FFmpeg' -NativeBin 'P:\tb\native\bin'
+    $sh = @($plan.Shadowed | Where-Object { $_.Name -eq 'ffmpeg' })
+    ($sh.Count -eq 1) -and ($sh[0].Target -like "$gyan\*") -and ($sh[0].Chosen -like "$btbn\*")
+}
+It 'Get-ShimPriority ranks a backup machine-then-user and refuses a document that is not one' {
+    # machine-then-user is how Windows composes the session PATH, so it is the order that makes
+    # "first one wins" agree with what used to resolve. Shape is checked by property PRESENCE:
+    # under strict mode a missing field either throws somewhere unrelated or yields $null, and a
+    # silently empty priority list turns 3 resolved names into 3 contested ones with no error.
+    $json = '{ "captured_at": "x", "machine": "P:\\pkgs\\Gyan.FFmpeg.Essentials_Microsoft.Winget.Source_8wekyb3d8bbwe\\b;C:\\nodejs", "user": "P:\\pkgs\\BtbN.FFmpeg.GPL.Shared.7.1_Microsoft.Winget.Source_8wekyb3d8bbwe\\b" }'
+    $order = Get-ShimPriority -Json $json -PackagesRoot $pkgRoot
+    $rejected = $false
+    try { Get-ShimPriority -Json '{ "shims": {} }' -PackagesRoot $pkgRoot | Out-Null }
+    catch { $rejected = $_.Exception.Message -match "no 'machine' field" }
+    (@($order).Count -eq 2) -and ($order[0] -eq $gyan) -and ($order[1] -eq $btbn) -and $rejected
+}
+
+Write-Host "`n== a wrapper that is already there wins BY CONSTRUCTION ==" -ForegroundColor Cyan
+
+It 'the PLANNER keeps a wrapper whose target exists, and reports what it would have been' {
+    # The open BACKLOG bug. consolidate-path.ps1's comment claimed "Never shim over a wrapper the
+    # toolbox builder owns" for a year while implementing only `if ($name -eq 'consolidate-path')`.
+    # Keeping first is what makes build-devtoolbox.ps1's venv wrappers win without either script
+    # knowing about the other: the builder runs first, so its wrappers are already on disk.
+    $cands = @(New-FakeCand -Name 'fzf' -Target 'P:\pkgs\junegunn.fzf_x\fzf.exe' -PackageId 'junegunn.fzf_x' -Package 'P:\pkgs\junegunn.fzf_x')
+    $plan = Get-ShimPlan -Candidates $cands -Existing @(New-FakeWrapper -Name 'fzf' -Target 'P:\tb\python\.venv\Scripts\fzf.exe') `
+        -TargetExists $alwaysThere -NativeBin 'P:\tb\native\bin'
+    $k = @($plan.Kept | Where-Object { $_.Name -eq 'fzf' })
+    (@($plan.Write).Count -eq 0) -and ($k.Count -eq 1) -and ($k[0].Reason -eq 'existing') -and
+        ($k[0].Would -eq 'sole -> P:\pkgs\junegunn.fzf_x\fzf.exe')
+}
+It 'the WRITER independently refuses to overwrite a wrapper the plan did not mark for refresh' {
+    # A SECOND, INDEPENDENT check, not a restatement of the planner's rule. The writer had NO
+    # Test-Path at all (consolidate-path.ps1:356-364), so any caller bug - a hand-built plan, a
+    # future mode, a planner regression - overwrote a builder-owned wrapper and the venv CLI it
+    # pointed at stopped resolving with nothing anywhere recording why. The plan below is exactly
+    # that caller bug, expressed on purpose.
+    $plan = @{ Write = @([pscustomobject]@{ Name = 'fzf'; Target = 'P:\pkgs\fzf.exe'; PackageId = 'p'; Wrapper = 'P:\tb\native\bin\fzf.cmd'; Because = 'sole'; Refresh = $false; Rivals = @() }) }
+    # Cleared BEFORE the call, not after: a sentinel reset afterwards is always $null and the
+    # assertion on it can never fail, which is a check that looks like one and is not.
+    $script:writerTouched = $null
+    $res = Invoke-ShimWrite -Plan $plan -NativeBin 'P:\tb\native\bin' -FileExists $alwaysThere `
+        -WriteFile { param($p, $b) $script:writerTouched = $p }
+    (@($res.Written).Count -eq 0) -and (@($res.Refused).Count -eq 1) -and ($null -eq $script:writerTouched)
+}
+It 'a STALE wrapper IS refreshed - the refusal is not unconditional' {
+    # smoke-test.ps1:287 tells the operator to re-run this script to fix a shim whose target a
+    # winget upgrade moved. Refusing every existing wrapper would make every stale shim
+    # PERMANENT and turn that instruction into a lie, so "exists" and "resolves" are different
+    # questions and only the second one protects.
+    $cands = @(New-FakeCand -Name 'fzf' -Target 'P:\pkgs\junegunn.fzf_x\fzf.exe' -PackageId 'junegunn.fzf_x' -Package 'P:\pkgs\junegunn.fzf_x')
+    $plan = Get-ShimPlan -Candidates $cands -Existing @(New-FakeWrapper -Name 'fzf' -Target 'P:\pkgs\junegunn.fzf_OLD\fzf.exe') `
+        -TargetExists $neverThere -NativeBin 'P:\tb\native\bin'
+    $script:refreshBody = $null
+    $res = Invoke-ShimWrite -Plan $plan -NativeBin 'P:\tb\native\bin' -FileExists $alwaysThere `
+        -WriteFile { param($p, $b) $script:refreshBody = $b }
+    (@($plan.Refreshed).Count -eq 1) -and (@($res.Written).Count -eq 1) -and (@($res.Refused).Count -eq 0) -and
+        ($script:refreshBody -eq (New-ShimBody -Target 'P:\pkgs\junegunn.fzf_x\fzf.exe'))
+}
+It 'a wrapper with no parseable target line is KEPT, never rewritten' {
+    # Somebody hand-wrote it. There is no way to tell a deliberate hand-written .cmd from a
+    # corrupt one, and only one of those two answers is safe.
+    $cands = @(New-FakeCand -Name 'tool' -Target 'P:\pkgs\p_x\tool.exe' -PackageId 'p_x' -Package 'P:\pkgs\p_x')
+    $plan = Get-ShimPlan -Candidates $cands -Existing @(New-FakeWrapper -Name 'tool' -Target $null -Parsed $false) `
+        -TargetExists $alwaysThere -NativeBin 'P:\tb\native\bin'
+    (@($plan.Write).Count -eq 0) -and (@($plan.Kept | Where-Object { $_.Reason -eq 'unparseable' }).Count -eq 1)
+}
+It 'a stale wrapper NO package can supply is reported as unfixable, not quietly ignored' {
+    # smoke-test.ps1 will report this one on every single run. Saying "a rebuild cannot fix this"
+    # once is the difference between an actionable report and a permanent red line.
+    $plan = Get-ShimPlan -Candidates @() -Existing @(New-FakeWrapper -Name 'gone' -Target 'P:\vanished\gone.exe') `
+        -TargetExists $neverThere -NativeBin 'P:\tb\native\bin'
+    @($plan.Kept | Where-Object { $_.Reason -eq 'stale-no-source' }).Count -eq 1
+}
+It 'consolidate-path is never shimmed over itself' {
+    $cands = @(New-FakeCand -Name 'consolidate-path' -Target 'P:\pkgs\p_x\consolidate-path.exe' -PackageId 'p_x' -Package 'P:\pkgs\p_x')
+    $plan = Get-ShimPlan -Candidates $cands -TargetExists $alwaysThere -NativeBin 'P:\tb\native\bin'
+    (@($plan.Write).Count -eq 0) -and (@($plan.Skipped).Count -eq 1)
+}
+
+Write-Host "`n== -Pick and the sibling rule ==" -ForegroundColor Cyan
+
+It 'a -Pick whose prefix matches NOTHING throws instead of falling through' {
+    # Falling through would leave the name contested while the operator believes they resolved
+    # it - and the report would agree with them, because a contested name is reported by the
+    # planner and a typo is not.
+    $cands = Get-ShimCandidates -PackagesRoot $pkgRoot -Enumerate (New-FakeWalk -Files $ffFiles)
+    $threw = $false
+    try { Get-ShimPlan -Candidates $cands -Pick 'ffmpeg=NoSuchPackage' -TargetExists $alwaysThere | Out-Null }
+    catch { $threw = $_.Exception.Message -match 'matches no package' }
+    $threw
+}
+It 'a -Pick binds the name, and its SIBLINGS follow into the same package' {
+    # ffmpeg/ffprobe/ffplay ship together and must come from one build; picking three times to
+    # say one thing is how two of them end up from different packages.
+    $cands = Get-ShimCandidates -PackagesRoot $pkgRoot -Enumerate (New-FakeWalk -Files $ffFiles)
+    $plan = Get-ShimPlan -Candidates $cands -Pick 'ffmpeg=Gyan.FFmpeg' -TargetExists $alwaysThere -NativeBin 'P:\tb\native\bin'
+    $probe = @($plan.Write | Where-Object { $_.Name -eq 'ffprobe' })
+    (@($plan.Contested).Count -eq 0) -and ($probe.Count -eq 1) -and
+        ($probe[0].Target -like "$gyan\*") -and ($probe[0].Because -eq 'sibling:ffmpeg')
+}
+It 'the sibling rule does NOT fire when the bound target is outside every candidate' {
+    # An ffmpeg.cmd pointing at a chocolatey install is evidence about ffmpeg and about nothing
+    # else. Dragging ffprobe to a winget package because ffmpeg happens to be bound somewhere
+    # would be inventing a decision out of an unrelated fact.
+    $cands = Get-ShimCandidates -PackagesRoot $pkgRoot -Enumerate (New-FakeWalk -Files $ffFiles)
+    $plan = Get-ShimPlan -Candidates $cands -Existing @(New-FakeWrapper -Name 'ffmpeg' -Target 'P:\ProgramData\chocolatey\bin\ffmpeg.exe') `
+        -TargetExists $alwaysThere -NativeBin 'P:\tb\native\bin'
+    @($plan.Contested | Where-Object { $_.Name -eq 'ffprobe' }).Count -eq 1
+}
+It 'a contested name is reported with EVERY candidate and a fix that recommends none of them' {
+    # Naming the first candidate would recommend BtbN for ffmpeg purely because B sorts before
+    # G, and an operator pasting the suggested command would install the wrong ffmpeg on a box
+    # whose own builder declares Gyan.
+    $cands = Get-ShimCandidates -PackagesRoot $pkgRoot -Enumerate (New-FakeWalk -Files $ffFiles)
+    $plan = Get-ShimPlan -Candidates $cands -TargetExists $alwaysThere -NativeBin 'P:\tb\native\bin'
+    $c = @($plan.Contested | Where-Object { $_.Name -eq 'ffmpeg' })[0]
+    (@($c.Candidates).Count -eq 2) -and ($c.Command -match 'BtbN\.FFmpeg\.GPL\.Shared\.7\.1') -and
+        ($c.Command -match 'Gyan\.FFmpeg\.Essentials') -and ($c.Command -match '<prefix>')
+}
+
+Write-Host "`n== editing a raw PATH must not expand it ==" -ForegroundColor Cyan
+
+It 'Remove-PathEntryFromString leaves a %VAR% entry LITERAL, in and out' {
+    # 5 of this box's 43 machine entries are %VAR%-based. Expanding to compare means re-emitting
+    # the expansion, which is the REG_SZ bug by another route: a PATH whose %SystemRoot% has been
+    # baked out works until the day it does not.
+    $raw = '%SystemRoot%\system32;P:\drop\me;%SystemRoot%'
+    $r = Remove-PathEntryFromString -Value $raw -Remove @('P:\drop\me')
+    ($r.Value -eq '%SystemRoot%\system32;%SystemRoot%') -and (@($r.Removed).Count -eq 1) -and
+        ($r.Kept -contains '%SystemRoot%\system32')
+}
+It 'matching ignores ONE trailing backslash and is case-insensitive' {
+    # The registry holds both 'C:\...\Python311\' and 'C:\...\ImageMagick-7.1.2-Q16-HDRI', and an
+    # operator typing the path by hand will not guess which. Only ONE, though: stripping every
+    # trailing slash would equate 'C:\' with 'C:'.
+    $r = Remove-PathEntryFromString -Value 'P:\Keep;P:\Python311\;P:\keep2' -Remove @('p:\PYTHON311')
+    ($r.Value -eq 'P:\Keep;P:\keep2') -and (@($r.Removed).Count -eq 1)
+}
+It 'Test-PathPlanChanged says NO CHANGE for a semantically identical PATH' {
+    # This answer is the elevation gate. A trailing ';' or a regained trailing backslash makes the
+    # two STRINGS differ while the PATH is identical, and comparing strings there drags a pure
+    # shim rebuild - which writes no registry value at all - through a UAC prompt.
+    -not (Test-PathPlanChanged -BeforeMachine @('P:\a', 'P:\b\') -AfterMachine @('P:\A\', 'P:\b') `
+        -BeforeUser @('P:\u') -AfterUser @('P:\u'))
+}
+It 'Test-PathPlanChanged says CHANGED for a reorder, because order IS priority' {
+    # -SyncWindow 0. Order in a PATH decides which of two ffmpegs answers; it is not
+    # presentation, and a reorder that reported "no change" would skip the backup as well.
+    (Test-PathPlanChanged -BeforeMachine @('P:\a', 'P:\b') -AfterMachine @('P:\b', 'P:\a')) -and
+        (Test-PathPlanChanged -BeforeMachine @('P:\a') -AfterMachine @('P:\a', 'P:\c'))
+}
+
+Write-Host "`n== the elevated child must be handed the flags the parent was ==" -ForegroundColor Cyan
+
+$cpPath = Join-Path $repoRoot 'scripts\consolidate-path.ps1'
+$cpAst = [System.Management.Automation.Language.Parser]::ParseFile($cpPath, [ref]$null, [ref]$null)
+$cpParams = @($cpAst.ParamBlock.Parameters)
+$nfAssign = @($cpAst.FindAll({ param($n)
+    ($n -is [System.Management.Automation.Language.AssignmentStatementAst]) -and
+    ($n.Left.Extent.Text -eq '$NeverForward') }, $true))
+$neverForward = @()
+if ($nfAssign.Count -gt 0) {
+    $neverForward = @($nfAssign[0].Right.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { $_.Value })
+}
+
+It 'EVERY parameter consolidate-path.ps1 declares is either forwarded or explicitly excluded' {
+    # THE HIGHEST-RISK LINE IN THE FEATURE, fixed as a CLASS. The old Invoke-SelfElevate
+    # hand-listed the two parameters it forwarded, so a switch added later was dropped in
+    # silence: the parent would report "rebuild only, nothing dropped", raise UAC, and the child
+    # - seeing none of the flags - would run PLAIN consolidation and DROP PATH ENTRIES NOBODY
+    # ASKED IT TO. Values here are built from each parameter's DECLARED TYPE, because that is
+    # what PowerShell actually puts in $PSBoundParameters and a switch takes a different code
+    # path from a string.
+    $bound = @{}
+    foreach ($p in $cpParams) {
+        $n = $p.Name.VariablePath.UserPath
+        $t = if ($p.StaticType) { $p.StaticType.Name } else { 'String' }
+        if ($t -eq 'SwitchParameter') { $bound[$n] = [switch]$true }
+        elseif ($t -eq 'Int32')       { $bound[$n] = 7 }
+        elseif ($t -eq 'String[]')    { $bound[$n] = @('a=b') }
+        else                          { $bound[$n] = 'v' }
+    }
+    $argl = @(Get-SelfElevateArgs -ScriptPath 'P:\repo\scripts\consolidate-path.ps1' -Sid 'S-1-5-21-1' `
+        -TargetMax 3500 -Bound $bound -NeverForward $neverForward)
+    $missing = @($cpParams | ForEach-Object { $_.Name.VariablePath.UserPath } | Where-Object {
+        ($neverForward -notcontains $_) -and ($argl -notcontains ('-' + $_)) })
+    if ($missing.Count) { Write-Host ("       not forwarded and not excluded: " + ($missing -join ', ')) -ForegroundColor DarkYellow }
+    ($cpParams.Count -ge 8) -and ($neverForward.Count -ge 4) -and ($missing.Count -eq 0)
+}
+It 'the script hands Invoke-SelfElevate its OWN $PSBoundParameters' {
+    # Structural, not a grep for the word: the pure forwarder being correct is worth nothing if
+    # the call site passes it nothing. Inside a function $PSBoundParameters is the FUNCTION's own
+    # bound parameters, which is empty here - hence -Bound, and hence this check.
+    $calls = @($cpAst.FindAll({ param($n)
+        ($n -is [System.Management.Automation.Language.CommandAst]) -and
+        ($n.GetCommandName() -eq 'Invoke-SelfElevate') }, $true))
+    $wired = @($calls | Where-Object {
+        $els = @($_.CommandElements)
+        $ok = $false
+        for ($i = 0; $i -lt $els.Count - 1; $i++) {
+            if (($els[$i] -is [System.Management.Automation.Language.CommandParameterAst]) -and
+                ($els[$i].ParameterName -eq 'Bound') -and
+                ($els[$i + 1].Extent.Text -eq '$PSBoundParameters')) { $ok = $true }
+        }
+        $ok
+    })
+    ($calls.Count -ge 1) -and ($wired.Count -eq $calls.Count)
+}
+It 'every forwarded value is QUOTED, and an array survives the hop as one comma-joined argument' {
+    # Start-Process joins -ArgumentList with spaces and does NOT quote for you, so an unquoted
+    # C:\some dir\x.json arrives as two arguments. And MEASURED: powershell.exe -File rejects a
+    # repeated parameter outright ("specified more than once") and does not parse an array
+    # literal either - "a=b","c=d" lands in the child as the single string a=b,c=d. The comma
+    # form is the only one that survives, which is why Get-ShimPickMap splits on commas.
+    $argl = @(Get-SelfElevateArgs -ScriptPath 'P:\my repo\consolidate-path.ps1' -Sid 'S-1' -TargetMax 3500 `
+        -Bound @{ Pick = @('ffmpeg=Gyan', 'ffprobe=Gyan'); FromBackup = 'P:\some dir\b.json' } -NeverForward @())
+    $i = [array]::IndexOf($argl, '-Pick')
+    $map = Get-ShimPickMap -Pick @($argl[$i + 1].Trim('"'))
+    (@($argl | Where-Object { $_ -eq '-Pick' }).Count -eq 1) -and
+        ($argl[$i + 1] -eq '"ffmpeg=Gyan,ffprobe=Gyan"') -and
+        ($argl -contains '"P:\some dir\b.json"') -and
+        ($argl -contains '"P:\my repo\consolidate-path.ps1"') -and
+        ($map.Count -eq 2) -and ($map['ffprobe'] -eq 'Gyan')
+}
+
+Write-Host "`n== PATH hygiene re-measures every precondition ==" -ForegroundColor Cyan
+
+# A filesystem the suite describes. 'P:\shadow' provides exactly what 'P:\jdk\bin' already
+# provides EARLIER, so it is genuinely shadowed; 'P:\scripts' provides one name nothing else does.
+$hygieneFs = {
+    param($Dir)
+    switch (([string]$Dir).TrimEnd('\').ToLowerInvariant()) {
+        'p:\jdk\bin'  { return @('java', 'javac') }
+        'p:\fake\shadow' { return @('java', 'javac') }
+        'p:\scripts'  { return @('pip', 'pip3.11') }
+        'p:\pips'     { return @('pip') }
+        'p:\empty'    { return @() }
+        'p:\dup'      { return @('git') }
+        default       { return @() }
+    }
+}
+$hygieneExpand = { param($s) ([string]$s).Replace('%FAKEVAR%', 'P:\fake') }
+$hygieneMachine = 'P:\jdk\bin;%FAKEVAR%\shadow;P:\empty;P:\pips;P:\scripts'
+$hygieneUser = 'P:\dup'
+function Invoke-Hygiene {
+    param([string]$Json, [string]$Machine = $hygieneMachine, [string]$User = $hygieneUser)
+    Get-PathHygienePlan -Json $Json -MachineRaw $Machine -UserRaw $User -Enumerate $hygieneFs -Expand $hygieneExpand
+}
+$hygEntry = {
+    param($scope, $entry, $require, $extra = '')
+    '{ "scope": "' + $scope + '", "entry": "' + $entry.Replace('\', '\\') + '", "require": "' + $require + '", "reason": "t"' + $extra + ' }'
+}
+
+It 'an entry whose precondition no longer holds is SKIPPED and reported, never removed' {
+    # The whole reason config\path-hygiene.json is re-measured rather than trusted. It is a list
+    # somebody ratified on one particular day; a machine moves. 'P:\dup' is declared as a
+    # cross-scope duplicate, and it is not in the machine hive here - so the user copy is now the
+    # ONLY provider of git, and removing it would take git off the PATH entirely.
+    $json = '{ "schema_version": 1, "entries": [' + (& $hygEntry 'user' 'P:\dup' 'duplicate-in-machine') + '] }'
+    $p = Invoke-Hygiene -Json $json
+    (@($p.RemoveUser).Count -eq 0) -and (@($p.Skipped).Count -eq 1) -and
+        ($p.Skipped[0].Why -match 'machine hive no longer carries')
+}
+It 'the ratified duplicate IS removed once the machine hive really does carry it' {
+    # The positive control. A predicate that skips everything protects nothing and prunes nothing.
+    $json = '{ "schema_version": 1, "entries": [' + (& $hygEntry 'user' 'P:\dup' 'duplicate-in-machine') + '] }'
+    $p = Invoke-Hygiene -Json $json -Machine ($hygieneMachine + ';P:\dup')
+    (@($p.RemoveUser).Count -eq 1) -and (@($p.Skipped).Count -eq 0) -and ($p.NewUser -eq '')
+}
+It 'a %VAR% entry is MEASURED expanded and REMOVED as the raw literal' {
+    # A naive pass over the raw values sees %SystemRoot%\system32 as a directory that does not
+    # exist, and a rule built on that would propose deleting system32. Expand to measure; match
+    # the registry literal to remove, because the literal is the only thing that can be matched
+    # in a value Get-RawPath deliberately did not expand.
+    $json = '{ "schema_version": 1, "entries": [' + (& $hygEntry 'machine' '%FAKEVAR%\shadow' 'shadowed') + '] }'
+    $p = Invoke-Hygiene -Json $json
+    (@($p.RemoveMachine).Count -eq 1) -and ($p.RemoveMachine[0] -eq '%FAKEVAR%\shadow') -and
+        ($p.NewMachine -notmatch 'shadow') -and ($p.NewMachine -notmatch 'FAKEVAR') -and
+        ($p.NewMachine -notmatch 'P:\\fake')
+}
+It 'shadowed REFUSES an entry that still provides a name nothing earlier provides' {
+    # 'P:\scripts' provides pip3.11, and nothing before it does. Removing it on the strength of
+    # "pip is shadowed anyway" is how a PATH loses a version-pinned alias nobody notices for a month.
+    $json = '{ "schema_version": 1, "entries": [' + (& $hygEntry 'machine' 'P:\scripts' 'shadowed') + '] }'
+    $p = Invoke-Hygiene -Json $json
+    (@($p.RemoveMachine).Count -eq 0) -and (@($p.Skipped).Count -eq 1) -and
+        ($p.Skipped[0].Why -match 'pip3\.11')
+}
+It 'and allows it once the loss is DECLARED in expect_unresolved' {
+    # The declaration is the trade being stated out loud - which is what makes the resolution
+    # delta's one remaining line ("pip3.11 no longer resolves") a decision instead of a surprise.
+    $json = '{ "schema_version": 1, "entries": [' + (& $hygEntry 'machine' 'P:\scripts' 'shadowed' ', "expect_unresolved": ["pip3.11"]') + '] }'
+    $p = Invoke-Hygiene -Json $json
+    $gone = @($p.Delta | Where-Object { $_.Change -eq 'unresolved' })
+    (@($p.RemoveMachine).Count -eq 1) -and ($gone.Count -eq 1) -and ($gone[0].Name -eq 'pip3.11')
+}
+It 'no-executables is measured, not assumed' {
+    $json = '{ "schema_version": 1, "entries": [' +
+        (& $hygEntry 'machine' 'P:\empty' 'no-executables') + ',' +
+        (& $hygEntry 'machine' 'P:\jdk\bin' 'no-executables') + '] }'
+    $p = Invoke-Hygiene -Json $json
+    (@($p.RemoveMachine).Count -eq 1) -and ($p.RemoveMachine[0] -eq 'P:\empty') -and
+        (@($p.Skipped | Where-Object { $_.Why -match 'provides 2 executable' }).Count -eq 1)
+}
+It 'the SHIPPED config\path-hygiene.json is accepted and names only machine/user scopes' {
+    # Positive control on the file that actually ships. A validator nothing valid passes is as
+    # useless as one nothing fails, and this config is the input to a machine PATH rewrite.
+    $cfg = Get-Content (Join-Path $repoRoot 'config\path-hygiene.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    $scopes = @(@($cfg.entries | ForEach-Object { $_.scope }) | Select-Object -Unique | Sort-Object)
+    $requires = @(@($cfg.entries | ForEach-Object { $_.require }) | Select-Object -Unique | Sort-Object)
+    ([int]$cfg.schema_version -eq 1) -and (@($cfg.entries).Count -ge 7) -and
+        (($scopes -join ',') -eq 'machine,user') -and
+        (@($requires | Where-Object { @('duplicate-in-machine', 'no-executables', 'shadowed') -notcontains $_ }).Count -eq 0) -and
+        (@($cfg.entries | Where-Object { -not $_.reason }).Count -eq 0)
+}
+It 'a hygiene config with an unknown schema_version is REJECTED' {
+    $rejected = $false
+    try { Invoke-Hygiene -Json '{ "schema_version": 99, "entries": [] }' | Out-Null }
+    catch { $rejected = $_.Exception.Message -match 'schema_version' }
+    $rejected
+}
+
+Write-Host "`n== the persisted shim map is the durable replacement for a lucky backup ==" -ForegroundColor Cyan
+
+It 'the shim map round-trips, carrying the priority order a rebuild needs' {
+    # logs\path-backup-20260909-203021.json is currently the ONLY record anywhere of the 27
+    # packages in resolution order, and it survived by luck. priority_order exists so the next
+    # rebuild does not need luck. Written to native\bin AND to logs\, because the 2026-09-10 case
+    # is precisely the one where native\bin is gone.
+    $cands = Get-ShimCandidates -PackagesRoot $pkgRoot -Enumerate (New-FakeWalk -Files $ffFiles)
+    $plan = Get-ShimPlan -Candidates $cands -TargetExists $alwaysThere -PriorityOrder @($gyan, $btbn) -NativeBin 'P:\tb\native\bin'
+    $doc = New-ShimSourcesDocument -Plan $plan -Mode 'rebuild' -PrioritySource 'test' -PriorityOrder @($gyan, $btbn)
+    $back = Read-ShimSources -Json ($doc | ConvertTo-Json -Depth 6)
+    (@($back.priority_order).Count -eq 2) -and ($back.priority_order[0] -eq $gyan) -and
+        ($back.shims.ffmpeg.chosen_because -eq 'rank:0') -and ($back.shims.ffmpeg.target -like "$gyan\*") -and
+        (@($back.shims.ffmpeg.rivals).Count -eq 1)
+}
+It 'a shim map with an unknown or absent schema_version is REFUSED, not deserialised' {
+    # Same reason Get-Catalog refuses one (lib\catalog.ps1:29-35). A reshaped document parses
+    # perfectly well, every field comes back $null, and the rebuild runs with an empty priority
+    # list - which on this box turns 3 resolved names into 3 contested ones with no error anywhere.
+    $bad = 0
+    foreach ($j in @('{ "schema_version": 99, "priority_order": [] }', '{ "priority_order": [] }')) {
+        try { Read-ShimSources -Json $j | Out-Null } catch { if ($_.Exception.Message -match 'schema_version') { $bad++ } }
+    }
+    $bad -eq 2
+}
+
 if (-not (Assert-SUSuiteFloor -SuiteFile $PSCommandPath -Ran ($script:Pass + $script:Fail))) { $script:Fail++ }
 Show-SUGuardSummary
+
 Write-Host ("`n{0} passed, {1} failed`n" -f $script:Pass, $script:Fail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
 exit $(if ($script:Fail) { 1 } else { 0 })
