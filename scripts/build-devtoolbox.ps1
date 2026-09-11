@@ -235,14 +235,19 @@ function Get-Python311 {
 
     if ($uv) {
         Write-Info "uv python install 3.11 (private, unregistered)"
-        # Out-Null, not 2>&1: uncaptured output inside a function is concatenated into this
-        # function's return value (the trap Invoke-Winget exists for), while redirecting uv's
-        # stderr under 'Stop' would throw on its first progress line. A non-zero exit or a
-        # stderr warning from uv (e.g. its version-link glitch on a first install) is
-        # non-fatal here - the authoritative path comes from 'uv python find' below, whose
-        # single stdout line is captured directly.
-        & $uv python install 3.11 | Out-Null
-        $managed = & $uv python find 3.11 | Select-Object -First 1
+        # Both uv calls go through Invoke-NativeCapture. uv writes progress to STDERR, including
+        # on success ("Installed Python 3.11.15 in 103ms"), and the previous `| Out-Null` here
+        # promoted that success line to a terminating NativeCommandError that failed the whole
+        # build at the first phase. See the note on Invoke-NativeCapture for the measurement.
+        #
+        # A non-zero exit is non-fatal: the usual cause is "already installed". The
+        # authoritative answer is the probe below, not the exit code.
+        $uvInstallPy = Invoke-NativeCapture -Exe $uv -Arguments @("python", "install", "3.11")
+        if ($uvInstallPy.ExitCode -ne 0) {
+            Write-Info "uv python install exited $($uvInstallPy.ExitCode) - probing for the interpreter directly"
+        }
+        $uvFind = Invoke-NativeCapture -Exe $uv -Arguments @("python", "find", "3.11")
+        $managed = @(Select-NativeStdout -Output $uvFind.Output | Select-Object -First 1)[0]
         if (Test-Python311 -Exe $managed) { return $managed }
     }
 
@@ -419,12 +424,52 @@ function Invoke-Winget {
         failure, and for `winget install astral-sh.uv` it usually means "already installed".
     #>
     param([Parameter(Mandatory)][string[]]$WingetArgs)
+    return Invoke-NativeCapture -Exe "winget" -Arguments $WingetArgs
+}
+
+function Invoke-NativeCapture {
+    <#
+        The general form of the trap Invoke-Winget was written for. Run ANY native command with
+        its output captured and its stderr survivable, and return the exit code beside it.
+
+        THE TRIGGER IS THE PIPE, not the redirection. PowerShell turns a native command's stderr
+        into ErrorRecords whenever that command's output flows into another command, and under
+        this file's global $ErrorActionPreference = 'Stop' the first such record is TERMINATING -
+        even when the command succeeded. Measured on 2026-09-11, mid-rebuild:
+
+            & $uv python install 3.11 | Out-Null
+            uv.exe : Installed Python 3.11.15 in 103ms
+            + CategoryInfo : NotSpecified: (Installed Python 3.11.15 in 103ms:String)
+            + FullyQualifiedErrorId : NativeCommandError
+
+        uv reports progress on stderr, so its SUCCESS message killed the build. `| Out-Null` did
+        not merely fail to prevent that, it CAUSED it: the pipe is what promotes stderr to an
+        ErrorRecord. Out-Null solves the different problem of native stdout leaking into a
+        function's return value, and the two are easy to confuse - the comment that used to sit
+        at that call site named the right hazard and drew the wrong conclusion from it.
+
+        An unpiped `& $Python -m pip install ...` is therefore fine as it stands and is left
+        alone; only calls whose output is piped or captured need this.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Exe,
+        [string[]]$Arguments = @()
+    )
     $prev = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        $out = winget @WingetArgs 2>&1
+        $out = & $Exe @Arguments 2>&1
         return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = @($out) }
     } finally { $ErrorActionPreference = $prev }
+}
+
+function Select-NativeStdout {
+    # 2>&1 merges ErrorRecords into the same array, so a caller that wants the command's real
+    # stdout has to drop them. Without this, 'uv python find' returns a progress line as often
+    # as a path.
+    param([object[]]$Output)
+    return @($Output | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } |
+             ForEach-Object { [string]$_ } | Where-Object { $_.Trim() })
 }
 
 function Install-WingetPackage {
@@ -644,7 +689,14 @@ function Install-Ghostscript {
     Get-Download -Url $url -OutFile $download -MinimumBytes 40MB `
         -Sha256 "3A4C28D0AAC47AA7CCCD35A5932C55110376E9DBD966898DDE388B7FABA444A4"
     New-Item -ItemType Directory -Path $dest -Force | Out-Null
-    & $sevenZip x $download "-o$dest" -y | Out-Null
+    # Captured, not `| Out-Null`: same pipe-promotes-stderr trap as the uv call in Get-Python311.
+    # 7z reports "WARNINGS:" and per-file diagnostics on stderr while still extracting and
+    # exiting 0, so the old shape could have failed the build on a successful extraction.
+    $sevenZipRun = Invoke-NativeCapture -Exe $sevenZip -Arguments @("x", $download, "-o$dest", "-y")
+    if ($sevenZipRun.ExitCode -ne 0) {
+        foreach ($line in $sevenZipRun.Output) { Write-Host "    $line" -ForegroundColor DarkGray }
+        Write-Warn "7z exited $($sevenZipRun.ExitCode) extracting Ghostscript - checking for the binaries anyway"
+    }
     foreach ($command in @("gswin64c", "gswin64")) {
         $target = Find-Executable -Name $command
         if ($target) {
