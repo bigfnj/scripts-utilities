@@ -81,7 +81,12 @@ Keep `logs\fresh-workstation` if a step fails.
 
 ## 5. Verify
 
-The runner executes the repository smoke test. Confirm zero failures, then:
+Work the **Go/no-go gate** in [`docs/fresh-workstation-audit.md`](../docs/fresh-workstation-audit.md)
+as the checklist for this section; that document also lists the deliberate limitations (no ARM64,
+no committed Python lock, CUDA 12.8 wheel channel) worth knowing before you retire the old box.
+
+Run `run-gate.ps1`, not `smoke-test.ps1` alone: it runs the smoke test AND every suite, so a smoke
+test that dies early cannot hide a failing suite. Confirm zero failures, then:
 
 ```powershell
 $toolbox = Join-Path $env:LOCALAPPDATA "DevToolbox"

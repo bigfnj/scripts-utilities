@@ -803,7 +803,7 @@ PATH too. Set CODEX_TOOLBOX to override the toolbox root path.
                 Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Sysmon/Operational'; Id=26}
               A mass deletion appears as a BURST of event 26 sharing one Image and
               ProcessGuid - Sysmon fires per file, not per directory.
-              Paired with a 1.5 GB USN journal (fsutil usn queryjournal C:), which records
+              Paired with a 2 GB USN journal (fsutil usn queryjournal C:), which records
               what/when with no agent and survives Sysmon being stopped. Both are checked by
               scripts\smoke-test.ps1, because a sensor nobody verifies stops working quietly.
 

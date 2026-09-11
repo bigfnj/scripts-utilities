@@ -13,6 +13,38 @@ destroys something. Fixed items are struck through with the date.
 
 ---
 
+## Where to pick up - handoff, 2026-09-11
+
+Repo is at `75c32a2`+ on `main`, pushed, tree clean, one worktree, no stray branches. Gate green:
+smoke 74/3/0, core 27, installer 104, render 23, smokelint 18, triage 31. The 3 smoke warnings
+(`cdb`, `poolmon`, the SYSTEM task unreadable unelevated) are expected, not regressions.
+
+**Do this first, and it settles two things at once.** Install the Windows SDK "Debugging Tools for
+Windows" (and the WDK), then `.\bootstrap.ps1 -Only security`. It clears the `cdb` and `poolmon`
+warnings, and because it makes bootstrap actually *install* something it exercises the one
+native-stderr site still marked UNPROVEN: `Install-WingetTool`'s `winget @args` install path.
+Every run so far found every tool already present, so that path has never been provoked. It is the
+most-travelled install path in the repo.
+
+**Then, in rough order of value:**
+
+1. Wire markdownlint into `run-gate.ps1`. `markdownlint-cli` is installed globally and
+   `.markdownlint.json` exists; nothing consumes either except a synthetic `%TEMP%` fixture. Two
+   backlog entries have asked for this.
+2. Fix the `machine-path-pending.txt` writer (see its entry below). Small, and it is a filename
+   that cannot be false.
+3. Move `path-backup-*.json`, `shim-sources.json` and `gate-phases.log` out of `logs/`. They are
+   inputs sitting in a directory whose name invites deletion.
+4. Parameterise the hardcoded `C:` in `modules/security.ps1`'s USN probe.
+
+**Two habits this round paid for, worth keeping.** Reproduce a measurement before recording it:
+five written-down claims failed when probed, including two of my own and one that had the
+native-stderr rule exactly backwards. And provoke each site individually rather than fixing "the
+same shape" in bulk, because winget and fsutil answer on stdout while npm genuinely uses stderr,
+so only one of six sites was an active crash.
+
+---
+
 ## Bugs - HIGH
 
 ### 1. ~~The Sysmon config is hardcoded to one profile name, and `-Verify` says it is fine~~ DONE 2026-09-10
@@ -718,13 +750,42 @@ These are human forensics rather than dead config, and deliberately kept - the s
 recorded at `Add-WinManifest` for `group` and `notes`. Listed so a future audit does not re-raise
 them as dead.
 
-### Orphans
+### ~~Orphans~~ RESOLVED 2026-09-11, both decided rather than deleted
 
-`docs/fresh-workstation-audit.md` has **zero** references anywhere in the repo - no doc, script,
-workflow or test links to it, and it is dated 2026-07-31. `scripts/install-whisper.ps1` is
-referenced only by a table row in `README.md`; no code path invokes it, unlike
-`scripts/install-ghidra.ps1` which is wired into the runner and the security module. Either
-deliberate manual-only tooling or stranded; decide rather than leave it ambiguous.
+`docs/fresh-workstation-audit.md` had zero inbound references. **Not deleted**, because only its
+"Findings resolved" section was historical: the "Remaining deliberate limitations" and the
+Go/no-go gate are still live, and the gate is the natural checklist for
+`tasks/fresh-toolbox-setup.md`. It now carries a dated how-to-read header, its gate step 2 says
+`run-gate.ps1` instead of `smoke-test.ps1`, and `tasks/fresh-toolbox-setup.md` section 5 links to
+it. Deleting a document to clear an orphan warning would have thrown away the content that made
+it worth keeping.
+
+`scripts/install-whisper.ps1` is genuinely manual-only: absent from `catalog.json`, from
+`docs/tools-reference.md`, and from every code path including the GUI, whose prose claims it
+shells out to `install-*.ps1` but in fact hard-codes only `uninstall-toolbox.ps1`. **Kept and
+labelled**: the README layout block now says "manual only; nothing invokes it", which is the
+honest state. Wiring it in as an opt-in switch beside `-InstallGhidra` / `-InstallLlm` is the
+open option if it is ever wanted.
+
+### `consolidate-path.ps1` writes a file whose name asserts the opposite of the truth
+
+`consolidate-path.ps1:535-538` writes `logs/machine-path-pending.txt` on the "Elevation required -
+NOTHING has been changed" branch. Nothing reads it and nothing deletes it, so after the elevated
+child succeeds seconds later the file remains, claiming a PATH change is pending that has already
+been applied. Deleted the stale copy 2026-09-11; the writer is unfixed. It should either remove
+the file after a successful elevated run or be renamed `machine-path-intended-<timestamp>.txt`.
+Same class as the log-line-that-cannot-fail: a filename is an assertion, and this one cannot be
+false.
+
+### `logs/` holds three INPUTS inside an ignored directory, with no stated retention
+
+`path-backup-*.json` is read by `-Restore` and `-FromBackup`, and five separate places in the repo
+record that `path-backup-20260909-203021.json` is the **only surviving record** of the 27-directory
+PATH order from the 2026-09-09 outage. `shim-sources.json` is the shim provenance fallback.
+`gate-phases.log` is the ledger `run-gate.ps1` compares against; delete it and drift detection
+silently restarts with no baseline. All three sit in a gitignored directory that nothing prunes
+and that a "clear the logs" instinct would empty. The README now says so, but the durable fix is
+to move these out of `logs/` into a directory whose name does not invite deletion.
 
 ## Closing the consolidation round, 2026-09-11
 

@@ -2,6 +2,12 @@
 
 Audit date: 2026-07-31
 
+> **How to read this in 2026-09 and later.** "Findings resolved" is a historical record of what
+> shipped on that date and needs no action. The two sections that are still live are **Remaining
+> deliberate limitations** and the **Go/no-go gate** at the end; the gate is the checklist for
+> `tasks/fresh-toolbox-setup.md`. Reviewed 2026-09-11: the limitations all still hold, and step 2
+> of the gate was updated from `smoke-test.ps1` to `run-gate.ps1`, which is now the real gate.
+
 ## Outcome
 
 The repository is ready to be used as the installation source for a new x64
@@ -67,7 +73,8 @@ must still be revalidated by the actual new-machine run.
 Do not retire the old machine until all of the following are true:
 
 1. `fresh-toolbox-setup-runner.ps1` completes successfully.
-2. `scripts/smoke-test.ps1` reports zero failures.
+2. `run-gate.ps1` reports zero failures. It runs the smoke test AND every suite, so a smoke test
+   that dies early cannot hide a failing suite; `smoke-test.ps1` alone is no longer sufficient.
 3. DevToolbox `pip check` reports no broken requirements.
 4. The generated toolbox manifest contains the expected new-machine paths.
 5. Representative Git authentication, secret decryption, and project work are
