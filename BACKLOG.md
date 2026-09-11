@@ -242,7 +242,6 @@ than by running it. Extract them into `ForensicsReport.Core.ps1` alongside the e
 
 ---
 
-
 **Three of these were not what the audit said, and the corrections matter more than the fixes.**
 The half-uninstall item was ALREADY closed by an earlier commit the same day - current behaviour
 was verified (exit 1, zero of three mutation steps reached, with a control proving "zero
@@ -331,9 +330,31 @@ Timed under Windows PowerShell 5.1, which is what the scheduled task runs. Numbe
   another volume, so the deletions fall outside the config's include prefix. Remove that junction
   and the forensics headline becomes pc-maintenance, every week, forever. Make it an explicit
   exclusion or an explicit comment, not an accident.
-- **`bootstrap.ps1:302-307`** says PATH registration is user scope "(never machine)", while
+- ~~**`bootstrap.ps1:302-307`** says PATH registration is user scope "(never machine)", while
   `consolidate-path.ps1` and `smoke-test.ps1:211-212` treat machine scope as the correct end
-  state. Pick one.
+  state. Pick one.~~ **RATIFIED 2026-09-11: machine scope**, for the reason the contradiction
+  existed in the first place — some agent shells inherit the machine PATH only, so a user-scope
+  toolbox is invisible to exactly the audience this repo serves. The live registry had already
+  settled it: `native\bin` and `sysinternals` are in HKLM and absent from HKCU.
+
+  The documented model is now: `bootstrap.ps1` **stages** both entries in the user hive because
+  it runs unelevated by contract, and `scripts/consolidate-path.ps1` — which elevates, backs both
+  hives up and can `-Restore` them — owns the machine write. `smoke-test.ps1:261-263` already
+  encoded that ladder correctly (machine `OK`, user-only `WARN`, absent `FAIL`); only the prose
+  was wrong.
+
+  Two things surfaced while closing it that were not in the original entry:
+
+  - **The contradiction had a functional half, not just a prose half.**
+    `uninstall-toolbox.ps1:167` calls `Remove-UserPathEntry`, which is user-scope only
+    (`lib/common.ps1:72-87` — there was no machine-scope helper in `lib/` at all), for entries
+    that live in HKLM. So the toolbox could not reverse its own PATH side effect. The two dead
+    `DevToolbox\native\bin` and `DevToolbox\sysinternals` entries sitting in the machine PATH
+    after the 2026-09-10 deletion **are** that gap, observed rather than theorised.
+  - **`docs/agent-rules.md`'s prohibition was narrowed, not dropped.** "Never add entries to the
+    system PATH" becomes "never add a *tool-specific* entry by hand; this repo owns exactly two,
+    declared in `catalog.json` and written by one script". A blanket licence to edit the system
+    PATH is not what the ratification buys.
 - **`Write-AgentBlock`** (`lib/common.ps1:430-431`) writes a new `.bak-<timestamp>` every run with
   no pruning; 9+ copies of `AGENTS.md` already sit in the profile root.
 

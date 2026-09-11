@@ -43,7 +43,10 @@ Three design choices exist specifically because the consumer is an agent, not a 
 **Bare-name resolution, no activation.** Agent shells usually do not persist state between
 commands: every tool call is a fresh process, so `activate` in one call is gone by the next. Every
 tool here is callable by name in any new shell because `native\bin` and `sysinternals` are on the
-user PATH and the venv CLIs are wrapped into `native\bin`.
+PATH and the venv CLIs are wrapped into `native\bin`. `bootstrap.ps1` stages those two entries in
+the **user** hive because it runs unelevated by contract;
+[`scripts/consolidate-path.ps1`](scripts/consolidate-path.ps1) then moves them to the **machine**
+hive, which is what makes them visible to the agent shells that inherit the machine PATH only.
 
 **The venv `Scripts` directory is deliberately *not* on PATH.** Exposing a Python 3.11 `python.exe`
 is what trips corporate "unsupported Python" compliance scanners. A bare `python` stays your

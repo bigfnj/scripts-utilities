@@ -226,17 +226,37 @@ When in doubt: if it's a CLI you type by name -> winget here. If it's a Python
 - For machine-scope installers that do not expose their CLI, use the repo's
   `Add-UserPathEntry` helper so the change stays in user scope and is tracked.
 - Never append to `$env:PATH` directly in a script that persists beyond the current session.
-- Never add entries to the **system** PATH (requires elevation and affects all users).
+- **Never add a *tool-specific* entry to the system PATH by hand.** This repo owns exactly
+  **two** machine-scope entries, `native\bin` and `sysinternals`, and nothing else belongs
+  there. They are declared in `catalog.json`, written only by `scripts/consolidate-path.ps1`
+  (which elevates, backs both hives up to `logs/path-backup-*.json` first, and can `-Restore`
+  them verbatim), and reversed by `scripts/uninstall-toolbox.ps1`. Everything else stays user
+  scope via `Add-UserPathEntry`.
+
+  Ratified 2026-09-11, after this document and the code disagreed for weeks. The reason is in
+  *Native HTTPS in agent sandboxes* and *When a tool is missing from PATH* below: **some agent
+  shells inherit the machine PATH only**, and a non-elevated install puts the toolbox in the user
+  PATH, which such a shell cannot see. The toolbox then tells an agent that ~40 tools are on PATH
+  while they are unresolvable — the single failure mode this repo exists to prevent. Two entries
+  machine-wide buy that back; a general licence to edit the system PATH does not, which is why
+  the prohibition is narrowed rather than dropped.
 - The `Sync-EnvPath` helper in `lib/common.ps1` refreshes the current session's
   PATH from the registry after a winget install - use it; do not restart shells
   or start new processes to pick up new tools.
 - **A tool that is "not recognized" is usually present.** See *When a tool is
   missing from PATH* below before installing anything a second time.
-- `bootstrap.ps1` (via `Register-ToolboxUserPath`) persists the durable toolbox
-  layer on the **user** PATH so it resolves by bare name in any new shell without
-  activation: `native\bin` and `sysinternals` (appended last so it never shadows
-  Git/coreutils names). An agent's tool calls do not share session state, so
-  per-session activation alone is not enough.
+- `bootstrap.ps1` (via `Register-ToolboxUserPath`) **stages** the durable toolbox layer on the
+  **user** PATH so it resolves by bare name in any new shell without activation: `native\bin`
+  and `sysinternals` (appended last so it never shadows Git/coreutils names). An agent's tool
+  calls do not share session state, so per-session activation alone is not enough.
+
+  User scope is the staging step, not the end state. `bootstrap.ps1` contracts to run
+  **unelevated**, and a mid-run UAC prompt plus a two-hive PATH write is exactly the shape that
+  destroyed a PATH on 2026-09-09 (see the header of `scripts/consolidate-path.ps1`). So bootstrap
+  writes the hive it can reach, and `scripts/consolidate-path.ps1` — the one script built to do
+  it safely — moves both entries to the machine hive afterwards. `scripts/smoke-test.ps1` already
+  encodes the ladder honestly: machine scope is `OK`, user-only is a `WARN` naming the
+  remediation, absent is a `FAIL`.
 - The venv `Scripts` dir is **not** put on the persistent PATH, because it holds
   `python.exe` and a 3.11 interpreter on PATH trips corporate "old Python"
   compliance scanners. Instead, `New-VenvCliWrappers` wraps each venv console
