@@ -1,0 +1,49 @@
+{
+  "$comment": "Ratified PATH entries that scripts\\consolidate-path.ps1 -Prune may remove. DATA, not code, for the same reason config\\sysmon-filedelete.xml is: the list is a judgement somebody made on one particular day and has to be reviewable without reading PowerShell. Every 'require' predicate is RE-MEASURED at run time by Get-PathHygienePlan (lib\\ShimPlan.ps1); an entry whose precondition no longer holds is SKIPPED and reported, never removed. Entries are written with %VAR% where one exists so the file is not specific to this box: the expanded value is what gets MATCHED, and the raw registry literal is what gets REMOVED. %USERPROFILE% is safe to expand even in the elevated child, because consolidate-path.ps1 refuses to run when the elevated SID differs from the SID that asked (see its -ElevatedFor guard) - so the profile cannot belong to a different administrator.",
+  "schema_version": 1,
+  "entries": [
+    {
+      "scope": "user",
+      "entry": "%LOCALAPPDATA%\\Programs\\Microsoft VS Code\\bin",
+      "require": "duplicate-in-machine",
+      "reason": "Present in BOTH hives, so the user copy contributes nothing to resolution - Windows composes machine-then-user and the machine copy answers first. Removing the machine copy instead would be wrong: some shells inherit the machine PATH only, which is the failure this script was written for."
+    },
+    {
+      "scope": "user",
+      "entry": "%LOCALAPPDATA%\\Programs\\Ollama",
+      "require": "duplicate-in-machine",
+      "reason": "Same cross-scope duplicate. ollama.exe keeps resolving from the machine entry."
+    },
+    {
+      "scope": "user",
+      "entry": "C:\\Anthropic\\.Git\\cmd",
+      "require": "duplicate-in-machine",
+      "reason": "Same cross-scope duplicate. Literal rather than %VAR%-based because C:\\Anthropic is a managed install root with no environment variable pointing at it."
+    },
+    {
+      "scope": "machine",
+      "entry": "%USERPROFILE%\\.dotnet\\tools",
+      "require": "no-executables",
+      "reason": "Zero executables: the directory was emptied by the 2026-09-10 wipe and nothing has re-populated it. A dotnet global tool install would put one back, which is why the predicate is re-measured instead of trusted - the entry earns its place again the moment it holds a tool."
+    },
+    {
+      "scope": "machine",
+      "entry": "%LOCALAPPDATA%\\Programs\\Python\\Python311\\Scripts",
+      "require": "shadowed",
+      "expect_unresolved": ["pip3.11"],
+      "reason": "Provides pip, pip3 and pip3.11. pip and pip3 already resolve to C:\\Anthropic\\.Python3\\Scripts, which is PATH entry 3 and therefore wins today; only the version-pinned pip3.11 alias is lost, and it is declared here so the removal is a stated trade rather than a surprise in the resolution delta. Paired with the entry below to de-shadow the compliance-visible 3.11 interpreter."
+    },
+    {
+      "scope": "machine",
+      "entry": "%LOCALAPPDATA%\\Programs\\Python\\Python311",
+      "require": "shadowed",
+      "reason": "Provides python and pythonw, both of which already resolve to C:\\Anthropic\\.Python3 at PATH entry 4. Taking it off PATH is the point rather than a side effect: a 3.11 interpreter reachable as bare 'python' is what trips compliance scanners, which is the same rule smoke-test.ps1 enforces for the toolbox venv Scripts directory."
+    },
+    {
+      "scope": "machine",
+      "entry": "%ProgramFiles%\\Common Files\\Oracle\\Java\\javapath",
+      "require": "shadowed",
+      "reason": "Provides java, javac, javaw and jshell, every one of which already resolves to the Eclipse Adoptium jdk-21 bin directory at PATH entry 1. Oracle's javapath is a directory of symlinks to whatever the last Oracle JRE installer decided; it wins nothing here and is a second, invisible answer to 'which java'."
+    }
+  ]
+}

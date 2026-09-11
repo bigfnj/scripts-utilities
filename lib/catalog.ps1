@@ -13,7 +13,14 @@ function Get-CatalogPath {
 
 # The only catalog schema this code knows how to read. Bump it here and in
 # catalog.json together, in the same commit that changes the shape.
-$script:CatalogSchemaVersion = 1
+#
+# 1 -> 2 adds side_effects.path_entries_machine_relative. The bump is LOAD-BEARING, not
+# bookkeeping: a version-1 catalog against this code has no such array, so
+# uninstall-toolbox.ps1 would iterate nothing and skip the machine-PATH removal in silence -
+# finishing with "toolbox uninstall complete" while leaving two dead DevToolbox entries in
+# HKLM. That silent-subset failure is the exact thing the check below exists to prevent, so the
+# check only earns its keep if the version actually moves when the shape does.
+$script:CatalogSchemaVersion = 2
 
 function Get-Catalog {
     # Reject a catalog this code cannot read, rather than silently installing a
