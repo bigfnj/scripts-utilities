@@ -192,7 +192,25 @@ function security_install_debugger {
         if ($script:DryRun) {
             Write-Info "[DRY-RUN] wrapper windbg -> $dbg"
         } else {
-            "@echo off`r`n`"$dbg`" %*" | Set-Content -Path (Join-Path $binDir "windbg.cmd") -Encoding ASCII
+            # New-ShimBody (lib\ShimFormat.ps1), not a local string: this module held four of the
+            # seven places that each carried their own copy of the .cmd byte shape, and a wrapper
+            # whose bytes drift stops being readable by the smoke test's stale-shim check - which
+            # then reports every healthy shim as neither stale nor present. (lib\common.ps1 and
+            # scripts\build-devtoolbox.ps1 still hold theirs as of this commit; they are being
+            # converted in parallel.)
+            #
+            # ALREADY IN SCOPE, verified rather than assumed: this file dot-sources nothing, but
+            # bootstrap.ps1:412 dot-sources it into ITS scope, and bootstrap.ps1:27 loaded
+            # lib\common.ps1, which loads lib\ShimFormat.ps1 at :19. Adding a dot-source here
+            # would be a second, divergent load path for the same two functions.
+            #
+            # -NoNewline is load-bearing and is the whole reason the bytes did not move.
+            # New-ShimBody's string already ENDS in CRLF; Set-Content without -NoNewline appends
+            # its own (measured under 5.1: the old  "...%*"  wrote tail 22 20 25 2A 0D 0A), so
+            # dropping it would append a THIRD line. Proven byte-identical on a TEMP fixture for
+            # all four writers, and the live native\bin\windbg.cmd on this box - the only one of
+            # the four whose target is installed - reproduces at 80 B exactly.
+            New-ShimBody -Target $dbg | Set-Content -Path (Join-Path $binDir "windbg.cmd") -Encoding ASCII -NoNewline
             Write-Ok "windbg -> $dbg"
         }
         Sync-EnvPath
@@ -261,7 +279,14 @@ function security_install_ghidra {
                Where-Object { Test-Path (Join-Path $_.FullName "bin\java.exe") } |
                Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty FullName
         if (-not $jdk -and $env:JAVA_HOME -and (Test-Path (Join-Path $env:JAVA_HOME "bin\java.exe"))) { $jdk = $env:JAVA_HOME }
-        $jdkLine = if ($jdk) { "set `"JAVA_HOME=$jdk`"`r`n" } else { "" }
+        # A LIST OF WHOLE LINES now, not a pre-terminated string spliced into the middle of a
+        # format literal. That splice is what made this the only writer whose shape could drift
+        # independently: the CRLF lived in $jdkLine, so the three-line and two-line cases were two
+        # different byte contracts maintained by one expression. New-ShimBody -Prologue exists for
+        # exactly this caller and inserts the line after `@echo off`, never into the target line,
+        # so Get-ShimTarget's "first line that matches" scan keeps finding ghidraRun.bat.
+        # Empty list = the no-JDK branch, which emits the plain two-line wrapper.
+        $jdkPrologue = if ($jdk) { @("set `"JAVA_HOME=$jdk`"") } else { @() }
 
         # Wrap ghidraRun + analyzeHeadless into native\bin so they are on the toolbox
         # PATH (invocable by name, and the smoke test's binary check for ghidraRun passes).
@@ -275,7 +300,11 @@ function security_install_ghidra {
             if ($script:DryRun) {
                 Write-Info "[DRY-RUN] wrapper $name -> $target"
             } else {
-                "@echo off`r`n$jdkLine`"$target`" %*" | Set-Content -Path (Join-Path $binDir "$name.cmd") -Encoding ASCII
+                # -NoNewline: see the note at the windbg writer above. Measured both branches on a
+                # TEMP fixture - 132 B with a JDK, 61 B without - against what the old expression
+                # emitted: identical, byte for byte.
+                New-ShimBody -Target $target -Prologue $jdkPrologue |
+                    Set-Content -Path (Join-Path $binDir "$name.cmd") -Encoding ASCII -NoNewline
                 Write-Ok "$name -> $target"
             }
         }
@@ -386,7 +415,8 @@ function security_wrap_poolmon {
     if ($script:DryRun) {
         Write-Info "[DRY-RUN] wrapper poolmon -> $poolmonPath"
     } else {
-        "@echo off`r`n`"$poolmonPath`" %*" | Set-Content -Path (Join-Path $binDir "poolmon.cmd") -Encoding ASCII
+        # -NoNewline: see the note at the windbg writer. Measured identical at 91 B.
+        New-ShimBody -Target $poolmonPath | Set-Content -Path (Join-Path $binDir "poolmon.cmd") -Encoding ASCII -NoNewline
         Write-Ok "poolmon -> $poolmonPath"
     }
     Sync-EnvPath
@@ -448,7 +478,8 @@ function security_install_console_debuggers {
         if ($script:DryRun) {
             Write-Info "[DRY-RUN] wrapper $tool -> $src"
         } else {
-            "@echo off`r`n`"$src`" %*" | Set-Content -Path (Join-Path $binDir "$tool.cmd") -Encoding ASCII
+            # -NoNewline: see the note at the windbg writer. Measured identical at 78 B for cdb.
+            New-ShimBody -Target $src | Set-Content -Path (Join-Path $binDir "$tool.cmd") -Encoding ASCII -NoNewline
             Write-Ok "$tool -> $src"
         }
     }

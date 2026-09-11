@@ -32,9 +32,10 @@
 
     WHAT IT CANNOT SEE, stated rather than discovered:
       - A child powershell.exe the suite spawns loads its libraries fresh, without this shadow.
-        That is the DOMINANT case here (smoke-test.ps1:498 and run-gate.ps1:79 run every suite as
-        a child), which is why this file is dot-sourced in each of the four suites rather than
-        once in a parent.
+        That is the DOMINANT case here (smoke-test.ps1:663 and run-gate.ps1:186 run every suite as
+        a child), which is why this file is dot-sourced in each of the FIVE suites rather than
+        once in a parent. Both line references were stale by ~160 lines when checked on
+        2026-09-11, pointing at a scriptblock definition and a comment body respectively.
       - Set-Content, Copy-Item, Move-Item, [IO.File]::WriteAllText and
         [Environment]::SetEnvironmentVariable. In this repo the Set-Content path is the BIGGER
         exposure than deletion is: Write-AgentBlock reaches the user's global CLAUDE.md. A
@@ -170,9 +171,22 @@ function Assert-SUSuiteFloor {
         section is otherwise invisible.
 
         ASSUMPTION, and it is a constraint on future test authors: one It call site = one test.
-        True for all four suites today (27/29/31/23 call sites, none inside a loop - the loops live
-        INSIDE It bodies). A future looped It must refactor or change this shape; the failure mode
-        is a confusing floor failure rather than a silent gap.
+        Measured 2026-09-11 across all FIVE suites - core 27, installer 86, render 23, smokelint
+        18, triage 31 - and none of those call sites is inside a LOOP; the loops live INSIDE It
+        bodies. A future looped It must refactor or change this shape; the failure mode is a
+        confusing floor failure rather than a silent gap.
+
+        NESTING IS NOT THE ASSUMPTION, and the distinction matters because four of the installer
+        suite's 86 It calls sit inside `& { }` blocks. FindAll(..., $true) walks the whole tree, so
+        a nested It is counted; it also RUNS, so both sides of the comparison agree and the floor
+        passes at 86/86. That is the check working, not a gap being tolerated.
+
+        The stated numbers were "all four suites (27/29/31/23)" until 2026-09-11 - wrong on the
+        count of suites AND on three of the four figures, in the one comment whose job is to tell
+        a future author what this function assumes about their tests. The FLOOR LOGIC was right
+        throughout: both sides derive from the same file, so nothing here was ever load-bearing on
+        the numbers. A comment that exists to warn and is quietly wrong is worse than no comment,
+        which is why it is a measurement with a date on it now rather than a remembered figure.
     #>
     param(
         [Parameter(Mandatory)][string]$SuiteFile,
@@ -219,7 +233,7 @@ function Show-SUGuardSummary {
 # produced a green run and the control was decorative. A throw is a terminating error that
 # propagates into the caller, aborts it before any It runs, and yields exit 1.
 #
-# The tally line is printed FIRST so run-gate.ps1:83-85 and smoke-test.ps1:499-500 both read a
+# The tally line is printed FIRST so run-gate.ps1:87-91 and smoke-test.ps1:685-686 both read a
 # real failure rather than reporting NO TALLY, which points at the harness instead of the cause.
 if (-not $script:SUTempRoot) {
     Write-Host "  GUARD NOT ARMED: cannot resolve TEMP - $($script:SUDegraded -join '; ')" -ForegroundColor Red
