@@ -22,6 +22,17 @@ logs/
 .env.*
 *.pem
 *.key
+*.pfx
+*.p12
+*.kdbx
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*.age
+# age/sops KEYS, not encrypted output: an .enc.yaml is meant to be committed.
+keys.txt
+age-key.txt
 
 SESSION_LOG*.md
 SESSION_HANDOFF*.md

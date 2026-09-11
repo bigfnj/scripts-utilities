@@ -11,6 +11,32 @@ starting points, not as suspicions to re-litigate.
 Severity is about consequence, not effort. **HIGH** means it silently produces a wrong answer or
 destroys something. Fixed items are struck through with the date.
 
+**Line anchors written before 2026-09-11 are stale; symbol names are not.** A backlog audit that
+day re-derived every reference. The most-edited files moved the most, so resolve an entry by its
+function name and re-grep rather than trusting its `file:line`. Corrections worth carrying:
+`Write-ActivationHelpers` is `build-devtoolbox.ps1:981-1005`; `Install-Tessdata` is `:840-865`;
+`Write-Manifest`/`Run-Smoke` are `:1320`/`:1323`, not `:874`/`:877`; the bootstrap readiness gate
+is `bootstrap.ps1:520-522`; `Get-ForensicsHealth` is `install-deletion-forensics.ps1:160`, and the
+`Copy-Item` that entry 2 cites is gone entirely, replaced by `[IO.File]::WriteAllText` at `:424`;
+`Get-InteractiveUser`/`Get-DownloadsPath` were renamed and moved to
+`ForensicsReport.Core.ps1:205`/`:283` as `Get-FxInteractiveUser`/`Get-FxDownloadsPath`; the
+consolidate-path shim writer moved wholesale into `lib/ShimPlan.ps1` as `Invoke-ShimWrite`
+(`:577-607`); `Write-AgentBlock`'s unpruned `.bak-` write is `lib/common.ps1:690`, and there is a
+**second** one at `:277` in `Remove-AgentBlocks` that no entry mentions.
+
+Three figures in this file were also re-measured and are wrong as written: the `.store\wix\5.0.2`
+damage is **47 files / 19.3 MB**, not 14 / 9.9 MB (the load-bearing half holds - `wix.exe` is
+absent and `~/.nuget/packages/wix` does not exist); the `AGENTS.md` backup accumulation is **26**
+files across the four deploy targets, not "9+"; and the AST rule described as "no native command
+in the builder is piped" is now repo-wide, covers stderr redirection as well, and treats `lib\`
+and `modules\` as exposed. The markdown-lint finding appears **twice** with contradictory status -
+the later entry is right, `markdownlint BACKLOG.md` exits 0, and only the CI wiring is missing.
+
+One method note that cost the audit a wrong answer first: `Get-ScheduledTask` silently omits
+ACL-restricted tasks and reported both `\PcMaintenance` and `\DeletionForensicsReport` as absent.
+`schtasks /query /tn` distinguishes them - "cannot find the file specified" is real absence,
+"Access is denied" is presence under a restrictive ACL.
+
 ---
 
 ## Where to pick up - handoff, 2026-09-11
@@ -276,10 +302,17 @@ than by running it. Extract them into `ForensicsReport.Core.ps1` alongside the e
 - **`consolidate-path.ps1:241-245` overwrites `native\bin\<name>.cmd` unconditionally**, so a
   winget package shipping `ffmpeg.exe` silently replaces the toolbox's own shim - the comment at
   `:185-188` claims the opposite.
-- **The deployed agent block is one section stale** (`lib/common.ps1:538-549`): the generator now
+- ~~**The deployed agent block is one section stale** (`lib/common.ps1:538-549`): the generator now
   emits a Sysmon/deletion-forensics paragraph the four deployed `CLAUDE.md`/`AGENTS.md` copies do
-  not have, and nothing verifies deployed against generator - the gap pc-maintenance's
-  `Invoke-DeploymentSmoke.ps1` exists to close for its own payload.
+  not have, and nothing verifies deployed against generator.~~ DONE - **both halves are false as of
+  2026-09-11.** All four targets MATCH the generator (verified with the repo's own
+  `lib/AgentDiscovery.ps1` extractor), and `scripts/smoke-test.ps1:337-400` now compares deployed
+  against generated with three verdicts and FAILs on drift. That check earned its keep the same
+  day: a one-word edit to the template (1.5 GB -> 2 GB) failed the gate on all four targets until
+  they were regenerated. Current anchor for the paragraph is `lib/common.ps1:797-807`.
+  Code-side follow-up, still open: `lib/AgentDiscovery.ps1:6-9` and `scripts/smoke-test.ps1:337-339`
+  both cite "BACKLOG.md:242-245" and "lib\common.ps1:564-575" and both still assert the deployed
+  copies lack the paragraph. All four of those references are now wrong.
 - ~~**`fresh-toolbox-setup-runner.ps1:62-68, 87`** reads a leaked `$LASTEXITCODE` as bootstrap's
   status (bootstrap has no trailing `exit`). It now also needs to handle
   `consolidate-path.ps1` exit **2** (elevation declined), added 2026-09-10.~~ DONE 2026-09-10
@@ -396,8 +429,10 @@ name including `.xml`/`.json`/`.psd1`/`.md`.
   `smoke-test.ps1:243-248` treat as a FAIL condition. Delete them or fix them.
 - `lib/common.ps1:202-208` - the doc block describing venv-CLI wrapping sits above
   `Set-NodeSystemCaBundle`; the function it documents (`New-VenvCliWrappers`, `:252`) has none.
-- `build-devtoolbox.ps1:738` writes `wrapper_exists = $true` as a literal inside the loop that
-  enumerates existing wrappers - it restates the loop's precondition and reads as a result.
+- ~~`build-devtoolbox.ps1:738` writes `wrapper_exists = $true` as a literal inside the loop that
+  enumerates existing wrappers - it restates the loop's precondition and reads as a result.~~
+  GONE 2026-09-11: `wrapper_exists` no longer appears in any `.ps1` in the repo. The only
+  remaining occurrence in the tree was this backlog line describing it.
 
 ---
 
@@ -479,7 +514,11 @@ Timed under Windows PowerShell 5.1, which is what the scheduled task runs. Numbe
   - **The contradiction had a functional half, not just a prose half.**
     `uninstall-toolbox.ps1:167` calls `Remove-UserPathEntry`, which is user-scope only
     (`lib/common.ps1:72-87` — there was no machine-scope helper in `lib/` at all), for entries
-    that live in HKLM. So the toolbox could not reverse its own PATH side effect. The two dead
+    that live in HKLM. So the toolbox could not reverse its own PATH side effect.
+    **CLOSED, re-checked 2026-09-11:** `Remove-MachinePathEntry` now exists at `lib/common.ps1:228`
+    returning `Removed` / `NotPresent` / `DryRun` / `NeedsElevation`, and
+    `scripts/uninstall-toolbox.ps1:244` calls it and handles `NeedsElevation`. The `:167` anchor
+    above is now `:244`, and `lib/common.ps1:72-87` is now `Remove-UserPathEntry` at `:188-227`. The two dead
     `DevToolbox\native\bin` and `DevToolbox\sysinternals` entries sitting in the machine PATH
     after the 2026-09-10 deletion **are** that gap, observed rather than theorised.
   - **`docs/agent-rules.md`'s prohibition was narrowed, not dropped.** "Never add entries to the
@@ -631,8 +670,20 @@ it as a child process starting at `Continue`. A rule that has to be argued away 
 
 Counted rather than assumed: **7 definitions, 3 distinct bodies**. Five are byte-identical after
 stripping comment help; `install-deletion-forensics.ps1` adds a `-PassThru` parameter and
-`New-ForensicsReport.ps1` is a third variant. Four of the seven are in scripts that dot-source no
-library at all, so a local copy is the only option.
+`New-ForensicsReport.ps1` is a third variant. **Three** of the seven are in scripts that
+dot-source no library at all, so a local copy is the only option there:
+`scripts/install-ghidra.ps1:43`, `scripts/install-whisper.ps1:50`,
+`scripts/New-ForensicsReport.ps1:69`. (This paragraph said "four" when first written on
+2026-09-11 and was corrected the same day by a backlog audit.)
+
+**The fourth is the dangerous one, and counting it as justified hid that.**
+`scripts/install-deletion-forensics.ps1` dot-sources `lib/common.ps1` at `:89` and then defines
+its own `Invoke-Native` at `:106`, which **shadows the library copy with a different return
+contract**: `lib/common.ps1:90` always returns `@{ExitCode; Output}`, while the local one returns
+a bare exit code unless `-PassThru` is passed. The two are not interchangeable, so deleting the
+local definition as "redundant" would silently change the value every call site in that file
+reads. Either rename it, or give the shared one the `-PassThru` behaviour and delete the local -
+but do not treat it as the same tidy-up as the uninstaller's byte-identical copy.
 
 Only `uninstall-toolbox.ps1:49` is strictly redundant - it dot-sources `lib/common.ps1` fourteen
 lines earlier and then defines an identical body. **Left deliberately**: its comment-based help is
@@ -839,6 +890,10 @@ place to look, not a result to cite.** Reproduce before recording.
 
 ## Deferred
 
-- Find a supported install channel for watchexec on Windows. It is not currently available in winget.
+- ~~Find a supported install channel for watchexec on Windows. It is not currently available in
+  winget.~~ **The premise is false as of 2026-09-11:** `winget search watchexec` returns
+  `watchexec.watchexec` 2.7.0 from the `winget` source. The exact-id lookup only failed because
+  the id is `watchexec.watchexec`, not `watchexec`. This is no longer research; it is a
+  `catalog.json` entry whenever somebody wants the tool.
 - Add native Windows ARM64 support; the current builder and optional JDK/Ghidra path target x64 Windows.
 - Evaluate a tested Python constraints/lock strategy without preventing routine security updates.
