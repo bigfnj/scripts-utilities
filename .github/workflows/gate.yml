@@ -70,6 +70,15 @@ jobs:
           .\tests\Invoke-RenderTests.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # lib\SmokeLint.ps1 holds the rules that keep scripts\smoke-test.ps1's own checks capable of
+      # failing. The script itself is deliberately not run here (see the header); its RULES depend
+      # on nothing outside the repository, so they are checked here like everything else.
+      - name: SmokeLint suite
+        shell: powershell
+        run: |
+          .\tests\Invoke-SmokeLintTests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Every script parses under 5.1
         shell: powershell
         run: |
@@ -99,3 +108,48 @@ jobs:
             exit 1
           }
           "all $($onDisk.Count) suite(s) are wired into CI"
+
+      # ORDER, NOT PRESENCE - and the difference is the whole check.
+      #
+      # tests\SUTestGuard.ps1 defines a Remove-Item shadow, and a function shadows the cmdlet only
+      # for code that runs AFTER the definition. Dot-source it BELOW lib\common.ps1 and
+      # common.ps1's own load has already bound the real cmdlet; in Invoke-InstallerTests.ps1 that
+      # is the one-line margin SUTestGuard.ps1:19-24 describes, where three Remove-Item calls
+      # reach the repository's own manifest\tools.json. The guard would still be in the file, the
+      # arm-time control would still print "ARMED", and the exposure would be back.
+      #
+      # `(Get-Content $f) -match 'SUTestGuard'` passes with the dot-source sitting anywhere,
+      # including last - so it asserts the STATEMENT EXISTS rather than the CONDITION holding,
+      # which is the lazy shape this repository's standing rule forbids. Taking the FIRST
+      # dot-source out of the AST and checking what it loads asserts the order instead.
+      #
+      # The invocation OPERATOR is what identifies a dot-source, not the command name:
+      # `. (Join-Path $PSScriptRoot 'SUTestGuard.ps1')` has no command name at all - its first
+      # element is a parenthesised expression - so GetCommandName() returns nothing here.
+      - name: The deletion guard is the first dot-source in every suite
+        shell: powershell
+        run: |
+          $bad = 0
+          foreach ($f in Get-ChildItem .\tests -Filter 'Invoke-*Tests.ps1') {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+            $dots = @($ast.FindAll({ param($n)
+              $n -is [System.Management.Automation.Language.CommandAst] -and
+              $n.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Dot }, $true) |
+              Sort-Object { $_.Extent.StartOffset })
+            if ($dots.Count -eq 0) {
+              Write-Host ("FAIL {0}: no dot-source at all, so tests\SUTestGuard.ps1 is never loaded" -f $f.Name)
+              $bad++
+              continue
+            }
+            $first = $dots[0]
+            $text = $first.Extent.Text.Trim()
+            if ($text -notmatch 'SUTestGuard\.ps1[''"]?\s*\)?\s*$') {
+              Write-Host ("FAIL {0}:{1}: the first dot-source loads {2} - tests\SUTestGuard.ps1 must come before it" -f `
+                $f.Name, $first.Extent.StartLineNumber, $text)
+              $bad++
+            } else {
+              Write-Host ("ok   {0}:{1} loads the guard first" -f $f.Name, $first.Extent.StartLineNumber)
+            }
+          }
+          if ($bad) { exit 1 }
+          "the deletion guard is the first dot-source in every suite"

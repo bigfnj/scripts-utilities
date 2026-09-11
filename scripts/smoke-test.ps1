@@ -313,6 +313,94 @@ if (Test-Path $tbRoot) {
     Test-Warn "DevToolbox not found at $tbRoot - skipping PATH readiness checks"
 }
 
+# -- Agent discovery blocks ----------------------------------------------------
+# BACKLOG.md:242-245 records this gap: the generator gained a Sysmon/deletion-forensics paragraph
+# (lib\common.ps1:564-575) that none of the four deployed CLAUDE.md/AGENTS.md copies has, and
+# "nothing verifies deployed against generator". README.md:261 meanwhile already tells the reader
+# that this gate exercises the agent-discovery blocks. It did not. This is the missing half, so
+# that sentence becomes true rather than being deleted.
+#
+# READ ONLY BY CONSTRUCTION, not by promise. lib\AgentDiscovery.ps1 parses common.ps1 and
+# evaluates only the ASSIGNMENT statements out of Write-AgentDiscovery, so Write-AgentBlock -
+# which overwrites four real files in the user's profile - is not present in what runs. Neither
+# writer is ever called from here. A check that writes what it is checking cannot fail.
+#
+# THREE VERDICTS PER FILE, never one. A block can be a faithful render of an older generator and
+# still name a live checkout, or look current and point at a directory that has been deleted.
+# One boolean covering all three is the exact shape that let a Sysmon config naming a nonexistent
+# profile pass as healthy for a year - see the note at :454-456 below.
+Test-Hdr "agent discovery blocks"
+. (Join-Path $REPO_ROOT (Join-Path 'lib' 'AgentDiscovery.ps1'))
+$adGen = Get-AgentDiscoveryBody -CommonPath (Join-Path $REPO_ROOT (Join-Path 'lib' 'common.ps1')) `
+                                -RepoRoot $REPO_ROOT
+$adRegime = 'NO REFERENCE'
+$adTally  = 'the generator could not be read'
+if ($adGen.Reason) {
+    # No reference means no verdict, and that is a FAILURE rather than a skip. A check that
+    # cannot reach the thing it compares against and says nothing is how this file came to claim
+    # six safeties it had never tested.
+    Test-Fail "cannot reach the generator, so nothing can be compared: $($adGen.Reason)"
+} else {
+    $adPresent = @()
+    $adMissing = @()
+    foreach ($adTarget in $adGen.Targets) {
+        if ($null -eq (Get-AgentBlockText -Path $adTarget -Marker $adGen.Marker)) { $adMissing += $adTarget }
+        else { $adPresent += $adTarget }
+    }
+
+    $adRegime =
+        if ($adPresent.Count -eq 0)                        { 'NOT DEPLOYED' }
+        elseif ($adPresent.Count -lt $adGen.Targets.Count) { 'PARTIAL' }
+        else                                               { 'DEPLOYED' }
+    $adTally = "$($adPresent.Count) of $($adGen.Targets.Count) target(s) carry the $($adGen.Marker) block"
+
+    if ($adRegime -eq 'NOT DEPLOYED') {
+        # Nothing deployed anywhere is ONE warning. %LOCALAPPDATA%\DevToolbox was deleted on
+        # 2026-09-10 and this box is mid-rebuild, so a clean machine that has not run bootstrap
+        # yet is a known state with a one-line fix - four failures would just be noise pointing
+        # at the same sentence.
+        Test-Warn "no agent blocks deployed to any of $($adGen.Targets.Count) target(s) - run .\bootstrap.ps1"
+    } else {
+        # PARTIAL is a DEFECT, and it is the reason absence and partial-deployment are separated.
+        # Three files carrying the block and a fourth not means exactly one agent host is working
+        # from nothing, and the state is invisible to anyone who opens the file they happen to
+        # use. Per missing file, by name.
+        foreach ($adTarget in $adMissing) {
+            Test-Fail "agent block missing from $adTarget while $($adPresent.Count) sibling target(s) carry it - partial deployment (re-run .\bootstrap.ps1)"
+        }
+        foreach ($adTarget in $adPresent) {
+            $adBlock = Get-AgentBlockText -Path $adTarget -Marker $adGen.Marker
+            Test-Ok "$adTarget carries the $($adGen.Marker) block"
+
+            if ((ConvertTo-AgentBlockComparable $adBlock) -eq (ConvertTo-AgentBlockComparable $adGen.Body)) {
+                Test-Ok "$adTarget matches what the generator would write"
+            } else {
+                Test-Fail ("{0} is STALE - {1} (re-run .\bootstrap.ps1)" -f `
+                    $adTarget, (Get-AgentBlockDrift -Deployed $adBlock -Generated $adGen.Body))
+            }
+
+            # A SEPARATE fact, and the one that survives when the comparison above fails: does
+            # the block point at a checkout that still exists? "This exact checkout" is
+            # deliberately NOT the test - three git worktrees of this repo are open on this box
+            # right now, and a gate that fails whenever you run it from one gets switched off.
+            $adManagedBy = Get-AgentBlockManagedBy $adBlock
+            if (-not $adManagedBy) {
+                Test-Fail "$adTarget has no 'Managed by:' line - the block cannot say which checkout produced it"
+            } elseif (-not (Test-AgentBlockRepoRoot $adManagedBy)) {
+                Test-Fail "$adTarget names '$adManagedBy' as its checkout, which no longer holds this repo - re-run .\bootstrap.ps1 from the one that does"
+            } elseif ($adManagedBy.TrimEnd('\') -ieq $REPO_ROOT.TrimEnd('\')) {
+                Test-Ok "$adTarget names this checkout"
+            } else {
+                Test-Ok "$adTarget names a live checkout of this repo ($adManagedBy), not the one running this gate"
+            }
+        }
+    }
+}
+# UNCONDITIONAL, on every path including the no-reference one. Without it the group reads exactly
+# the same whether it asserted twelve facts or skipped all of them, which is the "reported a
+# safety it had never checked" failure this file was built out of.
+Write-Host ("  regime: {0} - {1}" -f $adRegime, $adTally) -ForegroundColor DarkGray
+
 # -- Deletion forensics --------------------------------------------------------
 # Optional sensors, so absence is a WARN not a FAIL. Degradation, however, is a FAIL:
 # a sensor that is installed but not actually capturing is worse than one that is absent,
@@ -440,40 +528,39 @@ if ($fxFiles.Count) {
 
 # Every check in THIS file must be capable of failing.
 #
-# Six checks here wrapped a native command in try/catch and called Test-Ok unconditionally. A
-# native command that runs and exits non-zero raises no PowerShell exception, so the catch only
-# fires when the process cannot start - meaning those checks could not fail for the thing they
-# claimed to test. Measured: a shim printing a plausible version banner and exiting 3 was
-# reported "OK".
+# THE RULES NOW LIVE IN lib\SmokeLint.ps1, and they moved for one reason: as an inline
+# scriptblock here they were untestable. No test file anywhere referenced smoke-test.ps1 and
+# gate.yml deliberately does not run it (gate.yml:16-20), so DELETING this lint failed nothing -
+# a rule nobody can break on purpose is a rule nobody knows works. tests\Invoke-SmokeLintTests.ps1
+# now breaks both rules on fixtures, and just as importantly holds the false-positive controls.
+# Rule A (a verdict no failure can reach) and rule B (an exit-code check that -First corrupts)
+# are documented there, with the measurements.
 #
-# The rule targets the exact defect shape: a try block that RENDERS A VERDICT (calls Test-Ok)
-# without inspecting an exit code or comparing anything. Such a block reaches Test-Ok on every
-# path where the process started at all.
-#
-# A try that only GATHERS is explicitly fine, and the first draft of this lint was wrong to
-# flag it. The SysmonDrv and USN checks below read a native command inside a try and decide
-# outside it, with an explicit warn-on-unreadable branch - that is a better pattern than the
-# one being outlawed, not a worse one, and a lint that cried wolf about it would be turned off
-# within a week.
-$selfLint = {
-    param($File)
-    $ast = [System.Management.Automation.Language.Parser]::ParseFile($File, [ref]$null, [ref]$null)
-    $tries = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TryStatementAst] }, $true)
-    $bad = @()
-    foreach ($t in $tries) {
-        $body = $t.Body.Extent.Text
-        if ($body -notmatch '\bTest-Ok\b') { continue }          # gathers only; verdict is elsewhere
-        $hasExit = $body -match '\$LASTEXITCODE'
-        $hasCompare = $body -match '\s-(eq|ne|match|notmatch|like|notlike|gt|lt|ge|le|contains|in|is)\s'
-        if (-not ($hasExit -or $hasCompare)) { $bad += $t.Extent.StartLineNumber }
-    }
-    ($bad -join ',')
-}
-$lintOut = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -Command $selfLint -Args $PSCommandPath 2>&1 | Out-String).Trim()
-if ($lintOut) {
-    Test-Fail ("try block(s) at line(s) $lintOut check neither an exit code nor a comparison, so they cannot fail")
+# STILL A CHILD powershell.exe, for the reason the parse gate above gives and one more of its
+# own: rule B decides "cmdlet or native application" via Get-Command, and the cmdlet inventory
+# differs between 5.1 and 7 - Get-WmiObject exists in one and not the other. Answering that
+# question under the wrong host gives the wrong answer about the host that matters.
+$smokeLintLib = Join-Path $REPO_ROOT (Join-Path 'lib' 'SmokeLint.ps1')
+if (-not (Test-Path -LiteralPath $smokeLintLib)) {
+    Test-Fail 'missing lib\SmokeLint.ps1 - the self-lint has no rules to run'
 } else {
-    Test-Ok "every try block in this file inspects an exit code or compares a result"
+    $selfLint = {
+        param($LibPath, $File)
+        . $LibPath
+        $findings = @(Get-SmokeLintFindings -Path $File)
+        # Message last, and split with a limit of 3 on the way back: the messages contain pipes.
+        ($findings | ForEach-Object { '{0}|{1}|{2}' -f $_.Line, $_.Rule, $_.Message }) -join "`n"
+    }
+    $lintOut = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -Command $selfLint `
+                    -Args $smokeLintLib, $PSCommandPath 2>&1 | Out-String).Trim()
+    if ($lintOut) {
+        foreach ($lintLine in ($lintOut -split "`r?`n")) {
+            $lintParts = $lintLine -split '\|', 3
+            Test-Fail ("self-lint rule {0} at line {1}: {2}" -f $lintParts[1], $lintParts[0], $lintParts[2])
+        }
+    } else {
+        Test-Ok "self-lint: no rule A or B violation in $(Split-Path $PSCommandPath -Leaf)"
+    }
 }
 
 # The forensics report's own suites. Both run WITHOUT Ollama and without reading the real
@@ -486,21 +573,75 @@ if ($lintOut) {
 # a path with a literal TAB in it - so it reported "suite not found", stayed green, and verified
 # nothing for as long as that went unnoticed. A gate that passes when its tests have vanished is
 # not a gate.
-foreach ($suite in @(
-    @{ Name = 'core';      File = 'tests\Invoke-CoreTests.ps1' },
-    @{ Name = 'installer'; File = 'tests\Invoke-InstallerTests.ps1' },
-    @{ Name = 'triage';    File = 'tests\Invoke-TriageTests.ps1' },
-    @{ Name = 'render';    File = 'tests\Invoke-RenderTests.ps1' }
-)) {
-    $sPath = Join-Path $REPO_ROOT $suite.File
-    if (-not (Test-Path -LiteralPath $sPath)) { Test-Fail "$($suite.Name) test suite missing: $($suite.File)"; continue }
+#
+# THE LIST THAT RUNS COMES FROM DISK. gate.yml:97-110 guards its own hand-maintained suite list
+# because "a suite added to tests\ but not to this file would be silently uncovered while looking
+# covered" - and this file held the unguarded twin of exactly that list, so the local gate had
+# the defect CI had already fixed. Enumerating tests\ deletes the class rather than detecting it:
+# a new suite is run the moment it exists.
+#
+# $suiteRequired stays, and it is a FLOOR, nothing more. Enumeration cannot notice a suite that
+# was DELETED, which is the failure rule 1 of run-gate.ps1's header exists for. Its blind spot is
+# the same as gate.yml's and is stated rather than discovered: one commit that removes a suite
+# AND drops it from this list fires nothing.
+$suiteRequired = @('Invoke-CoreTests.ps1', 'Invoke-InstallerTests.ps1',
+                   'Invoke-TriageTests.ps1', 'Invoke-RenderTests.ps1')
+$suiteFiles = @(Get-ChildItem -LiteralPath (Join-Path $REPO_ROOT 'tests') -Filter 'Invoke-*Tests.ps1' `
+                    -File -ErrorAction SilentlyContinue | Sort-Object Name)
+foreach ($suiteReq in $suiteRequired) {
+    if (@($suiteFiles | ForEach-Object { $_.Name }) -notcontains $suiteReq) {
+        Test-Fail "test suite missing: tests\$suiteReq"
+    }
+}
+$suiteRan = @()
+foreach ($suiteFile in $suiteFiles) {
+    # Invoke-CoreTests.ps1 -> core. run-gate.ps1:156 greps the "<name> suite: N passed" line this
+    # produces, so the derivation has to be the one place it happens.
+    $sName = ($suiteFile.BaseName -replace '^Invoke-', '' -replace 'Tests$', '').ToLowerInvariant()
     # powershell.exe explicitly: the scheduled task runs 5.1, so the suites must pass there.
-    $tOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $sPath 2>&1 | Out-String
-    $tLine = ($tOut -split "`r?`n" | Where-Object { $_ -match 'passed,.*failed' } | Select-Object -Last 1)
+    $tOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $suiteFile.FullName 2>&1 | Out-String
+    $tLines = $tOut -split "`r?`n"
+    $suiteRan += $suiteFile.Name
+
+    # GUARD LIVENESS, asserted from the PARENT. tests\SUTestGuard.ps1:33-37 states its own blind
+    # spot: it cannot see into a child powershell.exe, and every suite here IS a child. So it
+    # announces "tripwire ARMED" on every run (SUTestGuard.ps1:232-233) precisely so the parent
+    # can confirm from outside what the child cannot confirm about itself.
+    #
+    # This is strictly stronger than grepping the suite's source for "SUTestGuard": it catches the
+    # dot-source being deleted, the file being no-op'd, AND the arm-time control failing to arm.
+    # A source check catches only the first, and CI already owns that half (the dot-source-order
+    # step there checks placement, which this cannot see).
+    #
+    # SEPARATE from the tally, because a suite can be fully green and completely unguarded. One
+    # boolean for two facts is the defect at :454-456, one file over.
+    if (@($tLines | Where-Object { $_ -match 'tripwire ARMED' }).Count -gt 0) {
+        Test-Ok "$sName suite ran with the deletion tripwire ARMED"
+    } else {
+        Test-Fail "$sName suite printed no 'tripwire ARMED' - tests\SUTestGuard.ps1 was not dot-sourced first, or did not arm"
+    }
+
+    $tLine = ($tLines | Where-Object { $_ -match 'passed,.*failed' } | Select-Object -Last 1)
     if ($tLine -match '(\d+) passed, (\d+) failed') {
-        if ([int]$Matches[2] -eq 0) { Test-Ok "$($suite.Name) suite: $($Matches[1]) passed" }
-        else { Test-Fail "$($suite.Name) suite: $($Matches[2]) failed" }
-    } else { Test-Fail "$($suite.Name) suite produced no tally" }
+        $tPass = [int]$Matches[1]; $tFail = [int]$Matches[2]
+        if ($tFail -gt 0) { Test-Fail "$sName suite: $tFail failed" }
+        # "0 passed, 0 failed" used to take the Test-Ok branch. An emptied file, a section that
+        # stopped running, and a suite aborted before its first It all print exactly that, and
+        # reading it as green is the outer half of the hole SUTestGuard.ps1:158-160 describes -
+        # its own AST floor covers the inside of a suite, this covers a suite that produced
+        # nothing at all.
+        elseif ($tPass -eq 0) { Test-Fail "$sName suite reported 0 passed, 0 failed - an emptied or aborted suite is not a pass" }
+        else { Test-Ok "$sName suite: $tPass passed" }
+    } else { Test-Fail "$sName suite produced no tally" }
+}
+# Did the loop reach every file it enumerated? This is the one thing the from-disk derivation
+# cannot establish about itself - an added `continue`, or a filter that stops matching, skips a
+# suite while the enumeration above still counts it.
+$suiteSkipped = @($suiteFiles | Where-Object { $suiteRan -notcontains $_.Name })
+if ($suiteSkipped.Count) {
+    foreach ($sk in $suiteSkipped) { Test-Fail "suite enumerated in tests\ but never run: $($sk.Name)" }
+} else {
+    Test-Ok "all $($suiteFiles.Count) suite(s) found in tests\ ran"
 }
 
 # -- Catalog integrity ---------------------------------------------------------
