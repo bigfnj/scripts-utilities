@@ -50,25 +50,49 @@ jobs:
         shell: powershell
         run: |
           .\tests\Invoke-CoreTests.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # $LASTEXITCODE is UNDEFINED at the start of a step, so `-ne 0` is TRUE and
+          # `exit $null` yields exit code 0 - the old guard here took its FAILURE branch and
+          # exited GREEN. Measured 2026-09-11. It was harmless only by accident, because every
+          # suite ends in an explicit `exit`. Bind the value first so the check is real.
+          $code = $LASTEXITCODE
+          if ($null -eq $code) { Write-Host 'FAIL suite set no exit code'; exit 1 }
+          if ($code -ne 0) { exit $code }
 
       - name: Installer suite
         shell: powershell
         run: |
           .\tests\Invoke-InstallerTests.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # $LASTEXITCODE is UNDEFINED at the start of a step, so `-ne 0` is TRUE and
+          # `exit $null` yields exit code 0 - the old guard here took its FAILURE branch and
+          # exited GREEN. Measured 2026-09-11. It was harmless only by accident, because every
+          # suite ends in an explicit `exit`. Bind the value first so the check is real.
+          $code = $LASTEXITCODE
+          if ($null -eq $code) { Write-Host 'FAIL suite set no exit code'; exit 1 }
+          if ($code -ne 0) { exit $code }
 
       - name: Triage suite
         shell: powershell
         run: |
           .\tests\Invoke-TriageTests.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # $LASTEXITCODE is UNDEFINED at the start of a step, so `-ne 0` is TRUE and
+          # `exit $null` yields exit code 0 - the old guard here took its FAILURE branch and
+          # exited GREEN. Measured 2026-09-11. It was harmless only by accident, because every
+          # suite ends in an explicit `exit`. Bind the value first so the check is real.
+          $code = $LASTEXITCODE
+          if ($null -eq $code) { Write-Host 'FAIL suite set no exit code'; exit 1 }
+          if ($code -ne 0) { exit $code }
 
       - name: Render suite
         shell: powershell
         run: |
           .\tests\Invoke-RenderTests.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # $LASTEXITCODE is UNDEFINED at the start of a step, so `-ne 0` is TRUE and
+          # `exit $null` yields exit code 0 - the old guard here took its FAILURE branch and
+          # exited GREEN. Measured 2026-09-11. It was harmless only by accident, because every
+          # suite ends in an explicit `exit`. Bind the value first so the check is real.
+          $code = $LASTEXITCODE
+          if ($null -eq $code) { Write-Host 'FAIL suite set no exit code'; exit 1 }
+          if ($code -ne 0) { exit $code }
 
       # lib\SmokeLint.ps1 holds the rules that keep scripts\smoke-test.ps1's own checks capable of
       # failing. The script itself is deliberately not run here (see the header); its RULES depend
@@ -77,13 +101,21 @@ jobs:
         shell: powershell
         run: |
           .\tests\Invoke-SmokeLintTests.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # $LASTEXITCODE is UNDEFINED at the start of a step, so `-ne 0` is TRUE and
+          # `exit $null` yields exit code 0 - the old guard here took its FAILURE branch and
+          # exited GREEN. Measured 2026-09-11. It was harmless only by accident, because every
+          # suite ends in an explicit `exit`. Bind the value first so the check is real.
+          $code = $LASTEXITCODE
+          if ($null -eq $code) { Write-Host 'FAIL suite set no exit code'; exit 1 }
+          if ($code -ne 0) { exit $code }
 
       - name: Every script parses under 5.1
         shell: powershell
         run: |
           $bad = 0
+          $seen = 0
           Get-ChildItem -Recurse -Filter *.ps1 | ForEach-Object {
+            $seen++
             $e = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$e)
             if ($e -and $e.Count) {
@@ -92,7 +124,11 @@ jobs:
             }
           }
           if ($bad) { exit 1 }
-          "all .ps1 parse under $($PSVersionTable.PSVersion)"
+          # A FLOOR. An enumeration that matches nothing printed "all .ps1 parse" and passed -
+          # so a renamed directory turned this step green. The local gate already refuses that
+          # ("the parse gate swept nothing"); the merge gate did not.
+          if ($seen -eq 0) { Write-Host 'FAIL swept 0 .ps1 files - the parse gate examined nothing'; exit 1 }
+          "all $seen .ps1 parse under $($PSVersionTable.PSVersion)"
 
       # The suite list above is hand-maintained, and a suite added to tests\ but not to this
       # file would be silently uncovered on CI while looking covered. Same failure the local
@@ -100,11 +136,32 @@ jobs:
       - name: No test suite is missing from this workflow
         shell: powershell
         run: |
+          # THE run: SCALARS, NOT THE WHOLE FILE. Matching the raw YAML also matches COMMENTS,
+          # so deleting the "Render suite" step passed as long as the filename survived anywhere
+          # in prose - and this file's own next comment forbids exactly that shape. Parse the
+          # workflow's run: blocks and look only at what CI actually executes.
           $onDisk = @(Get-ChildItem .\tests -Filter 'Invoke-*Tests.ps1' | ForEach-Object { $_.Name })
-          $wired  = (Get-Content .\.github\workflows\gate.yml -Raw)
+          if ($onDisk.Count -eq 0) { Write-Host 'FAIL found 0 suites in tests\ - this check examined nothing'; exit 1 }
+          $yaml = (Get-Content .\.github\workflows\gate.yml -Raw) -split "`n"
+          $runLines = @()
+          $inRun = $false
+          foreach ($line in $yaml) {
+            if ($line -match '^\s*run:\s*\|') { $inRun = $true; continue }
+            if ($inRun) {
+              if ($line -match '^\s*-\s' -or $line -match '^\s{0,6}\S' ) { $inRun = $false; continue }
+              # STRIP POWERSHELL COMMENTS TOO. A run: block is executable, but a # line inside it
+              # is not - and a filename surviving in one is exactly the shape this check exists to
+              # reject. Caught by its own control on 2026-09-11: sabotaging the Render step by
+              # replacing its invocation with '# was Invoke-RenderTests.ps1 here' was NOT detected
+              # until this line was added. A control that passes tells you nothing; this one failed
+              # and was right to.
+              $runLines += ($line -replace '#.*$', '')
+            }
+          }
+          $wired = ($runLines -join "`n")
           $missing = @($onDisk | Where-Object { $wired -notmatch [regex]::Escape($_) })
           if ($missing.Count) {
-            Write-Error ("test suite(s) not run by CI: {0}" -f ($missing -join ', '))
+            Write-Host ("FAIL test suite(s) not run by CI: {0}" -f ($missing -join ', '))
             exit 1
           }
           "all $($onDisk.Count) suite(s) are wired into CI"
@@ -201,22 +258,26 @@ jobs:
       - name: No stray control characters in tracked files
         shell: powershell
         run: |
+          # ONE COMPILED REGEX, not a per-byte PowerShell loop. Measured 2026-09-11 over a
+          # 48-file / 961 KB tree: the loop was 2,559 ms, this is 39 ms (66x), identical findings.
+          # Recorded because the obvious alternative LOSES: [Array]::FindIndex with a
+          # [Predicate[byte]] measured 3,642 ms - SLOWER than the loop - because the predicate is
+          # a scriptblock invoked once per byte. Same trap class as -Include under -LiteralPath.
+          $rx = [regex]::new('[\x00-\x08\x0B\x0C\x0E-\x1F]')
           $bad = 0
+          $seen = 0
           $exts = '.ps1', '.psm1', '.json', '.yml', '.md', '.xml', '.cmd'
           foreach ($f in (Get-ChildItem -Recurse -File | Where-Object { $exts -contains $_.Extension })) {
-            $bytes = [IO.File]::ReadAllBytes($f.FullName)
-            for ($i = 0; $i -lt $bytes.Length; $i++) {
-              $b = $bytes[$i]
-              if ($b -lt 32 -and $b -ne 9 -and $b -ne 13 -and $b -ne 10) {
-                $rel = $f.FullName.Substring((Get-Location).Path.Length + 1)
-                # Report the LINE, so the message points at something a human can find.
-                $line = 1
-                for ($j = 0; $j -lt $i; $j++) { if ($bytes[$j] -eq 10) { $line++ } }
-                Write-Host ("FAIL {0}:{1} contains control byte 0x{2:X2} - an interpreted string escape, almost certainly \b, \t or \f from a patch script" -f $rel, $line, $b)
-                $bad++
-                break
-              }
+            $seen++
+            $text = [IO.File]::ReadAllText($f.FullName)
+            $m = $rx.Match($text)
+            if ($m.Success) {
+              $rel = $f.FullName.Substring((Get-Location).Path.Length + 1)
+              $line = ($text.Substring(0, $m.Index) -split "`n").Count
+              Write-Host ("FAIL {0}:{1} contains control byte 0x{2:X2} - an interpreted string escape, almost certainly a backslash sequence from a patch script" -f $rel, $line, [int][char]$m.Value[0])
+              $bad++
             }
           }
           if ($bad) { exit 1 }
-          "no stray control characters in any tracked source file"
+          if ($seen -eq 0) { Write-Host 'FAIL scanned 0 files - this check examined nothing'; exit 1 }
+          "no stray control characters in any of $seen tracked source files"
