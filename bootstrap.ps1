@@ -362,7 +362,18 @@ function Register-ToolboxUserPath {
     # absent TESSDATA_PREFIX lets tesseract fall back to its own install-relative tessdata.
     # Every tesseract call on the box then died with "Failed loading language 'eng'".
     # Require real language data before claiming the toolbox owns the path.
-    $hasLangData = @(Get-ChildItem -LiteralPath $tessdata -Filter '*.traineddata' -File -ErrorAction SilentlyContinue).Count -gt 0
+    #
+    # Counting by NAME is not enough either, which is the other half of the same bug:
+    # Get-Download used to throw on a short file without deleting it, so this directory can
+    # hold zero-byte .traineddata corpses that satisfy a name filter and load nothing. 100KB
+    # is the floor scripts\build-devtoolbox.ps1 downloads against (tessdata_fast's smallest
+    # language is around 1MB, so the floor rejects only partials). eng is required BY NAME
+    # because it is the implicit default for every caller that does not pass -l - a tessdata
+    # holding only, say, jpn would pass a count check and still fail every default OCR call.
+    $langFiles = @(Get-ChildItem -LiteralPath $tessdata -Filter '*.traineddata' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Length -ge 100KB })
+    $hasLangData = ($langFiles.Count -gt 0) -and
+        (@($langFiles | Where-Object { $_.Name -eq 'eng.traineddata' }).Count -gt 0)
     if ($hasLangData) {
         $current = [System.Environment]::GetEnvironmentVariable("TESSDATA_PREFIX", "User")
         if ($current -ne $tessdata) {
@@ -374,6 +385,12 @@ function Register-ToolboxUserPath {
             }
         }
         $env:TESSDATA_PREFIX = $tessdata
+    } else {
+        # Saying nothing was the rest of the original defect: OCR simply did not work and no
+        # run ever mentioned why. Leaving TESSDATA_PREFIX unset is still the better of the
+        # two bad states - tesseract then falls back to its install-relative tessdata - but
+        # it is a broken toolbox either way, and a bootstrap that noticed has to say so.
+        Write-Warn "no usable tesseract language data in $tessdata (need eng.traineddata, 100KB or larger) - leaving TESSDATA_PREFIX unset; re-run scripts\build-devtoolbox.ps1 to fetch it"
     }
 
     # Make node/npm trust the OS certificate store (incl. a corporate TLS-

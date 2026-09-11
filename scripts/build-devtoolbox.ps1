@@ -9,6 +9,10 @@ param(
     [string]$Root = (Join-Path $env:LOCALAPPDATA "DevToolbox"),
     [switch]$SkipHeavy,
     [switch]$SkipPlaywrightBrowsers,
+    # Build the venv on a system-REGISTERED Python 3.11 when no uv-managed one can be
+    # found. Off by default and it should stay that way: see Get-Python311 for why the
+    # choice is permanent once the venv exists.
+    [switch]$AllowSystemPython,
     [switch]$DryRun
 )
 
@@ -116,38 +120,157 @@ function Ensure-Directory {
     New-Item -ItemType Directory -Path $Path -Force | Out-Null
 }
 
+function Get-UvExecutable {
+    # Get-Command only sees PATH, and uv's shim lived under the toolbox tree - so when that
+    # tree was deleted on 2026-09-10 uv became "unavailable" to this script while the winget
+    # package was still installed the entire time. That single false negative is what sent
+    # the Python choice down the system-interpreter path, so look harder than PATH.
+    $cmd = Get-Command uv -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source -and (Test-Path -LiteralPath $cmd.Source)) { return $cmd.Source }
+    # Find-Executable already knows the winget package layout
+    # (%LOCALAPPDATA%\Microsoft\WinGet\Packages\<id>_<source suffix>\uv.exe).
+    return (Find-Executable -Name "uv" -WingetId "astral-sh.uv")
+}
+
+function Test-Python311 {
+    param([string]$Exe)
+    if (-not $Exe -or -not (Test-Path -LiteralPath $Exe)) { return $false }
+    # ASK the interpreter; do not read the version out of its directory name. uv's layout
+    # holds both a concrete cpython-3.11.15-windows-x86_64-none directory and a
+    # cpython-3.11-windows-x86_64-none JUNCTION pointing at it, and a junction can outlive
+    # its target - so "3.11" in a path is a claim, and the version baked into pyvenv.cfg is
+    # not a claim that can be retracted later.
+    #
+    # No 2>&1: redirecting native stderr under $ErrorActionPreference='Stop' makes 5.1 raise
+    # a terminating NativeCommandError even on success (lib\common.ps1:294-298). The catch is
+    # for the other case - an executable that exists but cannot start, e.g. a dangling
+    # junction - which should read as "not a usable 3.11", not as a build failure.
+    try {
+        $reported = & $Exe -c "import sys; print('{}.{}'.format(*sys.version_info[:2]))"
+    } catch { return $false }
+    return (($LASTEXITCODE -eq 0) -and ((@($reported) -join "").Trim() -eq "3.11"))
+}
+
+function Find-ManagedPython311 {
+    # A uv-managed 3.11 can be ON DISK while uv's CLI is unreachable - that is precisely the
+    # state a deleted toolbox leaves behind, and the state in which the old code quietly
+    # chose the system interpreter instead. Two independent lookups, because they fail
+    # independently: uv's install directory, and the py launcher's own registry (uv registers
+    # its Pythons as "Astral/CPython3.11.x", so `py -0p` still finds one after a PATH wipe).
+    $roots = @($env:UV_PYTHON_INSTALL_DIR, (Join-Path $env:APPDATA "uv\python")) |
+        Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+    foreach ($root in $roots) {
+        # Concrete versions first and newest first, so cpython-3.11.15 beats cpython-3.11.9
+        # (a plain -Descending string sort does not: '9' sorts above '1') and both beat the
+        # bare cpython-3.11 junction, whose name hides which patch it actually resolves to.
+        $candidates = @(Get-ChildItem -LiteralPath $root -Directory -Filter "cpython-3.11*" -ErrorAction SilentlyContinue) |
+            ForEach-Object {
+                $concrete = $_.Name -match '^cpython-(3\.11\.\d+)-'
+                [pscustomobject]@{
+                    Exe      = (Join-Path $_.FullName "python.exe")
+                    Concrete = [bool]$concrete
+                    Version  = $(if ($concrete) { [version]$Matches[1] } else { [version]"3.11.0" })
+                }
+            } | Sort-Object -Property Concrete, Version -Descending
+        foreach ($candidate in $candidates) {
+            if (Test-Python311 -Exe $candidate.Exe) { return $candidate.Exe }
+        }
+    }
+    $pyLauncher = Get-Command py.exe -ErrorAction SilentlyContinue
+    if ($pyLauncher) {
+        # `py -0p` prints e.g. " -V:Astral/CPython3.11.15   C:\...\python.exe", with an
+        # optional " *" default marker between tag and path. The tag carries the patch
+        # version, so match a 3.11 PREFIX rather than comparing for equality. No stderr
+        # redirect here either - see Test-Python311.
+        $listed = @()
+        try { $listed = @(& $pyLauncher.Source -0p) } catch { $listed = @() }
+        foreach ($line in $listed) {
+            if ($line -match '^\s*-V:Astral/CPython3\.11(\.\d+)?\s+\*?\s*(?<path>\S.*\S)\s*$') {
+                if (Test-Python311 -Exe $Matches["path"]) { return $Matches["path"] }
+            }
+        }
+    }
+    return $null
+}
+
 function Get-Python311 {
     # Prefer a uv-managed standalone Python 3.11 for the toolbox venv. uv's Pythons are
     # plain extractions - NOT registered in Add/Remove Programs and NOT on PATH - so
     # corporate "old Python" scanners/remediation don't see or delete them (the system
     # PATH Python can be whatever's current). This also keeps the venv base stable and
-    # reproducible. Only fall back to a system/registered 3.11 if uv is unavailable.
-    if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
-        if ($DryRun) {
-            Write-Info "[DRY-RUN] would install astral-sh.uv (manages the private Python)"
-        } else {
-            Write-Info "install astral-sh.uv (manages the toolbox's private Python 3.11)"
-            # Out-Null: uncaptured command output inside this function is otherwise
-            # concatenated into the returned interpreter path (a PS return-value trap).
-            winget install --id astral-sh.uv -e --accept-source-agreements --accept-package-agreements --silent --scope user | Out-Null
-            Sync-EnvPath
-        }
-    }
-    $uv = Get-Command uv -ErrorAction SilentlyContinue
-    if ($uv) {
-        if ($DryRun) { Write-Info "[DRY-RUN] would: uv python install 3.11 (private, unregistered)"; return "python.exe" }
-        Write-Info "uv python install 3.11 (private, unregistered)"
-        # Out-Null the install (see note above). A non-zero exit or stderr warning
-        # from uv (e.g. its version-link glitch on first install) is non-fatal here -
-        # the authoritative interpreter path comes from 'uv python find' next, whose
-        # single stdout line we capture directly (no leak, no directory scanning).
-        & $uv.Source python install 3.11 | Out-Null
-        $managed = & $uv.Source python find 3.11 | Select-Object -First 1
-        if ($managed -and (Test-Path $managed)) { return $managed }
-        Write-Warn "uv did not yield a managed Python 3.11; falling back to a system install (may trip compliance)"
+    # reproducible, and it is what the "keep 3.11 off PATH" rule in docs\agent-rules.md
+    # is describing.
+    #
+    # Order: uv CLI -> uv-managed on disk -> a warning that can actually print -> system.
+    # The warning used to sit INSIDE the `if ($uv)` block, so the one path that really
+    # reached the system fallback - uv not resolvable at all - was the one path that said
+    # nothing. The 2026-09-10 rebuild would have built the venv on the compliance-visible
+    # registered 3.11 and announced it nowhere.
+    #
+    # And that would have been permanent in practice: a venv's base interpreter is written
+    # into pyvenv.cfg when the venv is created, Ensure-PythonVenv returns the existing venv
+    # on every later run, and nothing else calls this function. Hence a throw rather than a
+    # warning - the cheap fix (`uv python install 3.11`) is only cheap BEFORE the venv
+    # exists. Fail-closed is the deliberate choice; -AllowSystemPython is the override.
+    if ($DryRun) {
+        Write-Info "[DRY-RUN] would resolve a uv-managed Python 3.11 (private, unregistered)"
+        return "python.exe"
     }
 
-    # Fallback: a system/registered Python 3.11 (a compliance policy may flag this).
+    $uv = Get-UvExecutable
+    if (-not $uv) {
+        Write-Info "install astral-sh.uv (manages the toolbox's private Python 3.11)"
+        $uvInstall = Invoke-Winget -WingetArgs @("install", "--id", "astral-sh.uv", "-e",
+            "--accept-source-agreements", "--accept-package-agreements", "--silent", "--scope", "user")
+        if ($uvInstall.ExitCode -ne 0) {
+            # Deliberately not fatal and deliberately not silent. The usual cause is "already
+            # installed", which winget also reports non-zero; the authoritative answer is the
+            # probe on the next line, not the exit code. The old code ignored this outcome
+            # entirely and then read $null out of Get-Command.
+            Write-Info "winget exit $($uvInstall.ExitCode) for astral-sh.uv - probing for it directly"
+        }
+        Sync-EnvPath
+        $uv = Get-UvExecutable
+    }
+
+    if ($uv) {
+        Write-Info "uv python install 3.11 (private, unregistered)"
+        # Out-Null, not 2>&1: uncaptured output inside a function is concatenated into this
+        # function's return value (the trap Invoke-Winget exists for), while redirecting uv's
+        # stderr under 'Stop' would throw on its first progress line. A non-zero exit or a
+        # stderr warning from uv (e.g. its version-link glitch on a first install) is
+        # non-fatal here - the authoritative path comes from 'uv python find' below, whose
+        # single stdout line is captured directly.
+        & $uv python install 3.11 | Out-Null
+        $managed = & $uv python find 3.11 | Select-Object -First 1
+        if (Test-Python311 -Exe $managed) { return $managed }
+    }
+
+    $onDisk = Find-ManagedPython311
+    if ($onDisk) {
+        Write-Ok "uv-managed Python 3.11 found on disk: $onDisk"
+        return $onDisk
+    }
+
+    Write-Warn "no uv-managed Python 3.11 is available on this machine (uv resolvable: $([bool]$uv))"
+    if (-not $AllowSystemPython) {
+        throw @"
+Refusing to build the toolbox venv on a system-registered Python 3.11.
+
+The base interpreter is written into the venv's pyvenv.cfg when the venv is created, and
+Ensure-PythonVenv returns the existing venv on every later run - so this choice is permanent
+in practice, and a compliance sweep that removes "old Python" would take the toolbox with it.
+
+Fix the cause instead:
+    winget install --id astral-sh.uv -e --scope user   # only if 'uv' is missing
+    uv python install 3.11
+
+Then re-run this script. To accept a compliance-visible base interpreter anyway, re-run with
+-AllowSystemPython.
+"@
+    }
+    Write-Warn "-AllowSystemPython given: building on a system/registered Python 3.11 (may trip compliance)"
+
     $candidates = @(
         "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
         "$env:ProgramFiles\Python311\python.exe"
@@ -160,17 +283,48 @@ function Get-Python311 {
         $version = & $pyLauncher.Source -3.11 -c "import sys; print(sys.executable)"
         if ($LASTEXITCODE -eq 0 -and $version) { return ($version | Select-Object -First 1) }
     }
-    if ($DryRun) {
-        Write-Info "[DRY-RUN] would install Python.Python.3.11 via winget"
-        return "python.exe"
-    }
     Write-Info "install Python.Python.3.11 (fallback; system-registered)"
-    winget install --id Python.Python.3.11 -e --accept-source-agreements --accept-package-agreements --silent --scope user | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Python 3.11 install failed (uv and winget both unavailable)" }
+    $pyInstall = Invoke-Winget -WingetArgs @("install", "--id", "Python.Python.3.11", "-e",
+        "--accept-source-agreements", "--accept-package-agreements", "--silent", "--scope", "user")
+    if ($pyInstall.ExitCode -ne 0) {
+        foreach ($line in $pyInstall.Output) { Write-Host "    $line" -ForegroundColor DarkGray }
+        throw "Python 3.11 install failed (exit $($pyInstall.ExitCode)); uv and winget both unusable"
+    }
     Sync-EnvPath
     $sys = "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe"
     if (Test-Path $sys) { return $sys }
     throw "Python 3.11 not found after install"
+}
+
+function Get-VenvBaseInterpreter {
+    param([string]$VenvPath)
+    # Read the venv's OWN record of what it was built on. Get-Python311 runs exactly once -
+    # on the run that creates the venv - and every later run short-circuits in
+    # Ensure-PythonVenv, so on a re-run the $Python handed to Write-Manifest is the venv's
+    # own python.exe and says nothing about its base. pyvenv.cfg is the only thing that
+    # still knows, which is what makes the manifest field a measurement rather than a claim.
+    # 'base-executable' is written by 3.11's venv module; 'home' is the older key and holds
+    # the directory, which is still enough to tell uv-managed apart from system-registered.
+    $cfg = Join-Path $VenvPath "pyvenv.cfg"
+    if (-not (Test-Path -LiteralPath $cfg)) { return $null }
+    $values = @{}
+    foreach ($line in @(Get-Content -LiteralPath $cfg -ErrorAction SilentlyContinue)) {
+        if ($line -match '^\s*([^=#][^=]*?)\s*=\s*(.*?)\s*$') { $values[$Matches[1].ToLowerInvariant()] = $Matches[2] }
+    }
+    if ($values.ContainsKey("base-executable")) { return $values["base-executable"] }
+    if ($values.ContainsKey("home")) { return $values["home"] }
+    return $null
+}
+
+function Test-UvManagedPath {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    $roots = @($env:UV_PYTHON_INSTALL_DIR, (Join-Path $env:APPDATA "uv\python")) |
+        Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') }
+    foreach ($root in $roots) {
+        if ($Path.StartsWith(($root + '\'), [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
 }
 
 function Ensure-PythonVenv {
@@ -238,6 +392,41 @@ for root in site.getsitepackages():
     try { & $Python $tmp } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
 }
 
+function Invoke-Winget {
+    <#
+        Run winget with its output CAPTURED and its stderr survivable. Every winget call in
+        this file goes through here, because both ways of calling it directly are broken
+        under Windows PowerShell 5.1 and the two failures hide each other.
+
+        1. An unredirected native command inside a function writes to that FUNCTION'S output
+           stream. `winget @args; if ($LASTEXITCODE -ne 0) { return $false }` therefore
+           returned [<winget's stdout lines>, $false], and the caller's `if (-not $ok)`
+           guard silently stopped working, because -not on a multi-element array is $false.
+           Measured under 5.1: the leaky shape returns 3 elements and the guard fires =
+           False; captured, 1 element, fires = True. This is character-for-character the
+           defect 8bca5e9 fixed in lib\common.ps1:190 - the builder still had it, which
+           meant an 18-package native install could fail outright and still print "done".
+
+        2. This file sets $ErrorActionPreference = 'Stop' globally, and under Stop a native
+           command whose stderr is merged with 2>&1 raises a TERMINATING NativeCommandError
+           EVEN WHEN IT SUCCEEDED (lib\common.ps1:294-298 documents the same trap). The old
+           `winget list ... 2>&1` had that shape: one noise line on stderr from the first of
+           18 packages would have killed the whole build. Continue is set around the call
+           and restored in a finally, so a later throw never runs with the preference down.
+
+        Returns ExitCode and Output, not a bool, because the callers disagree about what a
+        non-zero exit means: for `winget list` it means "not installed yet", which is not a
+        failure, and for `winget install astral-sh.uv` it usually means "already installed".
+    #>
+    param([Parameter(Mandatory)][string[]]$WingetArgs)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $out = winget @WingetArgs 2>&1
+        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = @($out) }
+    } finally { $ErrorActionPreference = $prev }
+}
+
 function Install-WingetPackage {
     param([string]$Id, [switch]$MachineScope)
     if ($DryRun) {
@@ -245,17 +434,23 @@ function Install-WingetPackage {
         return $true
     }
     Assert-Prerequisites
-    $listed = winget list --id $Id -e --accept-source-agreements 2>&1
-    if ($LASTEXITCODE -eq 0 -and ($listed -match [regex]::Escape($Id))) {
+    $listed = Invoke-Winget -WingetArgs @("list", "--id", $Id, "-e", "--accept-source-agreements")
+    if ($listed.ExitCode -eq 0 -and ($listed.Output -match [regex]::Escape($Id))) {
         Write-Info "$Id already installed"
         return $true
     }
     Write-Info "winget install $Id"
-    $args = @("install", "--id", $Id, "-e", "--accept-source-agreements", "--accept-package-agreements", "--silent")
-    if (-not $MachineScope) { $args += @("--scope", "user") }
-    winget @args
-    if ($LASTEXITCODE -ne 0) {
-        Write-Err "$Id install failed"
+    # $wingetArgs, not $args: $args is an automatic variable, and assigning to it inside a
+    # function that already has a param block reads as though the caller's arguments are
+    # being forwarded when they are not.
+    $wingetArgs = @("install", "--id", $Id, "-e", "--accept-source-agreements", "--accept-package-agreements", "--silent")
+    if (-not $MachineScope) { $wingetArgs += @("--scope", "user") }
+    $install = Invoke-Winget -WingetArgs $wingetArgs
+    if ($install.ExitCode -ne 0) {
+        # The captured lines are only worth reading on this path, which is the whole reason
+        # Invoke-Winget keeps them instead of piping to Out-Null.
+        foreach ($line in $install.Output) { Write-Host "    $line" -ForegroundColor DarkGray }
+        Write-Err "$Id install failed (exit $($install.ExitCode))"
         return $false
     }
     Sync-EnvPath
@@ -370,6 +565,17 @@ function Get-Download {
     }
 
     if (-not (Test-Path -LiteralPath $OutFile) -or (Get-Item -LiteralPath $OutFile).Length -lt $MinimumBytes) {
+        # Delete the corpse BEFORE throwing. The SHA-256 branch below always cleaned up after
+        # itself; this one did not, and aria2c leaves a partial file behind on a truncated
+        # transfer. The short file then survived to satisfy the `if (Test-Path $out)
+        # { continue }` fast-path that used to guard Install-Tessdata, so the "rerun to
+        # retry" advice was false for that language forever - measured on this box, 2 of the
+        # 11 declared OCR languages had usable data.
+        #
+        # -ErrorAction SilentlyContinue is load-bearing, not decoration: the first disjunct
+        # of the condition above is "the file does not exist", and a Remove-Item that throws
+        # under $ErrorActionPreference='Stop' would replace the real message with its own.
+        Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
         throw "download failed or was unexpectedly small: $Url"
     }
     if ($Sha256 -and (Get-FileHash -LiteralPath $OutFile -Algorithm SHA256).Hash -ine $Sha256) {
@@ -381,7 +587,20 @@ function Get-Download {
 function Install-NativeTools {
     foreach ($pkg in $NativePackages) {
         $machineScope = $pkg.ContainsKey("machineScope") -and $pkg.machineScope
-        if (-not (Install-WingetPackage -Id $pkg.id -MachineScope:$machineScope)) {
+        # Captured and type-checked rather than tested inline. `if (-not (Install-WingetPackage
+        # ...))` READS like a guard, which is exactly why the leak below it went unnoticed for
+        # so long: once native output rode along in the return value the test became
+        # `-not <array>`, which is $false, and the throw never ran. A leak is a DIFFERENT
+        # defect from a failed install and has to be reported as one - otherwise the next
+        # person who adds an unredirected native call gets the silent version back, and the
+        # symptom is a green build with nothing installed.
+        $ok = Install-WingetPackage -Id $pkg.id -MachineScope:$machineScope
+        if ($ok -isnot [bool]) {
+            $shape = if ($null -eq $ok) { "nothing" } else { "{0}, {1} element(s)" -f $ok.GetType().Name, @($ok).Count }
+            throw ("Install-WingetPackage returned $shape for $($pkg.id) instead of a bool: " +
+                   "native output leaked into the return value, which silences the failure check below.")
+        }
+        if (-not $ok) {
             throw "required native package failed to install: $($pkg.id)"
         }
         foreach ($command in $pkg.commands) {
@@ -444,12 +663,18 @@ function Install-Tessdata {
     $failed = @()
     foreach ($lang in $langs) {
         $out = Join-Path $dest "$lang.traineddata"
-        if (Test-Path $out) { continue }
         if ($DryRun) {
             Write-Info "[DRY-RUN] download tessdata $lang"
             continue
         }
         $url = "https://github.com/tesseract-ocr/tessdata_fast/raw/main/$lang.traineddata"
+        # No `if (Test-Path $out) { continue }` here. That fast-path skipped Get-Download
+        # entirely, and with it Get-Download's own size check - so a zero-byte or partial
+        # .traineddata was PERMANENT and every rerun found nothing to do. The existence
+        # fast-path belongs in Get-Download, which returns immediately when the file already
+        # passes its size and hash checks; the only cost of dropping the guard here is one
+        # Get-Item per language.
+        #
         # OCR language data: a transient download failure for one language must not
         # abort the whole toolbox build. Best-effort per language.
         try { Get-Download -Url $url -OutFile $out -MinimumBytes 100KB }
@@ -778,13 +1003,23 @@ function Write-Manifest {
             exists = [bool]($target -and (Test-Path -LiteralPath $target))
         }
     }
+    # MEASURED from pyvenv.cfg rather than asserted from whatever Get-Python311 decided.
+    # Get-Python311 is called only on the run that creates the venv; on every re-run
+    # Ensure-PythonVenv returns early and $Python above is just the venv's own python.exe,
+    # which says nothing about its base. Whether the toolbox is sitting on a
+    # compliance-visible interpreter has to stay visible for as long as the venv exists,
+    # including on the runs that never made the choice.
+    $venvPath = Join-Path $Root "python\.venv"
+    $baseInterpreter = Get-VenvBaseInterpreter -VenvPath $venvPath
     $manifest = [ordered]@{
         schema_version = $ToolboxSchemaVersion
         created_at = (Get-Date).ToString("o")
         root = $Root
         python = [ordered]@{
             executable = $Python
-            venv = (Join-Path $Root "python\.venv")
+            venv = $venvPath
+            base_interpreter = $baseInterpreter
+            base_interpreter_uv_managed = (Test-UvManagedPath -Path $baseInterpreter)
             requirements_core = (Join-Path $Root "python\requirements-core.txt")
             requirements_ml = (Join-Path $Root "python\requirements-ml.txt")
         }
