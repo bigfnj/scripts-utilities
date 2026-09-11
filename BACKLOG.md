@@ -517,6 +517,97 @@ asserts no native command in the builder is piped.
   `$NoScopeFlag` list) into `catalog.json` as a `no_scope_flag` boolean field,
   so the script and the catalog stay in sync automatically.
 
+---
+
+## Post-merge audit, 2026-09-11 - deferred findings
+
+Three read-only audits over the 22 pushed commits. What they found and I fixed is in the commit
+log; this is what they found and I did **not** fix, with the reason.
+
+### The suites never run under Set-StrictMode, and three defences are written against it
+
+`Set-StrictMode -Version Latest` is set in `bootstrap.ps1`, `fresh-toolbox-setup-runner.ps1`,
+`gui/toolbox-gui.ps1`, `build-devtoolbox.ps1`, `install-llm.ps1`, `install-machine-scope.ps1` and
+`uninstall-toolbox.ps1` - and in **none** of the five suites, nor `run-gate.ps1`, nor
+`smoke-test.ps1`, nor `consolidate-path.ps1`. Both runners launch suites via
+`powershell.exe -File`, and strict mode does not cross a process boundary.
+
+So these comments describe a production condition the gate never reproduces:
+
+- `lib/ShimPlan.ps1` - "reading a property a ConvertFrom-Json object does not have THROWS"
+- `lib/ShimPlan.ps1` - "`$x = if (...) { @($one) }` yields a SCALAR ... Bit us here on the 44 sole names"
+- `lib/path-registry.ps1` - "the runner sets Set-StrictMode ... so a later `.Count` throws"
+
+The production claim is half-true: `fresh-toolbox-setup-runner.ps1` invokes `consolidate-path.ps1`
+in-process with `&`, so strict mode does propagate there - but the repair path the script itself
+prints (`-RebuildShims`) and the README instructions run it directly, with no strict mode. Adding
+`Set-StrictMode -Version Latest` to the suites would turn three arguments into three tested
+properties at no behavioural cost. Deferred only because it is a behaviour change to all five
+suites and this was already a long day.
+
+### lib/AgentDiscovery.ps1's allowlist is blind to method calls, and skips two arguments entirely
+
+The file executes source it extracted from `lib/common.ps1`, and guards that with an allowlist of
+one command (`Join-Path`), on the stated principle "refuse anything outside the allowlist rather
+than run it and hope". Two holes, both measured:
+
+- The walk filters on `CommandAst`. A static method call produces **zero** `CommandAst` nodes -
+  `InvokeMemberExpressionAst` is a disjoint branch of the hierarchy - so
+  `[IO.File]::ReadAllText(...)`, `[Environment]::SetEnvironmentVariable(...)` and
+  `[Diagnostics.Process]::Start(...)` all pass the allowlist and reach `[scriptblock]::Create`.
+- The two positional arguments of each `Write-AgentBlock` call are lifted as raw extent text and
+  spliced into the generated source without any allowlist check at all.
+
+Nothing fires today: `Write-AgentDiscovery`'s three assignments use only `Join-Path`, a plain
+`if/else` over two env vars, and a here-string with no `$( )` subexpressions. But the guard exists
+entirely for the future edit, and for the two most obvious future edits it is decorative. The file
+says "extraction fails closed instead; shadowing fails open" - for method calls it fails open.
+
+Same construction with no guard at all: `tests/Invoke-InstallerTests.ps1` lifts two assignments out
+of `smoke-test.ps1` and runs them through `Invoke-Expression`, on every gate run.
+
+### Remove-MachinePathEntry does not expand-to-compare, unlike its user-scope sibling
+
+`Add-UserPathEntry` and `Remove-UserPathEntry` expand entries for COMPARISON and re-emit the raw
+text, so a hand-written `%LOCALAPPDATA%\...` entry is recognised. `Remove-MachinePathEntry`
+compares raw-to-raw. Not a live bug - both callers derive the path from an env var as an absolute
+literal - but it would silently return `NotPresent` for a hand-edited `%VAR%` machine entry.
+
+### smoke-test.ps1's PATH length check cannot fire on a fresh profile
+
+`GetEnvironmentVariable('PATH','User')` returns `$null` when `HKCU\Environment\Path` does not
+exist, which is common on a newly created profile. `.TrimEnd(';')` on it then throws "You cannot
+call a method on a null-valued expression". `smoke-test.ps1` sets neither `Stop` nor `StrictMode`,
+so it prints red and continues - meaning the **4095-char truncation check never runs on exactly
+the machine most likely to need it**, and this repo ships a public `irm | iex` bootstrap. Every
+other consumer guards correctly (`Sync-EnvPath` filters with `Where-Object { $_ }`, `Get-RawPath`
+passes `''` as the default). This one dereference is unguarded.
+
+### modules/security.ps1's USN probe reports a problem on every unelevated run
+
+`fsutil usn queryjournal C:` requires elevation; `bootstrap.ps1` is documented to run
+unelevated. So on the normal path this throws into an empty catch, the value stays `$null`, and
+the module reports "USN journal unreadable on C:" as a problem every time. It is also the only
+hardcoded system volume in a module - `install-deletion-forensics.ps1` correctly parameterises
+`$Volume`; `$env:SystemDrive` would remove the assumption.
+
+### Write-only diagnostic keys
+
+`lib/ShimPlan.ps1`'s shim-sources document writes `mode`, `priority_source`, `captured_at`, the
+`kept` block and `contested[].resolve_with`; the only reader consumes `priority_order` alone.
+`ForensicsReport.Core.ps1`'s baseline writes `key`, `firstSeen` and `updated`, never read back.
+These are human forensics rather than dead config, and deliberately kept - the same reasoning
+recorded at `Add-WinManifest` for `group` and `notes`. Listed so a future audit does not re-raise
+them as dead.
+
+### Orphans
+
+`docs/fresh-workstation-audit.md` has **zero** references anywhere in the repo - no doc, script,
+workflow or test links to it, and it is dated 2026-07-31. `scripts/install-whisper.ps1` is
+referenced only by a table row in `README.md`; no code path invokes it, unlike
+`scripts/install-ghidra.ps1` which is wired into the runner and the security module. Either
+deliberate manual-only tooling or stranded; decide rather than leave it ambiguous.
+
 ## Deferred
 
 - Find a supported install channel for watchexec on Windows. It is not currently available in winget.
