@@ -21,6 +21,24 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $ToolboxSchemaVersion = 2
 
+# THE ONLY DOT-SOURCE IN THIS FILE, and it stays the only one.
+#
+# This script is deliberately standalone: bootstrap.ps1 runs it as a CHILD PROCESS, so it gets
+# none of bootstrap's scope, and nothing it needs may depend on having been dot-sourced by
+# somebody. That property was worth keeping, and it is why the divergence it caused went
+# unnoticed for so long - this file carried its own private copy of the .cmd shim format while
+# lib\ShimFormat.ps1 carried the rule saying not to, and the private copy was a here-string.
+#
+# lib\ShimFormat.ps1 was created on 2026-09-11 for exactly this callsite: two functions, 71 lines,
+# no side effects on dot-source, no transitive dot-sources of its own. Read its header for why the
+# contract could not live in lib\ShimPlan.ps1 (the whole shim planner) or in lib\common.ps1 (the
+# installer plumbing, plus a $script:MANIFEST that points at real state on load).
+#
+# The cost of being wrong about the path is bounded and loud: a missing file throws here, at load,
+# before the script has touched the machine. The cost of the duplication it replaces was silent -
+# every wrapper this build writes unparseable, and every reader reporting zero.
+. (Join-Path $PSScriptRoot '..\lib\ShimFormat.ps1')
+
 $CorePackages = @(
     "python-docx", "docxcompose", "docxtpl", "mammoth", "python-pptx",
     "openpyxl", "XlsxWriter", "xlrd", "pyxlsb", "pandas", "numpy", "duckdb",
@@ -100,15 +118,54 @@ function Invoke-Checked {
 }
 
 function Sync-EnvPath {
+    # IT APPENDED $env:PATH TO ITSELF. Measured on this box 2026-09-11 (Machine PATH 1,588 chars,
+    # User PATH 148, a 990-char starting $env:PATH), four calls of the old body:
+    #
+    #     call 1 -> 2,868 chars,  64 entries, 62 distinct
+    #     call 2 -> 4,746 chars, 108 entries, 62 distinct   <- past 4,095
+    #     call 3 -> 6,624 chars, 152 entries, 62 distinct
+    #     call 4 -> 8,502 chars, 196 entries, 62 distinct
+    #
+    # +1,878 chars and 44 entries per call, and the DISTINCT count never moves - every one of those
+    # 134 added entries is a duplicate. This build makes exactly four calls (Get-Python311 at two
+    # sites, Install-WingetPackage once per native package, Run-Smoke), so a real session crosses
+    # 4,095 on its SECOND call: the exact truncation cliff scripts\smoke-test.ps1 exists to warn
+    # about, reached from inside the builder. Every winget, uv and pip child launched after that
+    # point inherits the oversized PATH. The same four calls of the body below hold at 1,633 chars
+    # and 40 entries, identical on call 1 and call 4.
+    #
+    # Machine + User + the two toolbox directories ARE the whole truth, so the prior $env:PATH is
+    # discarded rather than folded back in. That is not a new opinion: it is what lib\common.ps1's
+    # Sync-EnvPath has always done. This copy differed from it in four ways and only one of them
+    # was a live defect; the other three (no Test-Path, no de-duplication, no filtering of empties)
+    # were what let the growth run unbounded instead of converging, so all four close together.
+    #
+    # WHY THE DUPLICATION REMAINS. Not an oversight and not laziness - the two are not the same
+    # function. common.ps1 resolves the toolbox from $env:CODEX_TOOLBOX (falling back to
+    # %LOCALAPPDATA%\DevToolbox); this one uses $Root, a real -Root parameter that lets the builder
+    # target a tree that is not the live toolbox. Collapsing them means either losing -Root or
+    # dot-sourcing 30 KB of installer plumbing into a script bootstrap.ps1 runs as a child process
+    # specifically so it stays standalone. The ShimFormat.ps1 note at the top of this file is the
+    # one place that trade came out the other way, and it did because the format had exactly one
+    # correct answer - a PATH root legitimately has two. So: keep both, and keep them behaviourally
+    # identical. If you change one, change the other.
     $machine = [System.Environment]::GetEnvironmentVariable("PATH", "Machine")
     $user = [System.Environment]::GetEnvironmentVariable("PATH", "User")
-    $env:PATH = @(
+    $paths = @()
+    # Test-Path, because on the first build native\bin and the venv do not exist yet. Adding a
+    # directory that is not there is not free: it is a dead entry that every later call preserves,
+    # and it is indistinguishable from the dead entries consolidate-path.ps1 is meant to remove.
+    foreach ($candidate in @(
         (Join-Path $Root "native\bin"),
-        (Join-Path $Root "python\.venv\Scripts"),
-        $machine,
-        $user,
-        $env:PATH
-    ) -join ";"
+        (Join-Path $Root "python\.venv\Scripts")
+    )) {
+        if (Test-Path $candidate) { $paths += $candidate }
+    }
+    $paths += ($machine -split ';')
+    $paths += ($user -split ';')
+    # -Unique makes repeated calls CONVERGE: the second call reproduces the first call's result
+    # exactly, which is the property that turns "called four times" from a defect into a no-op.
+    $env:PATH = ($paths | Where-Object { $_ } | Select-Object -Unique) -join ';'
 }
 
 function Ensure-Directory {
@@ -512,14 +569,41 @@ function Find-Executable {
         if (Test-Path $packagesRoot) {
             $packageDirs = Get-ChildItem -LiteralPath $packagesRoot -Directory -Filter "$WingetId*" -ErrorAction SilentlyContinue
             $exe = if ($Name.EndsWith(".exe")) { $Name } else { "$Name.exe" }
+            $cmdName = if ($Name.EndsWith(".cmd")) { $Name } else { "$Name.cmd" }
+            # ONE recursive walk per package, not two. This used to be two -Filter passes over the
+            # same tree, one for .exe and one for .cmd, and on the expensive path - a name no
+            # package supplies - BOTH walked the whole tree. Measured 2026-09-11 over this box's 27
+            # winget packages / 1,241 files, 7 runs each:
+            #
+            #   two -Filter passes (before)        76.6 ms per miss
+            #   one -Filter "<name>*" walk         37.9 ms per miss   (2.0x)
+            #
+            # MEASURED AND REJECTED, do not "simplify" to either of these:
+            #   - One UNFILTERED walk + a Where-Object on .Name is 86.1 ms, SLOWER than the two
+            #     passes it replaces. -Filter is handled by the filesystem driver; dropping it
+            #     materialises a FileInfo for all 1,241 files in PowerShell.
+            #   - -Include $exe, $cmdName looked like the obvious answer at 19.4 ms and is WRONG:
+            #     with -LiteralPath, -Include is silently IGNORED. It returned every file in the
+            #     package, AUTHORS and README.html included, and the timing was just an inert
+            #     filter breaking out of the loop on the first package. This is the same trap
+            #     tests\Invoke-InstallerTests.ps1 records against Get-ShimCandidates, where an
+            #     -Include would have written a README.cmd shim.
+            #
+            # The wildcard is "$Name*", not "$Name.*", so it stays a superset of both exact names
+            # even when the caller passes a name that already carries an extension - the line above
+            # then computes $cmdName as 'foo.exe.cmd', which 'foo.exe.*' cannot match.
+            # Verified identical to the two-pass version over 31 names x 27 packages, 0 differences.
             foreach ($packageDir in $packageDirs) {
-                $found = Get-ChildItem -LiteralPath $packageDir.FullName -Recurse -File -Filter $exe -ErrorAction SilentlyContinue |
-                    Select-Object -First 1
-                if ($found) { return $found.FullName }
-                $cmdName = if ($Name.EndsWith(".cmd")) { $Name } else { "$Name.cmd" }
-                $found = Get-ChildItem -LiteralPath $packageDir.FullName -Recurse -File -Filter $cmdName -ErrorAction SilentlyContinue |
-                    Select-Object -First 1
-                if ($found) { return $found.FullName }
+                $hits = @(Get-ChildItem -LiteralPath $packageDir.FullName -Recurse -File -Filter "$Name*" -ErrorAction SilentlyContinue |
+                    Where-Object { ($_.Name -ieq $exe) -or ($_.Name -ieq $cmdName) })
+                if (-not $hits.Count) { continue }
+                # .exe still beats .cmd within a package. The two sequential passes expressed that
+                # preference as ORDER; one walk has to say it out loud, or a package shipping both
+                # (cURL ships wcurl.bat beside curl.exe) starts resolving to whichever the
+                # enumeration happened to reach first.
+                $found = @(@($hits | Where-Object { $_.Name -ieq $exe }) +
+                           @($hits | Where-Object { $_.Name -ieq $cmdName }))[0]
+                return $found.FullName
             }
         }
     }
@@ -539,6 +623,26 @@ function Find-Executable {
         return $cmd.Source
     }
 
+    # THE EXHAUSTIVE FALLBACK. BACKLOG measures this at 4,048 ms per miss and proposes "cache
+    # misses per run". NOT DONE, and not because it is hard - because a per-run miss cache is
+    # WRONG HERE, and the reason is worth writing down so nobody re-derives it as an easy win.
+    #
+    # This function's dominant caller shape is PROBE, INSTALL, PROBE AGAIN:
+    #   Get-Python311:277 probes uv, misses, installs astral-sh.uv, probes again at :290
+    #   Install-Ghostscript:796 probes gswin64c/gswin64, misses, extracts, probes again at :830
+    # Both second probes are SUPPOSED to hit - that is the whole point of the install between
+    # them. A cache that remembers "uv was not found this run" makes the install unobservable and
+    # returns $null from a box that now has uv on it, which is precisely the false negative
+    # Get-UvExecutable:180 was written to stop. Ghostscript would fail the same way, silently.
+    #
+    # Making it correct means invalidating the cache on every mutation - each winget install, each
+    # 7z extraction, each Sync-EnvPath - i.e. a cache with an invalidation protocol threaded
+    # through the installers. That is a redesign, not a small change, and it buys ~4 s on a path
+    # taken a handful of times in a build that downloads gigabytes. Left open in BACKLOG.
+    #
+    # The cheap half of that BACKLOG line - "bound the depth" - is also NOT done: $env:ProgramFiles
+    # has no bounded depth that is safe to guess, and a bound that is one level too shallow turns
+    # a slow correct answer into a fast wrong one.
     $exe = if ($Name.EndsWith(".exe")) { $Name } else { "$Name.exe" }
     $roots = @(
         (Join-Path $Root "native"),
@@ -566,19 +670,28 @@ function New-CmdWrapper {
         Write-Info "[DRY-RUN] wrapper $Name -> $Target"
         return $true
     }
-    @"
-@echo off
-"$Target" %*
-"@ | Set-Content -Path $wrapper -Encoding ASCII
+    # New-ShimBody, NOT the here-string that used to be here. A here-string's line endings are a
+    # property of the CHECKOUT, not of this code: the repo has core.autocrlf=true and no
+    # .gitattributes, so a clone that handed this file LF would have emitted every one of this
+    # build's wrappers - 26 of them, counted from a -DryRun on 2026-09-11 - with a lone LF, and
+    # every reader anchors its regex on $. The smoke test's stale-shim check would then have
+    # reported them as zero stale AND zero present. lib\ShimFormat.ps1 carried that rule in writing
+    # while this file, one of the writers it was created for, broke it.
+    #
+    # -NoNewline is load-bearing: New-ShimBody's last two bytes are already CRLF, and Set-Content's
+    # default would append a second terminator.
+    #
+    # THE EMITTED BYTES ARE UNCHANGED, measured 2026-09-11 by running the old body out of a CRLF
+    # file and out of an LF file and diffing both against this one:
+    #
+    #   target C:\x\y.exe                 new 28 B | CRLF checkout old 28 B, IDENTICAL | LF old 27 B
+    #   target C:\Program Files\...\7z.exe new 47 B | CRLF checkout old 47 B, IDENTICAL | LF old 46 B
+    #
+    # So this is a no-op on a correctly-checked-out tree - which is the point. The one byte the LF
+    # column loses is the CR, and 28 B is what the byte-exact test in tests\Invoke-InstallerTests.ps1
+    # pins. The difference is no longer reachable: the bytes now come from the code.
+    Set-Content -Path $wrapper -Value (New-ShimBody -Target $Target) -Encoding ASCII -NoNewline
     return $true
-}
-
-function Get-WrapperTarget {
-    param([string]$Wrapper)
-    $line = Get-Content -LiteralPath $Wrapper -ErrorAction SilentlyContinue |
-        Where-Object { $_ -match '^"([^"]+)" %\*$' } | Select-Object -First 1
-    if ($line -and $line -match '^"([^"]+)" %\*$') { return $Matches[1] }
-    return $null
 }
 
 function Get-Download {
@@ -1087,7 +1200,13 @@ function Write-Manifest {
     $commands = [ordered]@{}
     foreach ($wrapper in Get-ChildItem -Path (Join-Path $Root "native\bin") -Filter "*.cmd" -File -ErrorAction SilentlyContinue) {
         $name = [IO.Path]::GetFileNameWithoutExtension($wrapper.Name)
-        $target = Get-WrapperTarget -Wrapper $wrapper.FullName
+        # Get-ShimTarget from lib\ShimFormat.ps1 - the same reader every other file in the repo
+        # uses - instead of the private Get-WrapperTarget that used to live beside New-CmdWrapper.
+        # A writer and a reader that drift apart is the failure this manifest would report as
+        # "path: null, exists: false" for a wrapper that was perfectly fine. It takes LINES rather
+        # than a path because modules\security.ps1 writes a THREE-line Ghidra wrapper, and the
+        # reader has to scan for the first matching line rather than index a fixed one.
+        $target = Get-ShimTarget -Lines @(Get-Content -LiteralPath $wrapper.FullName -ErrorAction SilentlyContinue)
         $commands[$name] = [ordered]@{
             path = $target
             wrapper = $wrapper.FullName
