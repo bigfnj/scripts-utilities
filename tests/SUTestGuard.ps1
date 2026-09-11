@@ -41,8 +41,17 @@
         Set-Content proxy is deliberately not attempted here - its param surface (positional
         Path AND positional Value, pipeline-bound -Value) makes a naive process{} shadow call the
         real cmdlet once per pipeline item, each overwriting the last, silently truncating a
-        multi-item write to its final line. A guard that corrupts fixtures gets deleted. The
-        prohibition is enforced as a source-level check in CI instead.
+        multi-item write to its final line. A guard that corrupts fixtures gets deleted.
+
+        Instead, gate.yml's "No test reaches a writer that cannot be redirected" step prohibits
+        the four writers that reach real user state with no path parameter to redirect:
+        Write-AgentDiscovery, Remove-AgentBlocks, Remove-UserPathEntry, Add-UserPathEntry.
+        Write-AgentBlock is deliberately NOT among them - it takes an explicit -FilePath, and a
+        test in Invoke-InstallerTests.ps1 points it at TEMP to pin its $-escaping.
+
+        That CI step was written on 2026-09-11 because this comment asserted it already existed
+        and it did not. Which is the same defect as everything else in this file: a confident
+        sentence about a control nobody had checked.
 #>
 
 $script:SUTempRoot = $null

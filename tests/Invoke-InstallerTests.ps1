@@ -1220,6 +1220,67 @@ It 'the Playwright phase checks the CA bundle BEFORE it runs, not after' {
         ($guard[0].Extent.StartOffset -lt $run[0].Extent.StartOffset)
 }
 
+Write-Host "`n== the agent-block writer must not reinterpret the body it is given ==" -ForegroundColor Cyan
+
+# A fixture root of its own, NOT $scratch. An earlier section of this suite removes $scratch, so
+# a test down here that assumes it still exists gets a DirectoryNotFoundException from its own
+# setup - and then passes or fails for a reason that has nothing to do with the thing under test.
+# That is how it first failed: the placeholder file was never written, Write-AgentBlock took its
+# APPEND path instead of the REPLACE path, and the assertion that the surrounding file survived
+# was reported as a writer bug. Self-contained, inside TEMP so the deletion tripwire permits it.
+$abRoot = Join-Path ([IO.Path]::GetTempPath()) ("agentblock-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $abRoot -Force | Out-Null
+
+It 'a body containing $-sequences round-trips through Write-AgentBlock byte for byte' {
+    # Write-AgentBlock used `$content -replace $pattern, $replacement`, and the replacement side
+    # of -replace is a .NET regex SUBSTITUTION string. So the body was reinterpreted on its way
+    # to disk: $$ collapsed to $, $& became the whole match, and $1 expanded to nothing because
+    # the pattern has no capture groups.
+    #
+    # This was not theoretical. The deployed agent block documents
+    #   cdb -z dump.dmp -c ".logopen out.txt; $$><script.txt; q"
+    # and all four files on this machine carried `$><script.txt` - a different, wrong cdb
+    # command - written there by the toolbox itself on every single deploy.
+    #
+    # A REPLACE path is exercised deliberately (the file already contains a block), because the
+    # append path never had the bug and would pass a broken writer.
+    $f = Join-Path $abRoot ("agentblock-" + [guid]::NewGuid().ToString('N') + '.md')
+    $body = @'
+cdb -z dump.dmp -c ".logopen out.txt; $$><script.txt; q"
+a dollar-one $1 and a dollar-amp $& and a bare $ and a backtick-n `n
+'@
+    Set-Content -LiteralPath $f -Value "top matter`n`n<!-- SUTEST_START -->`nplaceholder`n<!-- SUTEST_END -->`n`ntail matter" -Encoding UTF8
+    Write-AgentBlock -FilePath $f -Marker 'SUTEST' -Body $body | Out-Null
+    $raw = Get-Content -LiteralPath $f -Raw -Encoding UTF8
+    $got = [regex]::Match($raw, '(?s)<!-- SUTEST_START -->\r?\n(.*?)\r?\n<!-- SUTEST_END -->').Groups[1].Value
+    $want = ($body -replace "`r`n", "`n").TrimEnd()
+    $gotN = ($got -replace "`r`n", "`n").TrimEnd()
+    # Assert on the exact $-sequences, not just equality, so a failure says WHICH one was eaten.
+    if ($gotN -ne $want) {
+        Write-Host "     wanted: $want" -ForegroundColor Red
+        Write-Host "     got   : $gotN" -ForegroundColor Red
+    }
+    ($gotN -eq $want) -and ($gotN -match '\$\$><script\.txt') -and
+        ($gotN -match '\$1') -and ($gotN -match '\$&') -and
+        # the surrounding file must survive too - a splice that ate the tail would pass an
+        # equality check on the block alone
+        ($raw -match 'top matter') -and ($raw -match 'tail matter')
+}
+
+It 'a START marker with no matching END is refused, not guessed at' {
+    # The splice has to find both markers. Silently appending a second block, or truncating from
+    # the start marker to EOF, would corrupt a file the user owns - and one of these four files is
+    # the user's global CLAUDE.md.
+    $f = Join-Path $abRoot ("agentblock-orphan-" + [guid]::NewGuid().ToString('N') + '.md')
+    Set-Content -LiteralPath $f -Value "keep me`n<!-- SUTEST_START -->`nno end marker here" -Encoding UTF8
+    $before = Get-Content -LiteralPath $f -Raw -Encoding UTF8
+    $threw = $false
+    try { Write-AgentBlock -FilePath $f -Marker 'SUTEST' -Body 'x' | Out-Null }
+    catch { $threw = $_.Exception.Message -match 'no matching' }
+    $after = Get-Content -LiteralPath $f -Raw -Encoding UTF8
+    $threw -and ($after -eq $before)
+}
+
 if (-not (Assert-SUSuiteFloor -SuiteFile $PSCommandPath -Ran ($script:Pass + $script:Fail))) { $script:Fail++ }
 Show-SUGuardSummary
 

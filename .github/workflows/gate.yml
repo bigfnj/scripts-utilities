@@ -153,3 +153,36 @@ jobs:
           }
           if ($bad) { exit 1 }
           "the deletion guard is the first dot-source in every suite"
+
+      # The deletion tripwire shadows Remove-Item, and nothing can shadow Set-Content safely (its
+      # positional Path AND positional Value, plus a pipeline-bound -Value, make a naive proxy
+      # truncate a multi-item write to its last line). So the writers that reach REAL user state
+      # with no path parameter to redirect are prohibited from tests by inspection instead.
+      #
+      # Write-AgentBlock is deliberately NOT on this list: it takes an explicit -FilePath, so a
+      # test can point it at TEMP, and one does. The four below cannot be redirected at all -
+      # Write-AgentDiscovery and Remove-AgentBlocks default to four files in the user's profile
+      # including the global CLAUDE.md, and the two PATH helpers rewrite the persistent user PATH.
+      # A test calling any of them is a negative test aimed at real machine state, which is the
+      # exact shape of the 2026-09-10 incident.
+      #
+      # SUTestGuard.ps1's header claimed this check existed before it did. Written 2026-09-11.
+      - name: No test reaches a writer that cannot be redirected
+        shell: powershell
+        run: |
+          $banned = @('Write-AgentDiscovery', 'Remove-AgentBlocks', 'Remove-UserPathEntry', 'Add-UserPathEntry')
+          $bad = 0
+          foreach ($f in Get-ChildItem .\tests -Filter '*.ps1') {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+            foreach ($c in $ast.FindAll({ param($n)
+                $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+              $name = $c.GetCommandName()
+              if ($name -and ($banned -contains $name)) {
+                Write-Host ("FAIL {0}:{1} calls {2} - it writes real user state and takes no path to redirect" -f `
+                  $f.Name, $c.Extent.StartLineNumber, $name)
+                $bad++
+              }
+            }
+          }
+          if ($bad) { exit 1 }
+          ("no test calls any of: " + ($banned -join ', '))

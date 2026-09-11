@@ -492,12 +492,32 @@ function Write-AgentBlock {
     if (-not (Test-Path $FilePath)) { Set-Content $FilePath "" -Encoding UTF8 }
 
     $content = Get-Content $FilePath -Raw -Encoding UTF8
-    if ($content -match [regex]::Escape($start)) {
-        $pattern = "(?s)" + [regex]::Escape($start) + ".*?" + [regex]::Escape($end)
-        $replacement = "$start`n$Body`n$end"
-        $content = $content -replace $pattern, $replacement
+    $block = "$start`n$Body`n$end"
+    # SPLICED BY INDEX, NOT -replace. The replacement side of -replace is a .NET regex
+    # SUBSTITUTION string, so every $-sequence in the body was interpreted on its way to disk:
+    #   $$  -> a single literal $        $&  -> the whole match
+    #   $1  -> capture group 1, and this pattern has NO groups, so it expanded to nothing
+    # The body documents a cdb invocation, `cdb -c ".logopen out.txt; $$><script.txt; q"`, and
+    # every deploy silently wrote `$><script.txt` - a DIFFERENT and wrong cdb command - into all
+    # four agent files. The generator was correct in memory the whole time; the writer corrupted
+    # it, which is why this survived a year of the text being read and re-read.
+    #
+    # Found on 2026-09-11 by the new deployed-vs-generated check: bootstrap rewrote all four
+    # blocks and the drift went from 26 of 119 lines to exactly 1 - the same line - which is the
+    # signature of a lossy WRITE rather than a stale file. A round-trip test now pins it.
+    #
+    # IndexOf/Substring has no substitution semantics at all, which is the point: there is no
+    # escaping convention here to get wrong a second time.
+    $iStart = $content.IndexOf($start, [System.StringComparison]::Ordinal)
+    if ($iStart -ge 0) {
+        $iEnd = $content.IndexOf($end, $iStart, [System.StringComparison]::Ordinal)
+        if ($iEnd -lt 0) {
+            throw ("$FilePath has a $start marker with no matching $end - refusing to guess where " +
+                   "the block ends. Remove the stray marker by hand and re-run.")
+        }
+        $content = $content.Substring(0, $iStart) + $block + $content.Substring($iEnd + $end.Length)
     } else {
-        $content = $content.TrimEnd() + "`n`n$start`n$Body`n$end`n"
+        $content = $content.TrimEnd() + "`n`n$block`n"
     }
     $backup = "$FilePath.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
     if (Test-Path $FilePath) { Copy-Item $FilePath $backup -Force }
