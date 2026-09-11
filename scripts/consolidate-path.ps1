@@ -220,7 +220,27 @@ if ($ElevatedFor) {
     # practice nobody ever reads its output - including the backup path it prints, which is the
     # one line you need when a PATH change goes wrong. Transcribe it beside the PATH backups.
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-    try { Start-Transcript -Path $ElevatedLog -Force | Out-Null } catch { }
+    # NOT an empty catch. The one failure that actually occurs here is "Transcription has already
+    # been started" - fresh-toolbox-setup-runner.ps1 starts its own transcript and then invokes
+    # this script with `&`, so the child inherits a session that is already transcribing and 5.1
+    # throws. Swallowing that silently made the parent's promise at the elevation gate ("the
+    # elevated run transcribes to $ElevatedLog") false with no trace, which is worse than not
+    # promising it: the operator goes looking for a file that was never going to exist.
+    #
+    # Already-transcribing is benign - the output still lands in the RUNNER's transcript, so
+    # nothing is lost - so it is reported and execution continues. Any other failure (a locked
+    # file, a full disk) is reported with its real message for the same reason.
+    $script:TranscriptStarted = $false
+    try {
+        Start-Transcript -Path $ElevatedLog -Force | Out-Null
+        $script:TranscriptStarted = $true
+    } catch {
+        if ($_.Exception.Message -match 'already been started') {
+            Write-Info2 "already transcribing - this run's output goes to the caller's transcript, not $ElevatedLog"
+        } else {
+            Write-Warn2 "could not transcribe to $ElevatedLog ($($_.Exception.Message)) - output is console-only"
+        }
+    }
 }
 
 # --- restore ------------------------------------------------------------------

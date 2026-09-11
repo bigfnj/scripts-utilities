@@ -90,6 +90,9 @@ $ConfigSource  = Join-Path $REPO_ROOT 'config\sysmon-filedelete.xml'
 # Deployed OUTSIDE the toolbox on purpose: DevToolbox was destroyed in the incident this exists
 # to investigate, so the forensics config must not live inside its own subject.
 $ConfigDeployed = Join-Path $env:ProgramData 'Sysmon\filedelete-forensics.xml'
+# Fixed name, not timestamped, because the UNELEVATED parent has to print this path before the
+# elevated child exists. Same reasoning and same location as consolidate-path.ps1's.
+$ElevatedLog = Join-Path $REPO_ROOT 'logs\deletion-forensics-elevated.log'
 
 # Resolved HERE, at the top, while we may still be the interactive user. See -ProfilePath.
 if (-not $ProfilePath) { $ProfilePath = $env:USERPROFILE }
@@ -258,8 +261,45 @@ if (-not (Test-Elevated) -and -not $DryRun) {
     if ($Uninstall) { $argList += '-Uninstall' }
     if ($ShrinkJournal) { $argList += '-ShrinkJournal' }
     if ($NoSchedule) { $argList += '-NoSchedule' }
+
+    # TELL THE OPERATOR WHERE THE OUTPUT WENT, BEFORE THE CHILD EXISTS.
+    #
+    # A UAC child owns a brand-new console that is destroyed the instant it exits, so on
+    # 2026-09-11 a completely successful run of this script looked like this, in full:
+    #
+    #     WARN Elevation is required to install a driver and resize the USN journal. Relaunching...
+    #
+    # and nothing else, ever. Success and failure are character-for-character identical from the
+    # caller's side, which cost an investigation to establish that the redeploy had in fact
+    # worked (the only evidence was the deployed config's mtime).
+    #
+    # -RedirectStandardOutput CANNOT fix this: it lives in Start-Process's Default parameter set
+    # and -Verb lives in UseShellExecute, so the two are mutually exclusive and adding it is a
+    # binding error, not a fix. A transcript started INSIDE the child is the only mechanism, and
+    # the path has to be fixed rather than timestamped so the parent can print it in advance.
+    # scripts\consolidate-path.ps1 has done exactly this since 2026-09-10; this script is the
+    # other self-elevating script in the repo and did not.
+    Write-Info "elevated run transcribes to $ElevatedLog"
     $p = Start-Process powershell.exe -Verb RunAs -ArgumentList $argList -PassThru -Wait
+    if ($p.ExitCode -ne 0) { Write-Err "the elevated run exited $($p.ExitCode) - read $ElevatedLog" }
+    else { Write-Ok "the elevated run finished; its full output is in $ElevatedLog" }
     exit $p.ExitCode
+}
+
+# The elevated child transcribes here. Benign failure modes are reported rather than swallowed:
+# an outer transcript (the runner starts one) makes 5.1 throw "already been started", and the
+# output then lands in the caller's transcript instead - nothing is lost, but a silent catch
+# would make the line printed above a lie.
+if ((Test-Elevated) -and -not $DryRun) {
+    New-Item -ItemType Directory -Force -Path (Split-Path $ElevatedLog) | Out-Null
+    try { Start-Transcript -Path $ElevatedLog -Force | Out-Null }
+    catch {
+        if ($_.Exception.Message -match 'already been started') {
+            Write-Info "already transcribing - this run's output goes to the caller's transcript"
+        } else {
+            Write-Warn "could not transcribe to $ElevatedLog ($($_.Exception.Message)) - output is console-only"
+        }
+    }
 }
 
 $sysmon = Find-Sysmon

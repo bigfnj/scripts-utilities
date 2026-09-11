@@ -166,19 +166,6 @@ function Get-AgentDiscoveryBody {
     }
 }
 
-function Get-AgentBlockTargets {
-    <#
-    .SYNOPSIS
-        Just the deployment targets and marker, for callers that do not need the body.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$CommonPath,
-        [Parameter(Mandatory)][string]$RepoRoot
-    )
-    $g = Get-AgentDiscoveryBody -CommonPath $CommonPath -RepoRoot $RepoRoot
-    [pscustomobject]@{ Targets = $g.Targets; Marker = $g.Marker; Reason = $g.Reason }
-}
-
 function Get-AgentBlockText {
     <#
     .SYNOPSIS

@@ -307,6 +307,16 @@ function Get-ShimPlan {
     # A -Pick nobody can honour is an operator error, and silently ignoring it would leave the
     # name contested while the operator believes it was resolved.
     foreach ($pk in @($pickMap.Keys)) {
+        # The skip list wins over -Pick, and that has to be SAID. The main loop below tests
+        # $skipKeys and `continue`s before it ever reads $pickMap, so a -Pick naming a
+        # never-shim name passed every check here and was then discarded in silence - the
+        # operator gets "44 written, 0 contested" and no hint that the one decision they made
+        # by hand was thrown away. That is the same defect class this validation block was
+        # added to prevent, one loop further on.
+        if ($skipKeys -contains $pk) {
+            throw ("-Pick '$pk=$($pickMap[$pk])' names '$pk', which is on the never-shim list, " +
+                   "so the pick could not be honoured. Remove it from -Skip, or drop the -Pick.")
+        }
         if (-not $byName.ContainsKey($pk)) {
             throw "-Pick '$pk=$($pickMap[$pk])' names '$pk', which no package under the packages root supplies."
         }
