@@ -689,8 +689,9 @@ Write-Host "`n== a shim's bytes are a property of the code, not of the checkout 
 It 'New-ShimBody emits exactly  @echo off<CRLF>"<target>" %*<CRLF>  in ASCII' {
     # The bytes, not a regex over them. The repo has core.autocrlf=true and no .gitattributes,
     # so a here-string or [Environment]::NewLine would make the line endings a property of the
-    # working copy. Three separate readers anchor their regex on $ (build-devtoolbox.ps1:336,
-    # smoke-test.ps1:280, Get-ShimTarget), so a lone LF makes every shim unparseable and the
+    # working copy. The reader anchors its regex on $ (Get-ShimTarget, now the ONLY one left -
+    # build-devtoolbox.ps1 and smoke-test.ps1 each carried a private copy until 2026-09-11 and
+    # both now call it), so a lone LF makes every shim unparseable and the
     # smoke test reports 47 healthy shims as zero stale AND zero present.
     $b = [Text.Encoding]::ASCII.GetBytes((New-ShimBody -Target 'C:\x\y.exe'))
     $want = [Text.Encoding]::ASCII.GetBytes("@echo off") + @(13, 10) +
@@ -896,6 +897,24 @@ It 'a -Pick whose prefix matches NOTHING throws instead of falling through' {
     $threw = $false
     try { Get-ShimPlan -Candidates $cands -Pick 'ffmpeg=NoSuchPackage' -TargetExists $alwaysThere | Out-Null }
     catch { $threw = $_.Exception.Message -match 'matches no package' }
+    $threw
+}
+It 'a -Pick naming a SKIPPED name throws rather than being silently dropped' {
+    # The skip list wins over -Pick, and it has to SAY so. The main loop tests $skipKeys and
+    # `continue`s before it ever reads $pickMap, so a -Pick for a never-shim name passed every
+    # validation above and was then discarded in silence: the operator gets "44 written, 0
+    # contested" and no hint that the one decision they made by hand was thrown away.
+    #
+    # Same defect class as the test directly above, one loop further on - which is why it is
+    # asserted separately rather than folded into that one. A -Pick that is honoured and a -Pick
+    # that is refused are both fine; a -Pick that is accepted and ignored is not.
+    $cands = Get-ShimCandidates -PackagesRoot $pkgRoot -Enumerate (New-FakeWalk -Files $ffFiles)
+    $threw = $false
+    try {
+        Get-ShimPlan -Candidates $cands -Pick 'ffmpeg=Gyan.FFmpeg' -Skip @('ffmpeg') `
+                     -TargetExists $alwaysThere -NativeBin 'P:	b
+ativein' | Out-Null
+    } catch { $threw = $_.Exception.Message -match 'never-shim list' }
     $threw
 }
 It 'a -Pick binds the name, and its SIBLINGS follow into the same package' {
@@ -1300,6 +1319,13 @@ It 'a START marker with no matching END is refused, not guessed at' {
     $after = Get-Content -LiteralPath $f -Raw -Encoding UTF8
     $threw -and ($after -eq $before)
 }
+
+# The fixture root goes with the section that made it. Invoke-SmokeLintTests.ps1 cleans its own in
+# a finally and $scratch is cleaned at the top of this file; this one was introduced on 2026-09-11
+# with neither, and run-gate.ps1 -Phase runs each suite TWICE (once via smoke-test, once directly),
+# so it leaked two GUID directories per gate run - the same class BACKLOG records growing from 138
+# to 154 orphans before anyone noticed.
+Remove-Item -LiteralPath $abRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host "`n== a PATH edit goes through the registry, or it is not an edit ==" -ForegroundColor Cyan
 
