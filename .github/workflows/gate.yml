@@ -186,3 +186,37 @@ jobs:
           }
           if ($bad) { exit 1 }
           ("no test calls any of: " + ($banned -join ', '))
+
+      # Stray control characters are the signature of a patch script whose string escapes were
+      # interpreted: a Windows path written as "scripts\build" in a tool that processes \b yields
+      # a literal BACKSPACE, "P:\tb\native" yields TAB and newline. Two such files reached main on
+      # 2026-09-11 - one in a comment, one inside a single-quoted PowerShell string in a test that
+      # PASSED, because a single-quoted string may legally span lines and the mangled argument was
+      # never read on the path under test.
+      #
+      # That is why this is a byte check and not a review item: the damage is invisible in every
+      # editor and in every `Read`, survives parsing, and survives a green suite. Only `cat -A` or
+      # a byte scan shows it. TAB, CR and LF are the only control characters a source file in this
+      # repo has any business containing.
+      - name: No stray control characters in tracked files
+        shell: powershell
+        run: |
+          $bad = 0
+          $exts = '.ps1', '.psm1', '.json', '.yml', '.md', '.xml', '.cmd'
+          foreach ($f in (Get-ChildItem -Recurse -File | Where-Object { $exts -contains $_.Extension })) {
+            $bytes = [IO.File]::ReadAllBytes($f.FullName)
+            for ($i = 0; $i -lt $bytes.Length; $i++) {
+              $b = $bytes[$i]
+              if ($b -lt 32 -and $b -ne 9 -and $b -ne 13 -and $b -ne 10) {
+                $rel = $f.FullName.Substring((Get-Location).Path.Length + 1)
+                # Report the LINE, so the message points at something a human can find.
+                $line = 1
+                for ($j = 0; $j -lt $i; $j++) { if ($bytes[$j] -eq 10) { $line++ } }
+                Write-Host ("FAIL {0}:{1} contains control byte 0x{2:X2} - an interpreted string escape, almost certainly \b, \t or \f from a patch script" -f $rel, $line, $b)
+                $bad++
+                break
+              }
+            }
+          }
+          if ($bad) { exit 1 }
+          "no stray control characters in any tracked source file"

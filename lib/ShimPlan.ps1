@@ -202,7 +202,7 @@ function Get-ShimCandidates {
 }
 
 # New-ShimBody and Get-ShimTarget used to live here. They moved to lib\ShimFormat.ps1 so the
-# four writers in modules\security.ps1 and the one in scriptsuild-devtoolbox.ps1 could reach
+# four writers in modules\security.ps1 and the one in scripts\build-devtoolbox.ps1 could reach
 # them without dot-sourcing this whole planner - see that file's header for the topology.
 
 function Get-ShimExisting {

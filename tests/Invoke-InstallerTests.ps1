@@ -741,7 +741,7 @@ It 'every file that reads a wrapper uses the character-identical regex, and Shim
     # for its location rather than for a defect. Same mistake, same day, as the repo-wide parse
     # sweep: the filter has to be applied to the path BELOW the root being scanned.
     $wtPrefix = '.claude' + [IO.Path]::DirectorySeparatorChar + 'worktrees'
-    $rootLen = (Resolve-Path -LiteralPath $repoRoot).Path.TrimEnd('').Length + 1
+    $rootLen = (Resolve-Path -LiteralPath $repoRoot).Path.TrimEnd('\').Length + 1
     foreach ($f in (Get-ChildItem -LiteralPath $repoRoot -Recurse -Filter *.ps1 -File |
                     Where-Object { -not $_.FullName.Substring($rootLen).StartsWith($wtPrefix, [StringComparison]::OrdinalIgnoreCase) })) {
         if ((Get-Content -LiteralPath $f.FullName -Raw) -match $pat) {
@@ -933,8 +933,7 @@ It 'a -Pick naming a SKIPPED name throws rather than being silently dropped' {
     $threw = $false
     try {
         Get-ShimPlan -Candidates $cands -Pick 'ffmpeg=Gyan.FFmpeg' -Skip @('ffmpeg') `
-                     -TargetExists $alwaysThere -NativeBin 'P:	b
-ativein' | Out-Null
+                     -TargetExists $alwaysThere -NativeBin 'P:\tb\native\bin' | Out-Null
     } catch { $threw = $_.Exception.Message -match 'never-shim list' }
     $threw
 }
