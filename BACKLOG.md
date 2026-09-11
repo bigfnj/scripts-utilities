@@ -236,6 +236,11 @@ than by running it. Extract them into `ForensicsReport.Core.ps1` alongside the e
   Both are fixed, and `bootstrap.ps1` now counts files `>= 100KB` with `eng.traineddata` required
   by name, because pointing `TESSDATA_PREFIX` at a directory of zero-byte files breaks OCR harder
   than leaving it unset.
+- ~~**`consolidate-path.ps1:241-245` overwrites the wrapper unconditionally**~~ DONE 2026-09-11,
+  and fixed TWICE independently: the planner keeps an existing wrapper whose target still exists,
+  and the writer refuses separately, so a planner-only regression cannot reach the disk. Measured
+  in production during the rebuild: 34 shims written, **118 existing wrappers left untouched**.
+  The original wording follows.
 - **`consolidate-path.ps1:241-245` overwrites `native\bin\<name>.cmd` unconditionally**, so a
   winget package shipping `ffmpeg.exe` silently replaces the toolbox's own shim - the comment at
   `:185-188` claims the opposite.
@@ -338,14 +343,22 @@ unnoticed.
 Confirmed by AST across both repos (265 definitions, 3,950 call sites) and re-grepped by bare
 name including `.xml`/`.json`/`.psd1`/`.md`.
 
-- `catalog.json`: `schema_version` (never validated - contrast `PMManifest.ps1:25-26`, which
-  enforces its own), the whole `toolbox_layers` block `:165-171`, `llm.runtime`, and
-  `tools[].optional` (set on all 24 entries, 0 readers). `llm.embedding_fallbacks` advertises a
-  fallback that exists nowhere **and** names models absent from `models_base`.
-- `manifest/tools.json` write-only keys from `Add-WinManifest` (`lib/common.ps1:389-393`):
-  `last_verified`, `status` (hardcoded `"core"`), and `installed_version` - the last costs an
-  `Invoke-Expression $Detect` **per tool** to compute something nothing reads.
-- `$activatePs1` (`lib/common.ps1:442`) - assigned, never read.
+- ~~`catalog.json`: `schema_version` (never validated), the whole `toolbox_layers` block,
+  `llm.runtime`, and `tools[].optional`.~~ **CLOSED, verified 2026-09-11.** `schema_version` is
+  enforced by `Get-Catalog`, and the bump to 2 is load-bearing rather than bookkeeping: an old
+  catalog against current code would silently skip the machine-PATH removal in
+  `uninstall-toolbox.ps1`. `toolbox_layers` is gone bar a `$comment` explaining its removal, and
+  `optional` has zero occurrences. `llm.runtime` is the only survivor of this bullet.
+- ~~`manifest/tools.json` write-only keys from `Add-WinManifest`: `last_verified`, `status`,
+  and `installed_version`.~~ **CLOSED.** All three removed, with comments recording why -
+  `installed_version` cost an `Invoke-Expression $Detect` per tool to compute something nothing
+  read.
+- ~~`$activatePs1` (`lib/common.ps1:442`) - assigned, never read.~~ **WRONG ON BOTH COUNTS,
+  withdrawn 2026-09-11.** There is no `$activatePs1` in `lib/common.ps1` at all; it lives in
+  `scripts/build-devtoolbox.ps1`, where it is assigned and then **read** as the target of
+  `Set-Content -Path $activatePs1`. Recorded rather than quietly deleted, because a dead-code list
+  that has been wrong once should say so - this entry survived because nobody re-grepped a bare
+  name that looked obviously dead.
 - The shipped activation helpers (`build-devtoolbox.ps1:521-534`) prepend the venv `Scripts`
   directory to PATH, putting `python.exe` there - which `lib/common.ps1:202-208` and
   `smoke-test.ps1:243-248` treat as a FAIL condition. Delete them or fix them.
@@ -367,10 +380,10 @@ Timed under Windows PowerShell 5.1, which is what the scheduled task runs. Numbe
 | Sentinel classification | 28,129 ms | one compiled alternation | ~~done 2026-09-10~~ (24.6x) |
 | `Split-Path` for parent dirs, 4 sites | 8,824 ms | compute `Dir` once at gather | ~~done 2026-09-10~~ (46x) |
 | Dead event-1 query | ~10 s at 40k events | render the command line instead of discarding it | ~~done 2026-09-10~~ |
-| `& $add` closure per output line | 257 ms / 4,000 rows vs 10 ms | call `AppendLine` directly in the row loop only | open (25x) |
+| `& $add` closure per output line | 257 ms / 4,000 rows vs 10 ms | call `AppendLine` directly in the row loop only | ~~done~~ verified closed 2026-09-11 |
 | `ConvertTo-FxHtml` call overhead | 694 ms / 12,000 calls vs 21 ms | inline in the row loop | open |
-| `Split-Path -Leaf` per row | 318 ms / 4,000 rows vs 17 ms | `[IO.Path]::GetFileName` | open |
-| Renderer re-classifies sentinels | 15 regexes x 4,000 | pass the `IsSentinel` flag through | open |
+| `Split-Path -Leaf` per row | 318 ms / 4,000 rows vs 17 ms | `[IO.Path]::GetFileName` | ~~done~~ verified closed 2026-09-11 |
+| Renderer re-classifies sentinels | 15 regexes x 4,000 | pass the `IsSentinel` flag through | ~~done~~ verified closed 2026-09-11 |
 | `Find-Executable` fallback | 4,048 ms per exhaustive miss | cache misses per run; bound the depth | open |
 | `build-devtoolbox.ps1:276,280` | 2 walks of one tree | one walk testing both names | open |
 
@@ -388,9 +401,16 @@ Timed under Windows PowerShell 5.1, which is what the scheduled task runs. Numbe
 
 ## Design decisions worth revisiting, not bugs
 
-- **Two weekly SYSTEM tasks, an hour apart, and the second measures the first.** pc-maintenance
-  runs Sunday 03:00 with `-Apply`; the forensics report runs 04:00 over the last 7 days. Neither
-  knows about the other. `plex-bif-orphans` deletes ~6,935 files per sweep at 100% recurrence,
+- **~~Two~~ ONE weekly SYSTEM task now.** `\PcMaintenance` was **removed on 2026-09-11** at the
+  user's instruction, before its first-ever `-Apply` run (Sunday 2026-09-13 03:00), on the machine
+  it had just been implicated in wiping. Verified gone by two independent signals: `schtasks`
+  reports absent where it previously reported access-denied, and no registration file remains
+  under `System32\Tasks`. `DeletionForensicsReport` is still registered, and the payload plus 19
+  run logs were retained. The task XML was exported first, so it is reversible.
+
+  The note below is kept because the hazard returns the moment anyone re-registers that task.
+  pc-maintenance ran Sunday 03:00 with `-Apply`; the forensics report runs 04:00 over the last 7
+  days. Neither knew about the other. `plex-bif-orphans` deletes ~6,935 files per sweep at 100% recurrence,
   which is a textbook burst by the report's own definition and would permanently own the hero
   tile. The only reason it does not is incidental: the Plex media directory is a junction to
   another volume, so the deletions fall outside the config's include prefix. Remove that junction
@@ -425,6 +445,65 @@ Timed under Windows PowerShell 5.1, which is what the scheduled task runs. Numbe
   no pruning; 9+ copies of `AGENTS.md` already sit in the profile root.
 
 ---
+
+---
+
+## Found during the consolidation round, 2026-09-11
+
+Each names the file and the measurement. Line numbers are deliberately omitted where a symbol
+name will do: every reference in this file predating this week is now stale for
+`build-devtoolbox.ps1`, `lib/common.ps1`, `consolidate-path.ps1` and `smoke-test.ps1`, which
+between them moved by hundreds of lines. Re-anchor by symbol, not by line.
+
+### A dry run can still write the real user PATH
+
+`Add-UserPathEntry` has no `-DryRun` branch. `bootstrap.ps1`'s `Register-ToolboxUserPath` guards
+its own call site, but `lib/catalog.ps1` does not: under `-DryRun`, `Install-WingetTool` returns
+`$true` **without installing**, so a `winget-machine` or `winget-default` tool with a
+`path_fallback` whose binary is absent reaches `Add-UserPathEntry` and writes the persistent user
+hive during a run that promised to change nothing. Left open deliberately during the registry
+migration, which was confined to the mechanism; closing it is a behaviour change belonging either
+to the catalog call sites or to a guard in the function.
+
+### `Find-Executable`'s miss cache is not the easy win it looks like
+
+BACKLOG measures the exhaustive miss at 4,048 ms and the obvious fix is a per-run cache. It is
+wrong. The dominant caller shape is probe, install, probe again (`Get-Python311` for uv,
+`Install-Ghostscript` for gswin64c), so a miss cache makes the install **unobservable** and
+returns `$null` from a box that now has the tool. Correctness needs invalidation threaded through
+every installer. Recorded in a comment at the function so nobody re-derives it as a quick fix.
+
+Measured while fixing the adjacent two-walk problem, and worth keeping because both alternatives
+lose: an unfiltered single walk is **86.1 ms**, slower than the 76.6 ms two-pass it would replace;
+`-Include` is **silently ignored under `-LiteralPath`** and returned every file in the package
+including `README.html`, so its apparent 19.4 ms was an inert filter. The shipped `-Filter` plus
+exact-name test is 37.9 ms, verified identical across 31 names x 27 packages.
+
+### Hot paths in `lib/ShimPlan.ps1`, unmeasured
+
+The sibling rule recomputes `Get-ShimNormalKey` on every innermost iteration of a four-deep loop
+and never caches the normalised form of `$bound`, which only grows by one per outer pass. The
+hygiene `shadowed` predicate grows an array with `+=` inside a loop and then does a linear
+`-notcontains` per name against a list that includes everything `system32` provides. Both are
+genuinely quadratic shapes. **Neither has been measured**, and at 47 names over 27 packages the
+absolute cost may be irrelevant - which is exactly why they are recorded here rather than
+"optimised" on sight. Measure before touching, in this file's own tradition.
+
+### The repo's markdown is still unlinted
+
+`.markdownlint.json` exists and its only consumer is a synthetic one-line fixture in `%TEMP%`.
+Neither CI nor `run-gate.ps1` lints `README.md`, `BACKLOG.md` or `docs/`. One live MD012 violation
+was found and fixed by hand on 2026-09-11; nothing would have caught the next one.
+
+### Interesting, not actionable
+
+Every failure in this round's rebuild was a **native command's stderr under a global
+`$ErrorActionPreference = 'Stop'`**, and the trigger is the PIPE, not the redirection: PowerShell
+promotes stderr to ErrorRecords whenever a native command's output flows into another command.
+Three different commands, three different disguises - uv's *success* message, Node's CA-bundle
+warning, and aria2's real error. `lib/common.ps1` had the lesson written down and applied at some
+call sites and not others. The generalisation now lives in `Invoke-NativeCapture`, and an AST test
+asserts no native command in the builder is piped.
 
 ## Features
 
