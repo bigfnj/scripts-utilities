@@ -160,10 +160,20 @@ function Get-UsnState {
 function Get-ForensicsHealth {
     $svc = Get-Service -Name 'Sysmon64', 'Sysmon' -ErrorAction SilentlyContinue | Select-Object -First 1
     $drv = $null
-    try { $drv = (& sc.exe query SysmonDrv 2>&1 | Select-String 'RUNNING') -ne $null } catch { $drv = $false }
+    # Invoke-Native, not a bare `2>&1 |`, for the reason written at its definition: this file runs
+    # under Stop, and all three probes below merge stderr. THE HEALTH REPORT WAS THE WORST PLACE
+    # FOR THAT. sc.exe writes "The specified service does not exist" to stderr when SysmonDrv is
+    # absent, which is the single most likely state a health check is run in, and the catch here
+    # turned that terminating record into $drv = $false - the same answer as "installed but
+    # stopped". The wrapper keeps the answer and removes the throw, so the catch now covers only
+    # what it was written for: sc.exe or wevtutil not being resolvable at all.
+    try {
+        $q = Invoke-Native -FilePath 'sc.exe' -Arguments @('query', 'SysmonDrv') -PassThru
+        $drv = ($q.Output -match 'RUNNING')
+    } catch { $drv = $false }
     $logMax = $null
     try {
-        $gl = & wevtutil gl $SysmonLog 2>&1 | Out-String
+        $gl = (Invoke-Native -FilePath 'wevtutil' -Arguments @('gl', $SysmonLog) -PassThru).Output
         $m = [regex]::Match($gl, '(?im)maxSize:\s*(\d+)')
         if ($m.Success) { $logMax = [int64]$m.Groups[1].Value }
     } catch { }
@@ -173,7 +183,7 @@ function Get-ForensicsHealth {
     $svcStart = $(if ($svc) { [string]$svc.StartType } else { $null })
     $drvStart = $null
     try {
-        $qc = & sc.exe qc SysmonDrv 2>&1 | Out-String
+        $qc = (Invoke-Native -FilePath 'sc.exe' -Arguments @('qc', 'SysmonDrv') -PassThru).Output
         $m = [regex]::Match($qc, '(?im)START_TYPE\s*:\s*\d+\s+(\S+)')
         if ($m.Success) { $drvStart = $m.Groups[1].Value }
     } catch { }

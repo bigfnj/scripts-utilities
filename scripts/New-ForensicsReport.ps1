@@ -66,6 +66,36 @@ $SysmonLog = 'Microsoft-Windows-Sysmon/Operational'
 # top-level code starts reading the event log immediately and exits on the unelevated path.
 . (Join-Path $PSScriptRoot 'ForensicsReport.Core.ps1')
 
+function Invoke-Native {
+    <#
+        Run a native command with its output captured and its stderr survivable, returning the
+        exit code beside the captured text. Same shape and name as the wrapper in
+        install-deletion-forensics.ps1, whose Get-UsnState probes the same journal.
+
+        Under this file's $ErrorActionPreference = 'Stop', 5.1 promotes a native command's stderr
+        to a TERMINATING NativeCommandError once PowerShell has redirected that stream, and fsutil
+        writes to stderr in exactly the case the only caller exists to detect - a volume with no
+        USN journal.
+
+        THE RESTORE IS THE POINT, and it is why this is a function rather than the inline
+        save/set/restore that used to sit at the call site. That version restored INSIDE its try,
+        after the fsutil line, with an empty catch below: the throw skipped the restore, the catch
+        swallowed it, and every statement in the rest of the report then ran under Continue -
+        including the retention prune this file's comments call the dangerous part. A finally
+        cannot be skipped by a throw; a trailing assignment can.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @()
+    )
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $FilePath @Arguments 2>&1 | Out-String
+        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out }
+    } finally { $ErrorActionPreference = $prev }
+}
+
 $SentinelPatterns = Get-FxSentinelPattern
 $sentinelRx = New-FxSentinelRegex -Pattern $SentinelPatterns
 
@@ -238,10 +268,12 @@ Write-Host ("  {0} distinct pairing(s); {1}" -f $seen.Count,
       else { 'no baseline yet - first run establishes it' })) -ForegroundColor DarkGray
 
 $usnMax = $null
+# The catch is kept for the case it was actually written for - fsutil not being resolvable at all
+# - and no longer absorbs the stderr throw that used to skip the preference restore. Parsing is
+# this file's own logic and stays under Stop, outside the wrapper's window. Every failure still
+# leaves $usnMax $null, so the report says the journal size is unknown rather than claiming one.
 try {
-    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    $o = & fsutil usn queryjournal C: 2>&1 | Out-String
-    $ErrorActionPreference = $prev
+    $o = (Invoke-Native -FilePath 'fsutil' -Arguments @('usn', 'queryjournal', 'C:')).Output
     $m = [regex]::Match($o, '(?im)^\s*Maximum Size\s*:\s*0x([0-9a-f]+)')
     if ($m.Success) { $usnMax = [Convert]::ToInt64($m.Groups[1].Value, 16) }
 } catch { }

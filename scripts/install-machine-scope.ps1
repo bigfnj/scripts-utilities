@@ -92,6 +92,37 @@ function Resolve-Winget {
     return $null
 }
 
+function Invoke-Native {
+    <#
+        Run a native command with its output captured and its stderr survivable, returning the
+        exit code beside the captured lines.
+
+        This file sets $ErrorActionPreference = 'Stop', and 5.1 turns a native command's stderr
+        into a TERMINATING NativeCommandError whenever PowerShell has redirected that stream.
+        `winget list` writes at least one line of source/agreement noise to stderr on a perfectly
+        normal run, so the probe that decides "already installed?" threw on the FIRST id and the
+        machine-scope install never started - while the log, written by Log before the call, said
+        the run had begun.
+
+        That matters more here than almost anywhere: this script runs under SYSTEM from a
+        scheduled task with its streams captured to a file, and an enclosing capture redirects
+        stderr for every native command inside it. Measured 2026-09-11 under 5.1, three
+        host-stream conditions: with an outer 2>&1 in play even an unredirected `& exe > $null`
+        raises the record. Dropping the 2>&1 here would therefore have looked like a fix and held
+        only when nobody was capturing the log.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @()
+    )
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $FilePath @Arguments 2>&1
+        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = @($out) }
+    } finally { $ErrorActionPreference = $prev }
+}
+
 $winget = Resolve-Winget
 if (-not $winget) {
     Log "FAIL winget.exe could not be resolved in this security context"
@@ -128,8 +159,9 @@ $failures = @()
 $alreadyCount = 0
 $plannedCount = 0
 foreach ($id in $Ids) {
-    $listed = & $winget list --id $id -e --accept-source-agreements 2>&1
-    if ($LASTEXITCODE -eq 0 -and ($listed -match [regex]::Escape($id))) {
+    $probe = Invoke-Native -FilePath $winget -Arguments @('list', '--id', $id, '-e', '--accept-source-agreements')
+    $listed = $probe.Output
+    if ($probe.ExitCode -eq 0 -and ($listed -match [regex]::Escape($id))) {
         Log "SKIP already installed: $id"
         $alreadyCount++
         continue

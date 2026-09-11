@@ -114,6 +114,38 @@ function Get-GateStatus {
     'ok'
 }
 
+function Invoke-GateSuite {
+    <#
+        Run one suite as a 5.1 child and hand back its MERGED output beside its exit code.
+
+        THE CLASSIFIER ABOVE WAS UNREACHABLE IN THE CASE IT EXISTS FOR. The 2>&1 is not
+        optional - Get-GateTally reads the tally out of whatever the child printed, and a suite
+        that dies writes the reason to stderr - but under this file's $ErrorActionPreference =
+        'Stop' a native command whose stderr PowerShell has redirected raises a terminating
+        NativeCommandError. So the merge that makes NO TALLY / FAILED / EXIT<>0 distinguishable
+        was also what killed the parent before Get-GateStatus could distinguish them, and a
+        child that merely warned on stderr took the gate down with it.
+
+        Measured 2026-09-11 under 5.1, across three host-stream conditions (console inherited,
+        parent-captured with 2>&1 | Out-String, Start-Process -RedirectStandard*): `$x = & cmd
+        /c "echo e 1>&2 & exit /b 0" 2>&1` throws in all three, and so does the 2>$null form;
+        a plain `| Out-Null` with no redirection throws in NONE of them. The redirection is the
+        trigger. Rejected: dropping the 2>&1 and reading stdout only - that is what makes a
+        suite's dying words invisible, which is the opposite of this gate's job.
+
+        Continue is scoped to the one statement and restored in a finally, not after the call:
+        an exception in that window would otherwise leave the REST of the gate running under
+        Continue, silently downgrading every check below it.
+    #>
+    param([Parameter(Mandatory)][string]$ScriptPath)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $ps51 -NoProfile -ExecutionPolicy Bypass -File $ScriptPath 2>&1 | Out-String
+        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out }
+    } finally { $ErrorActionPreference = $prev }
+}
+
 $isAdmin = ([Security.Principal.WindowsPrincipal] `
             [Security.Principal.WindowsIdentity]::GetCurrent()
            ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -141,8 +173,9 @@ foreach ($s in $suites) {
     }
 
     Write-Host ("running  {0,-11} {1}" -f $s.Name, $s.What) -ForegroundColor DarkGray
-    $out = & $ps51 -NoProfile -ExecutionPolicy Bypass -File $path 2>&1 | Out-String
-    $code = $LASTEXITCODE
+    $run = Invoke-GateSuite -ScriptPath $path
+    $out = $run.Output
+    $code = $run.ExitCode
 
     $t = Get-GateTally $out
     $status = Get-GateStatus -Passed $t.Passed -Failed $t.Failed -Code $code
@@ -183,8 +216,9 @@ if ($PSBoundParameters.ContainsKey('Phase')) {
                           -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
         $name = ($sf.BaseName -replace '^Invoke-', '' -replace 'Tests$', '').ToLowerInvariant()
         Write-Host ("running  {0,-11} directly, so a smoke test that dies early cannot hide it" -f $name) -ForegroundColor DarkGray
-        $sOut = & $ps51 -NoProfile -ExecutionPolicy Bypass -File $sf.FullName 2>&1 | Out-String
-        $sCode = $LASTEXITCODE
+        $sRun = Invoke-GateSuite -ScriptPath $sf.FullName
+        $sOut = $sRun.Output
+        $sCode = $sRun.ExitCode
         $st = Get-GateTally $sOut
         $sStatus = Get-GateStatus -Passed $st.Passed -Failed $st.Failed -Code $sCode
         if ($sStatus -ne 'ok') { $hardFail = $true; Write-Host $sOut }
