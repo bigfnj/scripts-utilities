@@ -1886,6 +1886,195 @@ It 'and one walk still prefers .exe over .cmd, finds a sole .cmd, and never reso
 
 Remove-Item -LiteralPath $bdRoot -Recurse -Force -ErrorAction SilentlyContinue
 
+Write-Host "`n== the shim writers and the gates that notice when one stops running ==" -ForegroundColor Cyan
+
+# Repo-relative worktree exclusion, and it is deliberately not the absolute
+# `-notlike '*\.claude\worktrees\*'` used higher up in this file. Three full copies of this tree
+# live under .claude\worktrees\ during parallel agent work, so they have to be skipped - but an
+# absolute pattern matches EVERY file when the suite is itself run from a worktree, which is why
+# the shim-regex test at :700 finds 0 hits and fails there (measured 2026-09-11: 80 passed / 1
+# failed from a worktree, 81 / 0 from the main checkout). Relative means "a worktree nested under
+# this repo", never "this repo".
+$suRepoPrefix = $repoRoot.TrimEnd('\') + '\'
+function Get-SURepoScripts {
+    Get-ChildItem -LiteralPath $repoRoot -Recurse -Filter *.ps1 -File -ErrorAction SilentlyContinue |
+        Where-Object { -not ($_.FullName.Substring($suRepoPrefix.Length) -like '.claude\worktrees\*') }
+}
+
+It 'every pipeline that starts with New-ShimBody ends in Set-Content -NoNewline' {
+    # THE byte guard, and the only new check here with teeth on live machine state.
+    #
+    # New-ShimBody's string ALREADY ends in CRLF, and Set-Content without -NoNewline appends one
+    # of its own - measured under 5.1: the four inline literals this commit replaced ended in
+    # `" %*` with no newline and the file on disk ended 22 20 25 2A 0D 0A, i.e. Set-Content added
+    # it. So -NoNewline is not tidiness, it is the difference between an unchanged wrapper and
+    # every wrapper gaining a THIRD line. windbg / ghidraRun / analyzeHeadless / poolmon /
+    # cdb / kd / ntsd / gflags / dumpchk would keep resolving by name while the smoke test's
+    # stale-shim check - which anchors on $ - lost the ability to tell healthy from stale.
+    #
+    # PIPELINES ONLY, so lib\ShimPlan.ps1:558, which hands the body to a $WriteFile scriptblock as
+    # an ARGUMENT, is out of scope by shape rather than by an exception list that would need
+    # editing the next time a writer changes hands.
+    $bad = @(); $sites = 0
+    foreach ($f in (Get-SURepoScripts)) {
+        $a = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+        if (-not $a) { continue }
+        foreach ($pipe in $a.FindAll({ param($n)
+                $n -is [System.Management.Automation.Language.PipelineAst] }, $true)) {
+            $els = @($pipe.PipelineElements)
+            if ($els.Count -lt 2) { continue }
+            if (-not ($els[0] -is [System.Management.Automation.Language.CommandAst])) { continue }
+            if ($els[0].GetCommandName() -ne 'New-ShimBody') { continue }
+            $sites++
+            $last = $els[-1]
+            # Parameter names by PREFIX, because PowerShell resolves them that way: -NoNew binds
+            # -NoNewline just as well, and Set-Content has no other parameter starting "No".
+            $hasNoNewline = $false
+            if ($last -is [System.Management.Automation.Language.CommandAst]) {
+                if ($last.GetCommandName() -eq 'Set-Content') {
+                    foreach ($e in $last.CommandElements) {
+                        if ($e -is [System.Management.Automation.Language.CommandParameterAst] -and
+                            $e.ParameterName -and ('NoNewline' -like ($e.ParameterName + '*'))) { $hasNoNewline = $true }
+                    }
+                }
+            }
+            if (-not $hasNoNewline) {
+                $bad += ('{0}:{1}' -f $f.FullName.Substring($suRepoPrefix.Length), $pipe.Extent.StartLineNumber)
+            }
+        }
+    }
+    if ($bad.Count) { Write-Host "     writes a third line: $($bad -join ', ')" -ForegroundColor Red }
+    if ($sites -lt 4) { Write-Host "     only $sites New-ShimBody pipeline(s) found - expected at least the four in modules\security.ps1" -ForegroundColor Red }
+    ($sites -ge 4) -and ($bad.Count -eq 0)
+}
+
+It 'the three-line Ghidra wrapper is byte-identical to what the inline literal emitted' {
+    # The -Prologue case pinned at BYTE level, because Ghidra's is the only wrapper whose SHAPE
+    # can drift. The CRLF used to live inside $jdkLine and be spliced into the middle of a format
+    # literal, so the with-JDK and without-JDK cases were two byte contracts maintained by one
+    # expression - and the three-line one is the case every positional reader gets wrong.
+    #
+    # The left-hand sides below are the OLD expression verbatim, plus the CRLF Set-Content used to
+    # append. Both branches measured identical on a TEMP fixture before the change: 132 B with a
+    # JDK, 61 B without.
+    $t = 'C:\Tools\ghidra_12.1.2_PUBLIC\ghidraRun.bat'
+    $j = 'C:\Users\Admin\AppData\Local\DevToolbox\native\jdk-21'
+    $oldJdk   = "@echo off`r`n" + "set `"JAVA_HOME=$j`"`r`n" + "`"$t`" %*" + "`r`n"
+    $oldPlain = "@echo off`r`n" + ""                          + "`"$t`" %*" + "`r`n"
+    $newJdk   = New-ShimBody -Target $t -Prologue @("set `"JAVA_HOME=$j`"")
+    $newPlain = New-ShimBody -Target $t -Prologue @()
+    # -ceq: a case-insensitive compare would accept "@ECHO OFF", which cmd tolerates and the
+    # readers' regex does not care about - but the point of this test is that the bytes did not
+    # move, so it compares them the way a byte comparison would.
+    ($newJdk -ceq $oldJdk) -and ($newPlain -ceq $oldPlain) -and
+        ([Text.Encoding]::ASCII.GetBytes($newJdk).Count -eq 132) -and
+        ([Text.Encoding]::ASCII.GetBytes($newPlain).Count -eq 61) -and
+        # and the reader still finds the target past the prologue line
+        ((Get-ShimTarget -Lines ($newJdk -split "`r`n")) -eq $t)
+}
+
+It 'modules\security.ps1 hand-rolls no shim body, and dot-sources nothing to avoid it' {
+    # Four writers lived in that file, each with its own copy of the byte shape. They reach
+    # New-ShimBody through BOOTSTRAP's scope - bootstrap.ps1:27 loads lib\common.ps1, which loads
+    # lib\ShimFormat.ps1 at its :19, and bootstrap.ps1:412 dot-sources the module into that same
+    # scope. A dot-source inside security.ps1 would be a SECOND load path for the same two
+    # functions, which is the condition lib\ShimFormat.ps1's header measured its topology on.
+    #
+    # The literal check runs over STRING AST NODES, not the file text: this module's own comments
+    # discuss `@echo off` on purpose, and a grep would flag the explanation for the fix.
+    $p = Join-Path $repoRoot 'modules\security.ps1'
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($p, [ref]$null, [ref]$null)
+    $calls = @($ast.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.GetCommandName() -eq 'New-ShimBody' }, $true))
+    $dots = @($ast.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.CommandAst] -and
+        $n.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Dot }, $true))
+    $literals = @($ast.FindAll({ param($n)
+        ($n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
+         $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) -and
+        $n.Extent.Text -match '@echo off' }, $true))
+    if ($dots.Count)     { Write-Host "     dot-sources at line(s): $(@($dots | ForEach-Object { $_.Extent.StartLineNumber }) -join ', ')" -ForegroundColor Red }
+    if ($literals.Count) { Write-Host "     inline shim literal at line(s): $(@($literals | ForEach-Object { $_.Extent.StartLineNumber }) -join ', ')" -ForegroundColor Red }
+    ($calls.Count -ge 4) -and ($dots.Count -eq 0) -and ($literals.Count -eq 0)
+}
+
+It "smoke-test.ps1's required-suite floor names every suite in tests\" {
+    # The floor is the ONLY thing that can notice a DELETED suite; the from-disk enumeration next
+    # to it cannot, by construction - it simply stops finding the file. gate.yml:100-110 has had
+    # this check for CI's hand-maintained list since it was written, and the local gate had the
+    # unguarded twin: Invoke-SmokeLintTests.ps1 was outside $suiteRequired from the day it was
+    # written until 2026-09-11, so enumeration RAN it and reported it green while a commit
+    # deleting it would have fired nothing locally at all.
+    #
+    # Derived on BOTH sides, so there is no count in this file to reflex-edit in the same commit
+    # that removes a suite - and the array literal is evaluated out of the AST, so nothing in
+    # smoke-test.ps1 runs (it checks ~40 installed tools and a live Sysmon service).
+    $smoke = Join-Path $repoRoot 'scripts\smoke-test.ps1'
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($smoke, [ref]$null, [ref]$null)
+    $asg = @($ast.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+        $n.Left.Extent.Text -eq '$suiteRequired' }, $true))
+    if ($asg.Count -ne 1) {
+        Write-Host "     found $($asg.Count) assignments to `$suiteRequired, expected exactly 1" -ForegroundColor Red
+        return $false
+    }
+    $named = @(Invoke-Expression $asg[0].Right.Extent.Text)
+    $onDisk = @(Get-ChildItem -LiteralPath (Join-Path $repoRoot 'tests') -Filter 'Invoke-*Tests.ps1' `
+                    -File -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+    $missing = @($onDisk | Where-Object { $named -notcontains $_ })
+    if ($missing.Count) { Write-Host "     not in the floor: $($missing -join ', ')" -ForegroundColor Red }
+    # TWO POSITIVE CONTROLS, and neither is the count of files on disk. "$onDisk.Count -ge 5" was
+    # the obvious one and it is wrong: renaming a suite aside is the mutation that proves the
+    # smoke test's floor fires, and a disk-count control makes THIS test fire on it too - two red
+    # lines for one defect, which is how the wrong check gets blamed. So the controls are (1) the
+    # floor list itself is not empty or gutted, and (2) the enumeration can still find the file
+    # this very test is running from. Both hold regardless of which OTHER suite exists.
+    if ($named.Count -lt 5) { Write-Host "     the floor names only $($named.Count) suite(s)" -ForegroundColor Red }
+    if ($onDisk -notcontains 'Invoke-InstallerTests.ps1') { Write-Host "     the enumeration cannot even find the suite it is running from" -ForegroundColor Red }
+    ($named.Count -ge 5) -and ($onDisk -contains 'Invoke-InstallerTests.ps1') -and ($missing.Count -eq 0)
+}
+
+It "smoke-test.ps1's 5.1 parse gate sweeps the tree, not a list of six names" {
+    # A CONDITION, not a grep for "Get-ChildItem -Recurse": the two assignments that build the
+    # list are taken out of smoke-test.ps1's AST and EVALUATED with $REPO_ROOT bound here, then
+    # the result is inspected. An enumeration sitting there feeding nothing would pass a source
+    # check and fails this one.
+    #
+    # The eight names below are precisely what the hand-written six-name list missed, so they are
+    # the files a revert would drop. Measured 2026-09-11: 6 gated, 35 .ps1 on disk - which meant a
+    # 7-only construct in any lib\ file was caught by CI on push and never by the local gate that
+    # README.md and docs\agent-rules.md tell people to run first.
+    #
+    # THE TWO HALVES COVER DIFFERENT HOSTS, stated because neither is sufficient alone. Running
+    # from the MAIN checkout, the "no .claude\worktrees\ entry" half catches a missing filter and
+    # the count half is loose. Running from a WORKTREE there is nothing nested to exclude, so the
+    # count half is what catches an ABSOLUTE filter - which would sweep 0 files there.
+    $smoke = Join-Path $repoRoot 'scripts\smoke-test.ps1'
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($smoke, [ref]$null, [ref]$null)
+    $asg = @($ast.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+        ($n.Left.Extent.Text -eq '$parseRoot' -or $n.Left.Extent.Text -eq '$fxFiles') }, $true) |
+        Sort-Object { $_.Extent.StartOffset })
+    if ($asg.Count -ne 2) {
+        Write-Host "     found $($asg.Count) of the 2 expected assignments (`$parseRoot, `$fxFiles)" -ForegroundColor Red
+        return $false
+    }
+    $REPO_ROOT = $repoRoot
+    $parseRoot = $null; $fxFiles = $null
+    foreach ($a in $asg) { Invoke-Expression $a.Extent.Text }
+    $rel = @(@($fxFiles) | ForEach-Object { $_.FullName.Substring($parseRoot.Length) })
+    $want = @('lib\ShimPlan.ps1', 'lib\ShimFormat.ps1', 'lib\path-registry.ps1',
+              'lib\AgentDiscovery.ps1', 'lib\SmokeLint.ps1', 'lib\common.ps1',
+              'lib\catalog.ps1', 'scripts\consolidate-path.ps1')
+    $uncovered = @($want | Where-Object { $rel -notcontains $_ })
+    $leaked = @($rel | Where-Object { $_ -like '.claude\worktrees\*' })
+    if ($uncovered.Count) { Write-Host "     not parse-gated: $($uncovered -join ', ')" -ForegroundColor Red }
+    if ($leaked.Count)    { Write-Host "     $($leaked.Count) nested-worktree file(s) swept, e.g. $($leaked[0])" -ForegroundColor Red }
+    if ($rel.Count -lt 20) { Write-Host "     swept only $($rel.Count) file(s) - the walk is not reaching the tree (no -Recurse, or an ABSOLUTE worktree filter, which excludes everything when the gate is run from a worktree)" -ForegroundColor Red }
+    ($uncovered.Count -eq 0) -and ($leaked.Count -eq 0) -and ($rel.Count -ge 20)
+}
+
 if (-not (Assert-SUSuiteFloor -SuiteFile $PSCommandPath -Ran ($script:Pass + $script:Fail))) { $script:Fail++ }
 Show-SUGuardSummary
 

@@ -278,11 +278,25 @@ if (Test-Path $tbRoot) {
     if (Test-Path $nativeBin) {
         $stale = @()
         foreach ($w in Get-ChildItem -LiteralPath $nativeBin -Filter '*.cmd' -File -ErrorAction SilentlyContinue) {
-            $line = Get-Content -LiteralPath $w.FullName -ErrorAction SilentlyContinue |
-                Where-Object { $_ -match '^"([^"]+)" %\*$' } | Select-Object -First 1
-            if ($line -and $line -match '^"([^"]+)" %\*$') {
-                if (-not (Test-Path -LiteralPath $Matches[1])) { $stale += "$($w.BaseName) -> $($Matches[1])" }
-            }
+            # Get-ShimTarget (lib\ShimFormat.ps1) rather than a local copy of the regex. Already in
+            # scope with no new dot-source: :15 loads lib\common.ps1, which loads ShimFormat.ps1 at
+            # its :19. A second load path for the same two functions is the drift this consolidates.
+            #
+            # This was the second of the three hand-written readers to go - scripts\build-
+            # devtoolbox.ps1:579-580 still holds the third as of this commit, being converted in
+            # parallel - and it spelled the pattern TWICE in three lines: once in the filter, once
+            # outside to read $Matches. ($Matches does
+            # leak out of a Where-Object filter under 5.1, measured, so the second spelling was
+            # belt-and-braces rather than a workaround. Two spellings of one pattern is still how a
+            # future edit changes one and not the other, which is the failure this check cannot
+            # survive: every reader anchors on $, and one drifted regex reports all 152 healthy
+            # shims as zero stale AND zero present - a silent, total loss of the check.)
+            #
+            # Get-ShimTarget also SCANS for the first matching line. modules\security.ps1 writes a
+            # three-line Ghidra wrapper with set "JAVA_HOME=..." in the middle, so the wrong reader
+            # loses Ghidra first and without a word.
+            $target = Get-ShimTarget -Lines @(Get-Content -LiteralPath $w.FullName -ErrorAction SilentlyContinue)
+            if ($target -and -not (Test-Path -LiteralPath $target)) { $stale += "$($w.BaseName) -> $target" }
         }
         if ($stale.Count -eq 0) { Test-Ok "all native\bin shims resolve to an existing target" }
         else {
@@ -487,8 +501,9 @@ if (-not $fxElevated) {
     else { Test-Warn "no weekly forensics report task (optional: install-deletion-forensics.ps1)" }
 }
 
-# The generator and its renderer must at least parse under 5.1 - the scheduled task runs
-# powershell.exe, not pwsh, and a parse error there fails silently at 04:00 on a Sunday.
+# Every .ps1 in this repository must at least parse under 5.1 - the scheduled forensics task and
+# run-gate.ps1 both run powershell.exe, not pwsh, and a parse error there fails silently at 04:00
+# on a Sunday.
 #
 # The parse MUST be delegated to powershell.exe rather than called in-process. [Parser] uses the
 # grammar of the HOST it runs in, so this gate checked 5.1 only when the gate itself happened to
@@ -501,29 +516,67 @@ $parseProbe = {
     foreach ($f in $Files) {
         $e = $null
         [void][System.Management.Automation.Language.Parser]::ParseFile($f, [ref]$null, [ref]$e)
-        if ($e -and $e.Count) { $bad += ('{0}|{1}' -f (Split-Path $f -Leaf), $e[0].Message) }
+        # The FULL path comes back and the parent makes it repo-relative. A leaf name was enough
+        # while this list was six hand-picked files; over the whole tree it stops saying which
+        # lib\ or scripts\ a name came from.
+        if ($e -and $e.Count) { $bad += ('{0}|{1}' -f $f, $e[0].Message) }
     }
     $bad -join "`n"
 }
-$fxFiles = @()
-foreach ($fxScript in 'New-ForensicsReport.ps1', 'ForensicsReport.Core.ps1',
-                      'ForensicsReport.Render.ps1', 'ForensicsReport.Triage.ps1',
-                      'install-deletion-forensics.ps1') {
-    $fxPath = Join-Path $PSScriptRoot $fxScript
-    if (-not (Test-Path $fxPath)) { Test-Fail "missing $fxScript" } else { $fxFiles += $fxPath }
+
+# THE LIST COMES FROM THE TREE, not from six names written down here.
+#
+# The hand-maintained version covered New-ForensicsReport.ps1, the three ForensicsReport.*.ps1,
+# install-deletion-forensics.ps1 and lib\SysmonConfig.ps1 - and had already fallen behind by a
+# week. lib\ShimPlan.ps1, ShimFormat.ps1, path-registry.ps1, AgentDiscovery.ps1, SmokeLint.ps1,
+# common.ps1, catalog.ps1 and scripts\consolidate-path.ps1 were all outside it, so a 7-only
+# construct in any of them was caught by CI on push and never by the local gate that README.md
+# and docs\agent-rules.md tell people to run first. Measured 2026-09-11: 6 files gated, 35 .ps1
+# on disk.
+#
+# gate.yml:82-95 already sweeps the whole tree recursively. Deriving the set the same way makes
+# the local gate and CI agree BY CONSTRUCTION rather than by two lists being edited in step -
+# the argument the suite loop below makes at :630-634, one check up.
+#
+# THE WORKTREE EXCLUSION IS REPO-RELATIVE, and that is not a detail. Parallel agent work puts
+# three full copies of this tree under .claude\worktrees\ (gitignored, present on disk), so they
+# have to be skipped or every file is parsed four times and a sibling's work-in-progress fails
+# this gate. But an absolute `-notlike '*\.claude\worktrees\*'` matches EVERY file when the gate
+# is itself run from a worktree, silently reducing the sweep to nothing: measured 2026-09-11,
+# that is exactly why Invoke-InstallerTests.ps1's shim-regex test finds 0 hits and fails from a
+# worktree (80 passed / 1 failed) while passing from the main checkout (81 / 0). Relative, so the
+# pattern means "a worktree nested under this repo", never "this repo".
+$parseRoot = $REPO_ROOT.TrimEnd('\') + '\'
+$fxFiles = @(Get-ChildItem -LiteralPath $REPO_ROOT -Recurse -Filter *.ps1 -File -ErrorAction SilentlyContinue |
+             Where-Object { -not ($_.FullName.Substring($parseRoot.Length) -like '.claude\worktrees\*') } |
+             Sort-Object FullName)
+
+# A FLOOR, and it is here for the same reason $suiteRequired is below: enumeration can never
+# notice a file that was DELETED. These six are the weekly SYSTEM task's own dependency chain,
+# and their absence used to be caught only as a side effect of the list naming them. Losing that
+# in the move to enumeration would have traded one blind spot for another.
+foreach ($fxReq in 'scripts\New-ForensicsReport.ps1', 'scripts\ForensicsReport.Core.ps1',
+                   'scripts\ForensicsReport.Render.ps1', 'scripts\ForensicsReport.Triage.ps1',
+                   'scripts\install-deletion-forensics.ps1', 'lib\SysmonConfig.ps1') {
+    if (-not (Test-Path -LiteralPath (Join-Path $REPO_ROOT $fxReq))) { Test-Fail "missing $fxReq" }
 }
-# The renderer/validator lives in lib\, and it is the piece that decides whether the sensor
-# watches anything at all - so it is parse-gated under 5.1 like the rest.
-$fxLib = Join-Path $REPO_ROOT (Join-Path 'lib' 'SysmonConfig.ps1')
-if (-not (Test-Path $fxLib)) { Test-Fail 'missing lib\SysmonConfig.ps1' } else { $fxFiles += $fxLib }
-if ($fxFiles.Count) {
-    $parseOut = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -Command $parseProbe -Args (,$fxFiles) 2>&1 | Out-String).Trim()
+
+if ($fxFiles.Count -eq 0) {
+    # Not reachable while this file is one of them, which is the point: a filter that stops
+    # matching would otherwise report a clean sweep of nothing.
+    Test-Fail "found no .ps1 files under $REPO_ROOT - the parse gate swept nothing"
+} else {
+    $parseOut = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -Command $parseProbe -Args (,@($fxFiles.FullName)) 2>&1 | Out-String).Trim()
     if ($parseOut) {
         foreach ($line in ($parseOut -split "`r?`n")) {
             $p = $line -split '\|', 2
-            Test-Fail ("{0} does not parse under 5.1: {1}" -f $p[0], $p[1])
+            $fxRel = $p[0]
+            if ($fxRel.StartsWith($parseRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                $fxRel = $fxRel.Substring($parseRoot.Length)
+            }
+            Test-Fail ("{0} does not parse under 5.1: {1}" -f $fxRel, $p[1])
         }
-    } else { Test-Ok ("{0} forensics script(s) parse under Windows PowerShell 5.1" -f $fxFiles.Count) }
+    } else { Test-Ok ("all {0} .ps1 file(s) in the repo parse under Windows PowerShell 5.1" -f $fxFiles.Count) }
 }
 
 # Every check in THIS file must be capable of failing.
@@ -584,8 +637,16 @@ if (-not (Test-Path -LiteralPath $smokeLintLib)) {
 # was DELETED, which is the failure rule 1 of run-gate.ps1's header exists for. Its blind spot is
 # the same as gate.yml's and is stated rather than discovered: one commit that removes a suite
 # AND drops it from this list fires nothing.
+#
+# Invoke-SmokeLintTests.ps1 was outside the floor from the day it was written until 2026-09-11,
+# and the gap is the exact shape the paragraph above describes: enumeration RAN it, so it showed
+# up green in every tally, while a commit deleting it would have fired nothing at all locally -
+# the from-disk list simply stops finding it and the floor had no name to miss. The suite it
+# covers is the one holding smoke-test.ps1's own checks capable of failing, so its silent removal
+# is the single most expensive deletion available in this repository.
 $suiteRequired = @('Invoke-CoreTests.ps1', 'Invoke-InstallerTests.ps1',
-                   'Invoke-TriageTests.ps1', 'Invoke-RenderTests.ps1')
+                   'Invoke-TriageTests.ps1', 'Invoke-RenderTests.ps1',
+                   'Invoke-SmokeLintTests.ps1')
 $suiteFiles = @(Get-ChildItem -LiteralPath (Join-Path $REPO_ROOT 'tests') -Filter 'Invoke-*Tests.ps1' `
                     -File -ErrorAction SilentlyContinue | Sort-Object Name)
 foreach ($suiteReq in $suiteRequired) {
@@ -605,7 +666,7 @@ foreach ($suiteFile in $suiteFiles) {
 
     # GUARD LIVENESS, asserted from the PARENT. tests\SUTestGuard.ps1:33-37 states its own blind
     # spot: it cannot see into a child powershell.exe, and every suite here IS a child. So it
-    # announces "tripwire ARMED" on every run (SUTestGuard.ps1:232-233) precisely so the parent
+    # announces "tripwire ARMED" on every run (SUTestGuard.ps1:257-260) precisely so the parent
     # can confirm from outside what the child cannot confirm about itself.
     #
     # This is strictly stronger than grepping the suite's source for "SUTestGuard": it catches the
@@ -627,7 +688,7 @@ foreach ($suiteFile in $suiteFiles) {
         if ($tFail -gt 0) { Test-Fail "$sName suite: $tFail failed" }
         # "0 passed, 0 failed" used to take the Test-Ok branch. An emptied file, a section that
         # stopped running, and a suite aborted before its first It all print exactly that, and
-        # reading it as green is the outer half of the hole SUTestGuard.ps1:158-160 describes -
+        # reading it as green is the outer half of the hole SUTestGuard.ps1:168-171 describes -
         # its own AST floor covers the inside of a suite, this covers a suite that produced
         # nothing at all.
         elseif ($tPass -eq 0) { Test-Fail "$sName suite reported 0 passed, 0 failed - an emptied or aborted suite is not a pass" }
