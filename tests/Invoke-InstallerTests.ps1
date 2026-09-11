@@ -41,6 +41,28 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $repoRoot 'modules\cli-tools.ps1')
 
 $script:DryRun = $false
+
+# SELF-HEALING SWEEP, run before anything creates a fixture.
+#
+# This suite builds three module-scope fixture roots (installer-tests-, agentblock-, builder-
+# tests-) and removes each at the end of its section. Those cleanups sit at column 0, NOT in a
+# finally - the file has no top-level try at all - so anything that throws at module scope
+# between a create and its cleanup strands the directory. The `It` harness catches per-test, so
+# the common path is covered and the THROW path is not, and `run-gate.ps1 -Phase` runs this suite
+# twice per invocation, so a failing phase run strands six.
+#
+# Measured 2026-09-11: 86 orphaned agentblock-* directories had accumulated before anyone counted,
+# which is the same way the earlier 154-file tmp*.tmp leak was found. The durable fix is not a
+# 2000-line try wrapper around the body - it is making the NEXT run clean up after the last one,
+# which needs no discipline from any future test author and cannot itself be skipped by a throw.
+# Bounded: at worst one run's worth of fixtures survives, and only until the next run.
+#
+# Deleting only inside TEMP, which is also the one place tests\SUTestGuard.ps1's shadow permits.
+foreach ($stalePrefix in 'installer-tests-', 'agentblock-', 'builder-tests-') {
+    Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Directory -Filter "$stalePrefix*" -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ("installer-tests-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $scratch -Force | Out-Null
 $script:MANIFEST = Join-Path $scratch 'tools.json'
