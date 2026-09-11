@@ -381,11 +381,14 @@ Timed under Windows PowerShell 5.1, which is what the scheduled task runs. Numbe
 | `Split-Path` for parent dirs, 4 sites | 8,824 ms | compute `Dir` once at gather | ~~done 2026-09-10~~ (46x) |
 | Dead event-1 query | ~10 s at 40k events | render the command line instead of discarding it | ~~done 2026-09-10~~ |
 | `& $add` closure per output line | 257 ms / 4,000 rows vs 10 ms | call `AppendLine` directly in the row loop only | ~~done~~ verified closed 2026-09-11 |
-| `ConvertTo-FxHtml` call overhead | 694 ms / 12,000 calls vs 21 ms | inline in the row loop | open |
+| `ConvertTo-FxHtml` call overhead | 1,654 / 1,440 ms, 16,000 calls | inline in the row loop | ~~done 2026-09-11~~ (12-14x, 117 ms) |
 | `Split-Path -Leaf` per row | 318 ms / 4,000 rows vs 17 ms | `[IO.Path]::GetFileName` | ~~done~~ verified closed 2026-09-11 |
 | Renderer re-classifies sentinels | 15 regexes x 4,000 | pass the `IsSentinel` flag through | ~~done~~ verified closed 2026-09-11 |
-| `Find-Executable` fallback | 4,048 ms per exhaustive miss | cache misses per run; bound the depth | open |
-| `build-devtoolbox.ps1:276,280` | 2 walks of one tree | one walk testing both names | open |
+| `Find-Executable` fallback | 4,048 ms per exhaustive miss | ~~cache misses per run~~ | **REJECTED** - see below |
+| `build-devtoolbox.ps1:276,280` | 2 walks of one tree | one walk testing both names | ~~done 2026-09-11~~ (76.6 -> 37.9 ms) |
+| `ShimPlan` sibling rule renormalises | 555 ms real / 27,393 ms worst | memoise by input string, inline | ~~done 2026-09-11~~ (8.7x / 9.4x) |
+| `ShimPlan` `shadowed` predicate | 33.8 ms at real scale | ~~HashSet instead of `-notcontains`~~ | **REJECTED** - 31.4 ms, saves 2.4 ms |
+| `Add-UserPathEntry` duplicate entries | 2 entries in both hives | ask the machine hive before adding | ~~done 2026-09-11~~ |
 
 **Measured and REJECTED - do not "fix" these:**
 
@@ -393,6 +396,16 @@ Timed under Windows PowerShell 5.1, which is what the scheduled task runs. Numbe
   and raising `[regex]::CacheSize` changed nothing. The cache is not thrashing.
 - Combining the three `Get-WinEvent` passes into one `Id=@(1,4,26)` query saved only 18%
   (1,073 ms -> 882 ms). Not worth the branching.
+- The `shadowed` hygiene predicate's `+=` growth and linear `-notcontains` in `lib/ShimPlan.ps1`.
+  A real quadratic shape, and at this box's real scale - 42 composed PATH entries providing 1,231
+  names - it is **33.8 ms against 31.4 ms** for a `HashSet`. 2.4 ms is not a reason to rewrite the
+  predicate that decides whether to delete a PATH entry. Its neighbour in the same entry, the
+  sibling rule, measured 555 ms and WAS fixed: same "genuinely quadratic" description, opposite
+  verdict, which is the whole reason that entry said measure first.
+- Wrapping a memoised lookup in a scriptblock (`& $normOf`). A closure call costs the same ~64 us
+  of dispatch as the function call it replaces, so it saves nothing - this is the third time the
+  repo has measured it, after the `& $add` renderer closure and the `[Predicate[byte]]` above.
+  When the cost IS dispatch, the only fix is fewer calls, not cheaper-looking ones.
 - `Sort-Object -Top` at `Render.ps1:258`: **`-Top` does not exist in Windows PowerShell 5.1**. It
   would be green locally under pwsh and broken at 04:00 on a Sunday. The full sort of 100k
   objects is only 1,019 ms anyway.
@@ -479,15 +492,32 @@ lose: an unfiltered single walk is **86.1 ms**, slower than the 76.6 ms two-pass
 including `README.html`, so its apparent 19.4 ms was an inert filter. The shipped `-Filter` plus
 exact-name test is 37.9 ms, verified identical across 31 names x 27 packages.
 
-### Hot paths in `lib/ShimPlan.ps1`, unmeasured
+### Hot paths in `lib/ShimPlan.ps1` - ~~unmeasured~~ measured 2026-09-11, split verdict
 
-The sibling rule recomputes `Get-ShimNormalKey` on every innermost iteration of a four-deep loop
-and never caches the normalised form of `$bound`, which only grows by one per outer pass. The
-hygiene `shadowed` predicate grows an array with `+=` inside a loop and then does a linear
-`-notcontains` per name against a list that includes everything `system32` provides. Both are
-genuinely quadratic shapes. **Neither has been measured**, and at 47 names over 27 packages the
-absolute cost may be irrelevant - which is exactly why they are recorded here rather than
-"optimised" on sight. Measure before touching, in this file's own tradition.
+Both were described here as "genuinely quadratic shapes" with the instruction to measure before
+touching. Measured, they land on opposite sides, which is the best argument this file has for
+that instruction.
+
+**The sibling rule: FIXED.** `Get-ShimNormalKey` costs **78 us a call** - dispatch, not the two
+string operations inside it - and the innermost iteration of the four-deep loop called it on
+every pass. Old against new, at both shapes, asserting the same hit count:
+
+| shape | before | after | |
+|---|---|---|---|
+| real (deferred 6, bound 47, cands 3) | 555 ms | 64 ms | 8.7x |
+| worst (deferred 47, bound 47, cands 3) | 27,393 ms | 2,916 ms | 9.4x |
+
+Memoised **by input string**, not by name: the same string always normalises to the same key, so
+the cache is a property of `Get-ShimNormalKey` rather than of `$bound`'s contents and cannot go
+stale. A per-name cache would break silently the day a rule re-binds a name. 50 distinct paths
+are normalised now, in place of 5,076 and 311,469 calls.
+
+**The `shadowed` predicate: REJECTED**, 33.8 ms against 31.4 ms. See the rejected list above.
+
+**The trap, recorded because it nearly shipped:** the first draft of the memo wrapped the lookup
+in a `& $normOf` scriptblock, which saves nothing - a closure call costs the same dispatch as the
+function call it replaces. Three call sites of inline hashtable check is uglier and is the only
+version that is faster. When the cost is dispatch, the fix is fewer calls.
 
 ### The repo's markdown is still unlinted
 
@@ -647,6 +677,56 @@ workflow or test links to it, and it is dated 2026-07-31. `scripts/install-whisp
 referenced only by a table row in `README.md`; no code path invokes it, unlike
 `scripts/install-ghidra.ps1` which is wired into the runner and the security module. Either
 deliberate manual-only tooling or stranded; decide rather than leave it ambiguous.
+
+## Closing the consolidation round, 2026-09-11
+
+### ~~PATH carried two entries in both hives~~ FIXED
+
+`Add-UserPathEntry` only ever read the user hive, so every `bootstrap.ps1` run re-added the
+toolbox `native\bin` and `sysinternals` entries that the machine hive already carried. Windows
+composes machine-then-user, so neither user copy has ever won a lookup - removing them cannot
+change which `ffmpeg` or `rg` answers. Measured before changing anything: `user:1 machine:1` for
+both. Fixed with a new pure `Test-PathListProvides`, and both entries added to
+`config/path-hygiene.json` as `duplicate-in-machine`.
+
+**The order matters and is asserted by a test.** Adding those config entries is only safe
+BECAUSE of the guard: without it, `-Prune` removes the user copies and the next bootstrap run
+puts them straight back, and the two halves of this repo undo each other forever. The test
+asserts ORDER AND EFFECT, not presence, because a `Test-PathListProvides` call sitting anywhere
+in the function satisfies "the guard exists" while deciding nothing.
+
+### `config/path-hygiene.json` carries one entry that is already gone
+
+`%ProgramFiles%\Common Files\Oracle\Java\javapath` is in neither hive now. This is benign and
+self-reporting - `Get-PathHygienePlan` skips it with "not on the machine PATH any more" - and it
+is left in place deliberately, since the predicate is re-measured every run and the entry earns
+its place back the moment an Oracle JRE installer recreates it. Noted so the next reader does not
+mistake the skip line for a failure.
+
+### ~~The ledger hard-failed on a test count going UP~~ FIXED
+
+Any change to a unit-suite count failed the gate. The ledger's own history was the argument
+against it: `installer` went 38 -> 76 -> 79 -> 99 across four phases in one day, every one a
+DRIFT that had to be waved through, and a gate that is routinely waved through stops being read.
+A DECREASE still hard-fails; an INCREASE is a TRANSITION with the delta. Fails closed on `?`.
+
+### `subprocess.run(timeout=)` cannot kill a grandchild holding the pipe
+
+Hit twice today while scripting mutation runs in Python. `subprocess.run(..., capture_output=True,
+timeout=N)` against `powershell.exe` hangs past the timeout whenever the child spawns its own
+child that inherits the stdout handle: the timeout kills the direct child, then the parent blocks
+forever reading a pipe that the surviving grandchild still holds open. Redirect to a **file**
+instead of a pipe and the timeout behaves. Every mutation harness in `scratchpad/` does this now.
+Worth knowing before the next agent writes one.
+
+### The perf audit's numbers were optimistic where they were checkable
+
+Two audit figures were reproduced this round and neither held. `ConvertTo-FxHtml` was predicted at
+1,059 -> 17 ms (61x); measured twice it is 1,654 / 1,440 -> 117 / 119 ms (12-14x), because the
+audit timed bare `.Replace()` chains without the per-field `[string]` cast and empty check that
+preserve behaviour. The earlier BACKLOG figure for the same item, "694 ms / 12,000 calls",
+predated the command-line title and understated its own finding by a third. **Audit figures are a
+place to look, not a result to cite.** Reproduce before recording.
 
 ## Deferred
 
