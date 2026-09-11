@@ -713,8 +713,15 @@ It 'every file that reads a wrapper uses the character-identical regex, and Shim
     # at any number in between - while a NEW divergent copy still fails it.
     $pat = '\^"\(\[\^"\]\+\)" %\\\*\$'
     $hits = @()
+    # RELATIVE exclusion, not absolute. `-notlike '*\.claude\worktrees\*'` on the FULL path
+    # excludes every file in the tree when $repoRoot is ITSELF a worktree - which is how three
+    # parallel agents run - so the test reported 85/1 inside a worktree and 86/0 on main, failing
+    # for its location rather than for a defect. Same mistake, same day, as the repo-wide parse
+    # sweep: the filter has to be applied to the path BELOW the root being scanned.
+    $wtPrefix = '.claude' + [IO.Path]::DirectorySeparatorChar + 'worktrees'
+    $rootLen = (Resolve-Path -LiteralPath $repoRoot).Path.TrimEnd('').Length + 1
     foreach ($f in (Get-ChildItem -LiteralPath $repoRoot -Recurse -Filter *.ps1 -File |
-                    Where-Object { $_.FullName -notlike '*\.claude\worktrees\*' })) {
+                    Where-Object { -not $_.FullName.Substring($rootLen).StartsWith($wtPrefix, [StringComparison]::OrdinalIgnoreCase) })) {
         if ((Get-Content -LiteralPath $f.FullName -Raw) -match $pat) {
             $hits += $f.FullName.Substring($repoRoot.Length + 1)
         }
