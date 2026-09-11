@@ -224,10 +224,18 @@ than by running it. Extract them into `ForensicsReport.Core.ps1` alongside the e
   191, 277`; ~150 `X509Certificate2` per call in `lib/common.ps1:229-237`; `New-TemporaryFile` in
   `smoke-test.ps1:26` creates a file only its *name* is used from and the cleanup removes a
   directory instead (76 stray zero-byte `tmp*.tmp` currently in `%TEMP%`).~~ DONE 2026-09-10
-- **A partial tessdata download is permanent** despite the warning saying "rerun to retry"
+- ~~**A partial tessdata download is permanent** despite the warning saying "rerun to retry"
   (`build-devtoolbox.ps1:445-458`): `Install-Tessdata` short-circuits on `Test-Path` before the
   self-healing size check can run. Only `eng` and `osd` of 11 declared languages exist on this box,
-  and `bootstrap.ps1:351` counts files without checking size.
+  and `bootstrap.ps1:351` counts files without checking size.~~ DONE 2026-09-11
+
+  The entry recorded half the mechanism. The `Test-Path` short-circuit was only the first gate:
+  `Get-Download`'s **size**-failure branch threw WITHOUT deleting the partial, while its SHA-256
+  branch had always cleaned up after itself. So aria2c left a corpse, the next run's `Test-Path`
+  found it, and the failure became permanent — the two halves each made the other invisible.
+  Both are fixed, and `bootstrap.ps1` now counts files `>= 100KB` with `eng.traineddata` required
+  by name, because pointing `TESSDATA_PREFIX` at a directory of zero-byte files breaks OCR harder
+  than leaving it unset.
 - **`consolidate-path.ps1:241-245` overwrites `native\bin\<name>.cmd` unconditionally**, so a
   winget package shipping `ffmpeg.exe` silently replaces the toolbox's own shim - the comment at
   `:185-188` claims the opposite.
@@ -263,9 +271,67 @@ end-of-stream marker pair. `Remove-Event` then consumes both and throws, which u
 `$ErrorActionPreference = 'Stop'` would have killed the click handler AFTER a successful
 install. Worth knowing before anyone writes another event-driven pump.
 
-**Still open in this section:** the permanent partial tessdata download, the unconditional shim
-overwrite in `consolidate-path.ps1`, the stale deployed agent block, and `.bak-<timestamp>`
-files accumulating unpruned.
+**Still open in this section:** `.bak-<timestamp>` files accumulating unpruned. The partial
+tessdata download and the unconditional shim overwrite were fixed on 2026-09-11; the stale
+deployed agent block is now *detected* by the gate rather than invisible, which is the half that
+was missing.
+
+---
+
+## Found while rebuilding the toolbox, 2026-09-11
+
+Surfaced by the rebuild effort rather than by a sweep. Each names the file and the measurement.
+
+### A degraded build still reports success
+
+`build-devtoolbox.ps1` `Install-Tessdata` collects a `$failed` list, prints it, and discards it,
+so a run that lands **0 of 11** languages still exits 0. `Install-Ghostscript` and
+`Install-Sysinternals` are best-effort by explicit and defensible design (a missing Ghostscript
+should not fail a whole toolbox build), but **nothing aggregates the three into one "this build is
+degraded" signal**, and the manifest is written *before* `Run-Smoke` runs (`:874` vs `:877`) while
+`bootstrap.ps1:436` gates readiness on that manifest existing. So the honest summary is: three
+independent soft failures, no combined verdict, and a readiness flag that cannot see any of them.
+Wanted: a single `degraded` array in the manifest that `smoke-test.ps1` reads and reports.
+
+### `Get-Download` misreports a network failure as a truncated file
+
+Its aria2c leg ignores aria2c's exit code entirely and relies on the post-hoc size check to
+notice. It works, but the diagnostic is wrong: a DNS or TLS failure surfaces as "download failed
+or was unexpectedly small", which sends the reader looking at disk and mirrors rather than at the
+network. Capture and report the downloader's own exit code.
+
+### The forensics report classifies a package-cache wipe as noise
+
+`tests/Invoke-CoreTests.ps1` carries a test named `'a package cache is NOT a sentinel, or the tile
+is noise'`, asserting that `C:\Users\Admin\.nuget\packages\x` does **not** match the sentinel
+regex. That is correct for routine churn and wrong for a mass-deletion event, and it is not
+hypothetical: the 2026-09-10 wipe took **3,384 files across 128 package versions** out of the
+NuGet cache, including `onnxruntime.dll` and the .NET runtime packs, which blocked builds
+entirely — and it was found by hand, days later, not by the weekly report.
+
+The missing signal is **volume in one burst**, not path. A single file deleted from a package
+cache is noise; several thousand in one sweep is the loudest thing that happened that week. Any
+fix has to keep both properties, because a sentinel list that promotes package caches
+unconditionally would make `plex-bif-orphans` own the hero tile forever (see the design note
+below on the two weekly SYSTEM tasks).
+
+### Machine-state damage the PATH/toolbox audit did not cover
+
+Recorded because it was invisible to every check this repo has. `%USERPROFILE%\.dotnet\tools`
+holds `.store\wix\5.0.2` (14 files, 9.9 MB) and **no top-level `wix.exe`**, so
+`dotnet tool list --global` reports wix installed while `wix` does not run — the same
+payload-survived-shim-died shape as the winget packages this rebuild exists to repair, and as the
+NuGet cache. `wix` is absent from `%USERPROFILE%\.nuget\packages`, so an offline repair needs the
+nupkg from inside `.store`. Not this repo's to fix; worth knowing that the pattern recurs across
+every package manager on the box.
+
+### Nothing lints this repo's own markdown
+
+`.markdownlint.json` exists at the repo root, and its only consumer is `smoke-test.ps1:209-222`,
+which lints a synthetic one-line fixture in `%TEMP%` and picks the config up incidentally via
+markdownlint-cli's cwd search. Neither CI nor `run-gate.ps1` ever lints `README.md`, `BACKLOG.md`
+or `docs/`. Measured on 2026-09-11: one live MD012 violation in `BACKLOG.md`, pre-existing and
+unnoticed.
 
 ## Dead code
 

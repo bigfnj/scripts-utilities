@@ -76,7 +76,12 @@ function Assert-Prerequisites {
 #                       the end (leaking a code) on another - consolidate-path.ps1 does exactly
 #                       that: `exit 2` when elevation is declined, no exit at all on success.
 #   -TrustExitCode      the callee ends EVERY path in an explicit exit, so any unlisted non-zero
-#                       code is genuinely its own and is fatal. Only smoke-test.ps1 qualifies.
+#                       code is genuinely its own and is fatal. smoke-test.ps1 and bootstrap.ps1
+#                       both qualify: bootstrap.ps1 used to fall off the end and inherit the code
+#                       of whatever native command it ran last, which is why the runner stopped
+#                       trusting it; it now exits 1 on GROUP_FAILURES and 0 otherwise, so a
+#                       "bootstrap INCOMPLETE - N tool(s) failed" run must stop the runner rather
+#                       than letting it carry on to PATH consolidation over a half-installed box.
 function Invoke-Checked {
     param(
         [string]$Description,
@@ -117,7 +122,7 @@ try {
     if ($RefreshToolbox) { $bootstrapArgs.RefreshToolbox = $true }
     if ($SkipHeavy) { $bootstrapArgs.SkipHeavyToolboxBuild = $true }
     if ($SkipPlaywrightBrowsers) { $bootstrapArgs.SkipPlaywrightBrowsers = $true }
-    Invoke-Checked "Run bootstrap.ps1" { & $Bootstrap @bootstrapArgs }
+    Invoke-Checked "Run bootstrap.ps1" { & $Bootstrap @bootstrapArgs } -TrustExitCode
 
     if ($InstallGhidra) {
         Write-Step "optional Ghidra"

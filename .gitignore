@@ -1,6 +1,11 @@
 # AI agent infrastructure - local only, not for version control
 AI_UNDERSTANDING/
 .codex/
+# Agent worktrees land HERE, inside the repo, so each one is a full second copy of the tree.
+# Without this line `git add -A` stages every file of every concurrent agent's checkout.
+# Scoped to worktrees/ rather than all of .claude/ so a future tracked .claude/settings.json
+# or .claude/commands/ still works.
+.claude/worktrees/
 **/*.aiu.json
 CLAUDE.md
 AGENTS.md
