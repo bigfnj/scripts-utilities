@@ -697,18 +697,31 @@ It 'New-ShimBody emits exactly  @echo off<CRLF>"<target>" %*<CRLF>  in ASCII' {
             [Text.Encoding]::ASCII.GetBytes('"C:\x\y.exe" %*') + @(13, 10)
     (@(Compare-Object $b $want -SyncWindow 0).Count -eq 0) -and ($b.Count -eq 28)
 }
-It 'the shim regex is character-identical in all three files that read a wrapper' {
-    # A DRIFT guard, deliberately at source level: the three readers are in three files nothing
-    # forces to agree, and a regex that is merely equivalent today is how they stop agreeing.
-    # modules\security.ps1 writes a THREE-line Ghidra wrapper, so any reader that stops matching
+It 'every file that reads a wrapper uses the character-identical regex, and ShimFormat owns it' {
+    # A DRIFT guard at source level: a regex that is merely EQUIVALENT today is how readers stop
+    # agreeing. modules\security.ps1 writes a THREE-line Ghidra wrapper, so any reader that drifts
     # loses Ghidra first and silently.
+    #
+    # DERIVED, not hardcoded. This test named three files until 2026-09-11, when New-ShimBody and
+    # Get-ShimTarget moved into lib\ShimFormat.ps1 so the writers that dot-source nothing could
+    # reach them - and the test failed for the refactor rather than for a defect. A fixed list
+    # also cannot survive the consolidation now in progress, which takes the reader count from
+    # three to one: it would have to be edited in the same commit that reduces it, which is
+    # exactly the maintenance tax that gets a check deleted.
+    #
+    # The invariant is "all copies agree", not "there are N copies", so it holds at 3, at 1, and
+    # at any number in between - while a NEW divergent copy still fails it.
     $pat = '\^"\(\[\^"\]\+\)" %\\\*\$'
     $hits = @()
-    foreach ($f in @('lib\ShimPlan.ps1', 'scripts\build-devtoolbox.ps1', 'scripts\smoke-test.ps1')) {
-        $src = Get-Content (Join-Path $repoRoot $f) -Raw
-        if ($src -match $pat) { $hits += $f }
+    foreach ($f in (Get-ChildItem -LiteralPath $repoRoot -Recurse -Filter *.ps1 -File |
+                    Where-Object { $_.FullName -notlike '*\.claude\worktrees\*' })) {
+        if ((Get-Content -LiteralPath $f.FullName -Raw) -match $pat) {
+            $hits += $f.FullName.Substring($repoRoot.Length + 1)
+        }
     }
-    $hits.Count -eq 3
+    # At least one reader must exist, the canonical definition must be among them, and no file
+    # may carry a variant spelling - which is what a hit on the escaped pattern already proves.
+    ($hits.Count -ge 1) -and ($hits -contains 'lib\ShimFormat.ps1')
 }
 It 'Get-ShimTarget reads the THREE-line Ghidra wrapper, not just the two-line one' {
     # modules\security.ps1:278 emits  @echo off / set "JAVA_HOME=..." / "<target>" %*  - so a

@@ -33,6 +33,8 @@
     Tested by: tests\Invoke-InstallerTests.ps1
 #>
 
+. (Join-Path $PSScriptRoot 'ShimFormat.ps1')   # New-ShimBody / Get-ShimTarget
+
 # Split-PathList and Remove-PathEntryFromString live next door. Dot-sourced unconditionally
 # rather than behind a Get-Command probe: both files define functions only, so re-defining them
 # costs nothing, and a conditional import is the kind of thing that works until two callers
@@ -199,39 +201,9 @@ function Get-ShimCandidates {
     return @($out.ToArray())
 }
 
-function New-ShimBody {
-    <#
-        THE one definition of the shim byte shape:  @echo off<CRLF>"<abs target>" %*<CRLF>
-        ASCII, no BOM, written with -NoNewline so nothing appends a third line.
-
-        A LITERAL `r`n, never [Environment]::NewLine and never a here-string. The bytes have to
-        be a property of this code, not of the machine or of the checkout: the repo has
-        core.autocrlf=true and no .gitattributes, so a here-string's line endings are whatever
-        git handed this working copy. Three separate writers read these files back by regex -
-        build-devtoolbox.ps1:336 Get-WrapperTarget, smoke-test.ps1:280 (the stale-shim check)
-        and Get-ShimTarget below - and all three anchor on $, so a lone LF makes every shim
-        unparseable and the smoke test reports 47 healthy shims as 0.
-    #>
-    param([Parameter(Mandatory)][string]$Target)
-    return "@echo off`r`n`"$Target`" %*`r`n"
-}
-
-function Get-ShimTarget {
-    <#
-        The target a wrapper points at, or $null if no line matches. Same regex as
-        build-devtoolbox.ps1:336-342 and smoke-test.ps1:280-283, deliberately.
-
-        SCANS FOR THE FIRST MATCHING LINE - never "read the second line". modules\security.ps1:278
-        emits a THREE-line Ghidra wrapper with a `set "JAVA_HOME=..."` line in the middle, and a
-        positional read would report the JAVA_HOME assignment as Ghidra's target.
-    #>
-    param([string[]]$Lines = @())
-    foreach ($line in @($Lines)) {
-        if ($null -eq $line) { continue }
-        if ($line -match '^"([^"]+)" %\*$') { return $Matches[1] }
-    }
-    return $null
-}
+# New-ShimBody and Get-ShimTarget used to live here. They moved to lib\ShimFormat.ps1 so the
+# four writers in modules\security.ps1 and the one in scriptsuild-devtoolbox.ps1 could reach
+# them without dot-sourcing this whole planner - see that file's header for the topology.
 
 function Get-ShimExisting {
     <#

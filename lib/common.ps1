@@ -11,6 +11,13 @@ $script:MANIFEST = Join-Path $PSScriptRoot "..\manifest\tools.json"
 # defined a few lines down, which takes -Msg where consolidate-path.ps1's takes a positional $t.
 . (Join-Path $PSScriptRoot "path-registry.ps1")
 
+# New-ShimBody / Get-ShimTarget - the .cmd wrapper byte contract, shared with the four writers in
+# modules\security.ps1 (which run in bootstrap's scope, i.e. this one) and with the reader in
+# scripts\smoke-test.ps1. Deliberately a separate tiny file rather than lib\ShimPlan.ps1: pulling
+# 958 lines of planner into every bootstrap run to get a two-line string builder is the wrong
+# trade, and build-devtoolbox.ps1 - which dot-sources nothing else at all - needs it too.
+. (Join-Path $PSScriptRoot "ShimFormat.ps1")
+
 # -- Logging -------------------------------------------------------------------
 function Write-Info  { param([string]$Msg) Write-Host "  $Msg" -ForegroundColor Cyan }
 function Write-Ok    { param([string]$Msg) Write-Host "OK $Msg" -ForegroundColor Green }
