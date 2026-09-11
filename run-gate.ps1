@@ -257,8 +257,27 @@ if ($PSBoundParameters.ContainsKey('Phase')) {
             # step turns "18 missing tools" into 18 OKs without a line of this repository
             # changing. Failing on that would make the ledger unusable during exactly the work it
             # exists to track.
-            if ($k -eq 'smoke') { $transitions += ('smoke {0} -> {1}' -f $prevMap[$k], $phaseCounts[$k]) }
-            else                { $drift += ('{0} {1} -> {2}' -f $k, $prevMap[$k], $phaseCounts[$k]) }
+            if ($k -eq 'smoke') { $transitions += ('smoke {0} -> {1}' -f $prevMap[$k], $phaseCounts[$k]); continue }
+
+            # A DECREASE HARD-FAILS. AN INCREASE DOES NOT. Both used to, and it made the ledger
+            # punish the one thing this repo wants: adding a test. Every commit that fixed a bug
+            # here also added the check that catches it, so every one of them tripped DRIFT and
+            # had to be waved through - and a gate that is routinely waved through stops being
+            # read at all. A count that FELL is the real signal: a suite lost coverage, either by
+            # a deleted It block or by one that stopped being reached.
+            #
+            # FAILS CLOSED on anything it cannot compare. Format-GateCount emits '?' for a suite
+            # that printed no tally, and '?' must never be read as growth; if either side is not
+            # an integer this stays DRIFT.
+            $prevN = 0
+            $nowN = 0
+            $comparable = ([int]::TryParse([string]$prevMap[$k], [ref]$prevN)) -and
+                          ([int]::TryParse([string]$phaseCounts[$k], [ref]$nowN))
+            if ($comparable -and $nowN -gt $prevN) {
+                $transitions += ('{0} GREW {1} -> {2} (+{3})' -f $k, $prevN, $nowN, ($nowN - $prevN))
+            } else {
+                $drift += ('{0} {1} -> {2}' -f $k, $prevMap[$k], $phaseCounts[$k])
+            }
         }
         # A suite APPEARING or VANISHING changes the shape of the ledger rather than a count, and
         # it is already fatal elsewhere: smoke-test.ps1's required-suite floor fails on a deleted
@@ -270,8 +289,9 @@ if ($PSBoundParameters.ContainsKey('Phase')) {
 
         foreach ($tr in $transitions) { Write-Host ("TRANSITION {0}" -f $tr) -ForegroundColor Cyan }
         if ($drift.Count) {
-            # A unit-suite count that MOVED is either a regression or an addition nobody reviewed,
-            # and a test count has no environmental excuse the way the smoke triple does.
+            # A unit-suite count that FELL, or one that cannot be compared at all. Either way a
+            # test count has no environmental excuse the way the smoke triple does. Growth is
+            # reported above as a TRANSITION instead - see the reasoning at the decrease check.
             foreach ($d in $drift) { Write-Host ("DRIFT      {0}" -f $d) -ForegroundColor Red }
             $hardFail = $true
         } elseif ($transitions.Count -eq 0) {
