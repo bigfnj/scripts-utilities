@@ -614,13 +614,33 @@ function Find-Executable {
         }
     }
 
+    # THE RESOLVED FILE MUST ACTUALLY BE RUNNABLE, and that check is not decoration.
+    #
+    # On Windows, Get-Command returns an ApplicationInfo for a file it finds in a PATH directory
+    # by exact name, extension or not. Measured on a GitHub windows-latest runner 2026-09-17:
+    # `Find-Executable -Name 'README'` returned C:\Program Files\mongosh\README - mongosh is
+    # preinstalled there, its directory is on PATH, and it ships an extensionless README. This
+    # box has no such file, so the test covering it passed locally and failed only in CI.
+    #
+    # Returning that path is the failure this whole area guards against one level down: the
+    # caller wraps whatever comes back in a native\bin shim, and lib\ShimFormat.ps1's header
+    # already records that a shim pointing at the wrong file "looks exactly like a working one".
+    # A shim pointing at a README is worse - it resolves, runs, and does nothing.
+    #
+    # .ps1 stays handled below rather than being listed here: a PowerShell script is not
+    # runnable as a bare native command, which is exactly why it is swapped for its .cmd shim.
+    $runnable = '.exe', '.cmd', '.bat', '.com'
     $cmd = Get-Command $Name -ErrorAction SilentlyContinue
     if ($cmd -and $cmd.Source -and (Test-Path $cmd.Source)) {
-        if ([IO.Path]::GetExtension($cmd.Source) -ieq ".ps1") {
+        $ext = [IO.Path]::GetExtension($cmd.Source)
+        if ($ext -ieq ".ps1") {
             $cmdShim = [IO.Path]::ChangeExtension($cmd.Source, ".cmd")
             if (Test-Path $cmdShim) { return $cmdShim }
+        } elseif ($runnable -contains $ext.ToLowerInvariant()) {
+            return $cmd.Source
         }
-        return $cmd.Source
+        # Anything else falls through to the exhaustive search below, which filters on "$Name.exe"
+        # and so cannot return a non-executable at all.
     }
 
     # THE EXHAUSTIVE FALLBACK. BACKLOG measures this at 4,048 ms per miss and proposes "cache

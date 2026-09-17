@@ -2206,8 +2206,17 @@ It 'and one walk still prefers .exe over .cmd, finds a sole .cmd, and never reso
     #
     # Driven entirely off a TEMP fixture: $env:LOCALAPPDATA carries the fake Packages root, and
     # $env:ProgramFiles / ${env:ProgramFiles(x86)} are pointed at it too so the exhaustive
-    # fallback cannot reach this box on the README case. All three are process-wide, so they are
-    # restored in the finally.
+    # fallback cannot reach this box on the README case.
+    #
+    # $env:PATH IS REDIRECTED TOO, and leaving it out is what made this test lie about where it
+    # was looking. Find-Executable consults Get-Command before the exhaustive search, and
+    # Get-Command searches the REAL PATH no matter what the three variables above say. Measured
+    # on a GitHub windows-latest runner 2026-09-17: the README case resolved to
+    # C:\Program Files\mongosh\README, because mongosh is preinstalled there, its directory is on
+    # PATH, and it ships an extensionless README. This box has no such file, so the test passed
+    # locally and failed only in CI - for six days, behind an unrelated failure.
+    #
+    # All four are process-wide, so they are restored in the finally.
     $defs = Get-BuilderFnScope -Name 'Find-Executable'
     if (-not $defs) { Write-Host "       Find-Executable is gone" -ForegroundColor DarkYellow; return $false }
     $fix = Join-Path $bdRoot ('fe-' + [guid]::NewGuid().ToString('N'))
@@ -2219,6 +2228,7 @@ It 'and one walk still prefers .exe over .cmd, finds a sole .cmd, and never reso
         Set-Content -LiteralPath (Join-Path $pkg $leaf) -Value 'fixture' -Encoding ASCII
     }
     $savedLocal = $env:LOCALAPPDATA; $savedPf = $env:ProgramFiles; $savedPf86 = ${env:ProgramFiles(x86)}
+    $savedPath = $env:PATH
     try {
         $got = & {
             param($Defs, $Fix)
@@ -2228,6 +2238,7 @@ It 'and one walk still prefers .exe over .cmd, finds a sole .cmd, and never reso
             $env:LOCALAPPDATA = $Fix
             $env:ProgramFiles = $Fix
             ${env:ProgramFiles(x86)} = $Fix
+            $env:PATH = $Fix
             [pscustomobject]@{
                 Both   = (Find-Executable -Name 'zzboth' -WingetId 'Test.Tool')
                 Sole   = (Find-Executable -Name 'zzsole' -WingetId 'Test.Tool')
@@ -2236,12 +2247,80 @@ It 'and one walk still prefers .exe over .cmd, finds a sole .cmd, and never reso
         } $defs $fix
     } finally {
         $env:LOCALAPPDATA = $savedLocal; $env:ProgramFiles = $savedPf; ${env:ProgramFiles(x86)} = $savedPf86
+        $env:PATH = $savedPath
     }
     if ($got.Both -ne (Join-Path $pkg 'zzboth.exe')) { Write-Host ("       a package shipping both resolved to: {0}" -f $got.Both) -ForegroundColor DarkYellow }
     if ($got.Readme) { Write-Host ("       README resolved to: {0}" -f $got.Readme) -ForegroundColor DarkYellow }
     ($got.Both -eq (Join-Path $pkg 'zzboth.exe')) -and
         ($got.Sole -eq (Join-Path $pkg 'zzsole.cmd')) -and
         ($null -eq $got.Readme)
+}
+
+It 'Find-Executable refuses a non-executable that Get-Command finds on PATH' {
+    # THE REGRESSION TEST FOR A CI-ONLY FAILURE, and the reason it has to poison PATH on purpose.
+    #
+    # Get-Command returns an ApplicationInfo for a file it finds in a PATH directory by exact
+    # name, with or without an extension. Measured on a GitHub windows-latest runner
+    # 2026-09-17: Find-Executable -Name 'README' returned C:\Program Files\mongosh\README,
+    # because mongosh is preinstalled, its directory is on PATH, and it ships an extensionless
+    # README. This box has no such file, so the neighbouring test passed locally and failed only
+    # in CI - for six days, hidden behind an unrelated failure.
+    #
+    # The neighbour now redirects $env:PATH, which is correct and also means it can no longer
+    # catch this: with PATH pointed at a fixture that has no README on it, the Get-Command branch
+    # is never reached. So this test puts one there DELIBERATELY. Without the extension check in
+    # Find-Executable it returns the README; with it, the exhaustive fallback runs instead and
+    # filters on "<name>.exe", which cannot match.
+    #
+    # Why it matters beyond a red build: the caller wraps whatever comes back in a native\bin
+    # shim, and lib\ShimFormat.ps1's header already records that a shim pointing at the wrong
+    # file "looks exactly like a working one". One pointing at a README resolves, runs, does
+    # nothing, and reports success.
+    $defs = Get-BuilderFnScope -Name 'Find-Executable'
+    if (-not $defs) { Write-Host "       Find-Executable is gone" -ForegroundColor DarkYellow; return $false }
+
+    $fix = Join-Path $bdRoot ('pathpoison-' + [guid]::NewGuid().ToString('N'))
+    $onPath = Join-Path $fix 'mongosh'
+    New-Item -ItemType Directory -Path $onPath -Force | Out-Null
+    # No extension, which is the whole point.
+    Set-Content -LiteralPath (Join-Path $onPath 'zzreadme') -Value 'fixture' -Encoding ASCII
+    # A real executable beside it, so the test also proves the check did not simply break
+    # resolution outright.
+    Set-Content -LiteralPath (Join-Path $onPath 'zzreal.exe') -Value 'fixture' -Encoding ASCII
+
+    $savedPath = $env:PATH; $savedPf = $env:ProgramFiles; $savedPf86 = ${env:ProgramFiles(x86)}
+    $savedLocal = $env:LOCALAPPDATA
+    try {
+        $got = & {
+            param($Defs, $Fix, $OnPath)
+            . $Defs
+            $Root = Join-Path $Fix 'toolbox'
+            $CommandSearchPatterns = @{}
+            $env:PATH = $OnPath
+            $env:ProgramFiles = $Fix
+            ${env:ProgramFiles(x86)} = $Fix
+            $env:LOCALAPPDATA = $Fix
+            [pscustomobject]@{
+                SeenByGetCommand = [bool](Get-Command 'zzreadme' -ErrorAction SilentlyContinue)
+                Readme           = (Find-Executable -Name 'zzreadme' -WingetId '')
+                Real             = (Find-Executable -Name 'zzreal' -WingetId '')
+            }
+        } $defs $fix $onPath
+    } finally {
+        $env:PATH = $savedPath; $env:ProgramFiles = $savedPf; ${env:ProgramFiles(x86)} = $savedPf86
+        $env:LOCALAPPDATA = $savedLocal
+    }
+
+    # A POSITIVE CONTROL ON THE PREMISE. If Get-Command stops resolving extensionless files, this
+    # test would pass for the wrong reason and go on passing for ever while covering nothing.
+    if (-not $got.SeenByGetCommand) {
+        Write-Host "       Get-Command no longer resolves an extensionless file - this test now proves nothing" -ForegroundColor DarkYellow
+        return $false
+    }
+    if ($got.Readme) { Write-Host ("       a non-executable resolved to: {0}" -f $got.Readme) -ForegroundColor DarkYellow }
+    if ($got.Real -ne (Join-Path $onPath 'zzreal.exe')) { Write-Host ("       the real .exe resolved to: {0}" -f $got.Real) -ForegroundColor DarkYellow }
+
+    ($null -eq $got.Readme) -and ($got.Real -eq (Join-Path $onPath 'zzreal.exe'))
 }
 
 Remove-Item -LiteralPath $bdRoot -Recurse -Force -ErrorAction SilentlyContinue
