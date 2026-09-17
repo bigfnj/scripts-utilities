@@ -9,6 +9,12 @@ AI_UNDERSTANDING/
 **/*.aiu.json
 CLAUDE.md
 AGENTS.md
+# CLAUDE.local.md is the documented place for a per-repo standing order, so it is
+# exactly the content that must not be committed. This repo is PUBLIC.
+CLAUDE.local.md
+# Only C:\Users\Admin\.config\git\ignore was catching this, and a machine-global
+# rule does not travel with a clone of a public repo.
+.claude/settings.local.json
 
 # Archives
 *.zip

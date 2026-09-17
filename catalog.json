@@ -145,6 +145,19 @@
       "notes": "write layered Photoshop .psd files from Python (import-only; no CLI)"
     },
     {
+      "name": "cuda-toolkit", "group": "extras", "channel": "winget-machine",
+      "id": "Nvidia.CUDA", "binary": "nvcc", "detect": "nvcc --version",
+      "default": false,
+      "path_fallback": "%ProgramFiles%\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.4\\bin",
+      "notes": "CUDA 13 toolkit, needed for onnxruntime-gpu's CUDAExecutionProvider (1.30 requires CUDA 13.* + cuDNN 9.*; torch's bundled CUDA 12 does NOT satisfy it, the provider just fails to load). CUDA 13 moved the runtime DLLs to bin/x64 rather than bin - cudart64_13.dll and cublasLt64_13.dll live there, and that directory must be on PATH (add_dll_directory alone is not enough) or onnxruntime falls back to CPU SILENTLY and is merely ~20x slower. Pair with nvidia-cudnn-cu13. default:false because it is ~4 GB and only GPU inference needs it."
+    },
+    {
+      "name": "nvidia-cudnn-cu13", "group": "extras", "channel": "pip-toolbox",
+      "id": "nvidia-cudnn-cu13", "binary": null, "import": null, "detect": null,
+      "register_manifest": false, "default": false,
+      "notes": "cuDNN 9 for CUDA 13; DLLs only, no import module, lands in site-packages/nvidia/cudnn/bin. Required by onnxruntime-gpu next to the CUDA 13 toolkit. Note the nvidia-cuda-runtime-cu13 wheel on PyPI is a 1.2 kB 0.0.0a0 placeholder - take the runtime from the toolkit, not pip. Safe to install with its deps: it pulls nvidia-cublas and nvidia-cuda-nvrtc but touches no numpy/pillow pins. Unrelated ML packages often DO pin those - use pip --no-deps for those, or they downgrade numpy/pillow and break rembg, scikit-image, pdfplumber and pillow-heif in this shared venv."
+    },
+    {
       "name": "ollama", "group": "llm", "channel": "winget-user",
       "id": "Ollama.Ollama", "binary": "ollama", "detect": "ollama --version",
       "default": false,
@@ -160,7 +173,8 @@
     "7zip.7zip",
     "OpenJS.NodeJS.LTS",
     "WiresharkFoundation.Wireshark",
-    "Microsoft.WindowsWDK.10.0.26100"
+    "Microsoft.WindowsWDK.10.0.26100",
+    "Nvidia.CUDA"
   ],
   "llm": {
     "$comment": "Optional local-LLM stack, provisioned by scripts/install-llm.ps1 (opt-in, not a default group). Ollama is the only runtime implemented; llama.cpp is an opt-in alternative (see BACKLOG) and is NOT selectable from here. Model pulls are VRAM-tiered so an 8 GB box does not waste disk on models it cannot run. There is no embedding-fallback list: nothing implements one, and the two models it used to name were not in models_base, so it read as a capability that did not exist.",
