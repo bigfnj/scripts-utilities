@@ -90,23 +90,57 @@ function Get-Download {
         if ($validSize -and $validHash) { return }
         Remove-Item -LiteralPath $OutFile -Force
     }
+    # THE DOWNLOADER'S OWN EXIT CODE, read and reported apart from the size/hash checks below.
+    # Neither leg used to read it: a DNS, TLS or proxy failure leaves no file at all, and the
+    # size check downstream then called that "download failed or was unexpectedly small" - which
+    # sends the reader at disk space and mirrors when the fault was the network. MEASURED
+    # 2026-09-17 against an unresolvable host, both legs: aria2c exits 19 and curl exits 6, and
+    # the file is ABSENT rather than short. Neither code means truncation, so the two conditions
+    # throw different messages and each one names the exit code it actually saw.
+    #
+    # Captured via Invoke-Native rather than run bare, for the reason its own docblock gives:
+    # under this file's 'Stop' preference an enclosing capture turns aria2c's first stderr line
+    # into a terminating NativeCommandError, so a bare call would throw before $LASTEXITCODE
+    # could be read. The cost is that aria2c's progress is captured instead of live; only the
+    # TAIL is echoed on failure, because its useful line is the final summary and everything
+    # above it is progress repaints.
+    $downloader = ""
+    $rc  = 0
+    $log = @()
     $aria = Join-Path $Root "native\bin\aria2c.cmd"
     if (Test-Path -LiteralPath $aria) {
-        & $aria --allow-overwrite=true --auto-file-renaming=false --max-tries=3 --dir (Split-Path $OutFile) --out (Split-Path $OutFile -Leaf) $Url
+        $downloader = "aria2c"
+        $r = Invoke-Native -FilePath $aria -Arguments @(
+            '--allow-overwrite=true', '--auto-file-renaming=false', '--max-tries=3',
+            '--dir', (Split-Path $OutFile), '--out', (Split-Path $OutFile -Leaf), $Url)
+        $rc  = $r.ExitCode
+        $log = $r.Output
     } else {
+        $downloader = "Invoke-WebRequest"
         try {
             Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
         } catch {
             Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
-            & curl.exe -L --retry 3 --fail -o $OutFile $Url
+            $downloader = "curl"
+            $r = Invoke-Native -FilePath "curl.exe" -Arguments @('-L', '--retry', '3', '--fail', '-o', $OutFile, $Url)
+            $rc  = $r.ExitCode
+            $log = $r.Output
         }
     }
-    if (-not (Test-Path $OutFile) -or (Get-Item $OutFile).Length -lt $MinimumBytes) {
-        throw "download failed or was unexpectedly small: $Url"
+    if ($rc -ne 0) {
+        foreach ($line in @($log | Select-Object -Last 15)) { Write-Host "    $line" -ForegroundColor DarkGray }
+        throw "$downloader exited $rc so the download never completed (network, DNS, TLS or an HTTP error - NOT a truncated file): $Url"
+    }
+    if (-not (Test-Path $OutFile)) {
+        throw "$downloader exited 0 but wrote no file at $OutFile : $Url"
+    }
+    $bytes = (Get-Item $OutFile).Length
+    if ($bytes -lt $MinimumBytes) {
+        throw "the file arrived but is too small: $bytes byte(s), expected at least $MinimumBytes ($downloader exited 0, so this is truncation or the wrong URL, not a network failure): $Url"
     }
     if ($Sha256 -and (Get-FileHash -LiteralPath $OutFile -Algorithm SHA256).Hash -ine $Sha256) {
         Remove-Item -LiteralPath $OutFile -Force
-        throw "SHA-256 verification failed: $Url"
+        throw "the file arrived at full size but its SHA-256 does not match ($downloader exited 0): $Url"
     }
 }
 
