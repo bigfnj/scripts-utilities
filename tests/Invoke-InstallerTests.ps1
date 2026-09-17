@@ -58,8 +58,23 @@ $script:DryRun = $false
 # Bounded: at worst one run's worth of fixtures survives, and only until the next run.
 #
 # Deleting only inside TEMP, which is also the one place tests\SUTestGuard.ps1's shadow permits.
+#
+# AGE-GATED, and the age is what makes this suite safe to run twice at once.
+#
+# Without the filter this sweep deletes EVERY installer-tests-*, agentblock-* and builder-tests-*
+# directory in TEMP, including the live fixtures of a run already in progress. $scratch below
+# holds $script:MANIFEST, so a second run starting mid-flight pulls the manifest out from under
+# the first one and the failures land on whatever test happens to touch it next - a corruption
+# that reads exactly like a code bug. This box runs concurrent agent sessions by design, and the
+# repo's own rule about a shared checkout says so; worktrees isolate FILES and share TEMP.
+#
+# 30 minutes is longer than any observed run of this suite (seconds) by three orders of magnitude,
+# so a stranded directory is still collected on the next run and the self-healing property the
+# block above describes is unchanged. Nothing asserts the sweep, so the suite count does not move.
+$suSweepCutoff = (Get-Date).AddMinutes(-30)
 foreach ($stalePrefix in 'installer-tests-', 'agentblock-', 'builder-tests-') {
     Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Directory -Filter "$stalePrefix*" -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt $suSweepCutoff } |
         ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
@@ -659,6 +674,27 @@ function New-FakeWalk {
     # recurse flag, because getting either wrong is a real bug this seam has to be able to show:
     # -Include instead of -Filter once matched README.md and would have written README.cmd.
     param([string[]]$Files)
+
+    # New-FakeExe IS CAPTURED AS A VARIABLE, and calling it by name here does not work.
+    #
+    # GetNewClosure() binds the scriptblock to a new dynamic module. That module captures the
+    # caller's VARIABLES; it resolves FUNCTIONS through global scope, which the script scope of
+    # this suite is not. So `New-FakeExe $f` inside the closure finds nothing whenever this file
+    # is invoked in-session as `.\tests\Invoke-InstallerTests.ps1` - which is exactly how
+    # .github\workflows\gate.yml runs it.
+    #
+    # Measured 2026-09-17: as `powershell -File`, 108 passed / 0 failed. In-session, 96 / 12,
+    # every failure "The term 'New-FakeExe' is not recognized". CI had been red on that for six
+    # days, and because a failing step aborts the job, the five checks below the installer step
+    # had not run in CI either. run-gate.ps1 could not see it: Invoke-GateSuite launches each
+    # suite as a `powershell.exe -File` CHILD, so the local gate never exercises the in-session
+    # path. The gate now runs both modes and compares - see run-gate.ps1's parity entry.
+    #
+    # ${function:Name} yields the scriptblock, which IS a variable and IS captured. Deliberately
+    # not `function global:New-FakeExe`: that also passes, and it works by polluting the session
+    # rather than by fixing the capture, so the next helper added here would fail the same way.
+    $mkExe = ${function:New-FakeExe}
+
     return {
         param($Path, $Filter, $Recurse)
         $ext = ([string]$Filter).TrimStart('*')
@@ -669,7 +705,7 @@ function New-FakeWalk {
             if (-not $lf.EndsWith($ext)) { continue }
             $under = if ($Recurse) { $lf.StartsWith($root + '\') }
                      else { ([IO.Path]::GetDirectoryName($f)).TrimEnd('\').ToLowerInvariant() -eq $root }
-            if ($under) { $hits.Add((New-FakeExe $f)) }
+            if ($under) { $hits.Add((& $mkExe $f)) }
         }
         return @($hits.ToArray())
     }.GetNewClosure()
@@ -763,6 +799,50 @@ It 'Get-ShimTarget returns $null for a wrapper somebody hand-wrote' {
     # This is what makes rule 3 (unparseable -> never touch) possible. A reader that guesses
     # here would hand the planner a target that was never in the file.
     $null -eq (Get-ShimTarget -Lines @('@echo off', 'echo hello', 'pause'))
+}
+
+Write-Host "`n== tools\browse ships as a package so its wrapper stays in contract ==" -ForegroundColor Cyan
+
+It 'browse declares a console script, which is why its shim is contract-shaped' {
+    # The reason tools\browse is a pip package rather than a loose .py beside rerank.py: pip
+    # emits browse.exe into the venv Scripts dir, New-VenvCliWrappers wraps THAT, and the
+    # result is a single-quoted-target wrapper every reader in this repo can parse. Drop the
+    # entry point and the install silently produces no shim at all.
+    $toml = Join-Path $repoRoot 'tools\browse\pyproject.toml'
+    (Test-Path -LiteralPath $toml) -and
+        ([IO.File]::ReadAllText($toml) -match '(?m)^\s*browse\s*=\s*"toolbox_browse\.cli:main"\s*$')
+}
+
+It 'the browse version in pyproject.toml and __init__.py agree' {
+    # Two hand-maintained copies of one number. They are what smoke-test.ps1 compares an
+    # INSTALLED browse against to catch "edited the repo, never reinstalled", so if they
+    # disagree with each other that check is measuring the wrong thing.
+    $toml = [IO.File]::ReadAllText((Join-Path $repoRoot 'tools\browse\pyproject.toml'))
+    $init = [IO.File]::ReadAllText((Join-Path $repoRoot 'tools\browse\toolbox_browse\__init__.py'))
+    $a = [regex]::Match($toml, '(?m)^version\s*=\s*"([^"]+)"')
+    $b = [regex]::Match($init, '__version__\s*=\s*"([^"]+)"')
+    $a.Success -and $b.Success -and ($a.Groups[1].Value -eq $b.Groups[1].Value)
+}
+
+It 'browse declares no pip dependencies, so an install cannot pull an untracked package' {
+    # docs\agent-rules.md forbids installs that bypass the manifest. trafilatura and curl_cffi
+    # are catalog entries for exactly that reason; a dependency here would install them behind
+    # the catalog's back, into a venv shared with rembg, scikit-image and pdfplumber.
+    $toml = [IO.File]::ReadAllText((Join-Path $repoRoot 'tools\browse\pyproject.toml'))
+    [regex]::Match($toml, '(?m)^dependencies\s*=\s*\[\s*\]').Success
+}
+
+It 'the browse optional upgrades are in the catalog, on the pip-toolbox channel' {
+    # install-browse.ps1 -WithExtras THROWS on a missing entry rather than installing nothing,
+    # so these two names are a contract between that script and catalog.json.
+    $cat = Get-Catalog
+    $names = @($cat.tools | ForEach-Object { $_.name })
+    $ok = $true
+    foreach ($want in @('trafilatura', 'curl_cffi')) {
+        $item = @($cat.tools | Where-Object { $_.name -eq $want })[0]
+        if (-not $item -or $item.channel -ne 'pip-toolbox') { $ok = $false }
+    }
+    $ok -and ($names -contains 'trafilatura') -and ($names -contains 'curl_cffi')
 }
 
 Write-Host "`n== ENUMERATION ORDER IS NOT A RANK ==" -ForegroundColor Cyan

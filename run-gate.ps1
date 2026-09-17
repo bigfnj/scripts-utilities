@@ -136,12 +136,36 @@ function Invoke-GateSuite {
         Continue is scoped to the one statement and restored in a finally, not after the call:
         an exception in that window would otherwise leave the REST of the gate running under
         Continue, silently downgrading every check below it.
+
+        -InSession RUNS THE SUITE THE WAY CI DOES, and it is a switch on THIS function rather
+        than a second wrapper on purpose. The repo-wide native-stderr rule exempts exactly three
+        function names and a test caps the list at three, so a fourth wrapper would fail the
+        gate it is trying to strengthen.
+
+        The two modes are not equivalent, which is the whole reason the switch exists.
+        `-File` makes the suite the top-level script; `-Command "... ; & <path>"` makes it a
+        script invoked from inside another script, which is what .github\workflows\gate.yml does.
+        A closure built with GetNewClosure() resolves FUNCTIONS through global scope, and the
+        script scope of a nested script is not global - so a helper called from inside such a
+        closure is found in one mode and not the other. Measured 2026-09-17 on
+        tests\Invoke-InstallerTests.ps1: 108/0 under -File, 96/12 in-session, and CI had been red
+        on exactly that for six days while this gate reported green.
     #>
-    param([Parameter(Mandatory)][string]$ScriptPath)
+    param(
+        [Parameter(Mandatory)][string]$ScriptPath,
+        [switch]$InSession
+    )
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $out = & $ps51 -NoProfile -ExecutionPolicy Bypass -File $ScriptPath 2>&1 | Out-String
+        if ($InSession) {
+            # Set-Location first, because CI's run: block executes with the repo root as its
+            # working directory and a suite is free to depend on that.
+            $cmd = "Set-Location -LiteralPath '{0}'; & '{1}'" -f $repoRoot, $ScriptPath
+            $out = & $ps51 -NoProfile -ExecutionPolicy Bypass -Command $cmd 2>&1 | Out-String
+        } else {
+            $out = & $ps51 -NoProfile -ExecutionPolicy Bypass -File $ScriptPath 2>&1 | Out-String
+        }
         return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out }
     } finally { $ErrorActionPreference = $prev }
 }
@@ -160,6 +184,9 @@ Write-Host ''
 
 $results = @()
 $hardFail = $false
+# Kept so the parity check below can compare against the per-suite counts smoke-test already
+# printed, instead of running every suite a third time.
+$smokeOut = $null
 
 foreach ($s in $suites) {
     if ($Only -and $s.Name -ne $Only) { continue }
@@ -176,6 +203,8 @@ foreach ($s in $suites) {
     $run = Invoke-GateSuite -ScriptPath $path
     $out = $run.Output
     $code = $run.ExitCode
+
+    if ($s.Name -eq 'smoke') { $smokeOut = $out }
 
     $t = Get-GateTally $out
     $status = Get-GateStatus -Passed $t.Passed -Failed $t.Failed -Code $code
@@ -196,6 +225,71 @@ foreach ($s in $suites) {
     }
     $results += [pscustomobject]@{ Suite = $s.Name; Passed = $t.Passed; Warnings = $t.Warnings
                                    Failed = $t.Failed; Status = $status }
+}
+
+# --- invocation parity --------------------------------------------------------
+#
+# THE GAP THIS CLOSES, and it is measured rather than imagined.
+#
+# Every suite above runs as a `powershell.exe -File` CHILD. .github\workflows\gate.yml runs each
+# one IN-SESSION, as `.\tests\Invoke-XTests.ps1` from inside a run: block. Those two modes do not
+# resolve functions inside a GetNewClosure() scriptblock the same way, because such a closure
+# looks functions up through GLOBAL scope and the script scope of a nested script is not global.
+#
+# On 2026-09-17 that difference meant tests\Invoke-InstallerTests.ps1 scored 108/0 here and 96/12
+# in CI. The build had been red for SIX DAYS and this gate could not see it by construction. It
+# was worse than one red suite: a failing CI step aborts the job, so the five repo-hygiene checks
+# that sit below the installer step had not run in CI either for the same six days.
+#
+# So the property is not "the suites pass", it is "the suites pass THE SAME WAY in both modes".
+# Cost is one extra child per suite, which is cheaper than six days.
+Write-Host ''
+Write-Host 'running  parity      every suite again IN-SESSION, the way CI invokes it' -ForegroundColor DarkGray
+
+$suiteFiles = @(Get-ChildItem -LiteralPath (Join-Path $repoRoot 'tests') -Filter 'Invoke-*Tests.ps1' -File -ErrorAction SilentlyContinue |
+                Sort-Object Name)
+if ($suiteFiles.Count -eq 0) {
+    # A FLOOR. An enumeration that matches nothing would otherwise print no lines at all and let
+    # the gate pass having compared nothing - the same shape the parse gate's own floor exists for.
+    Write-Host '         FAIL parity: found 0 suites in tests\ - this check compared nothing' -ForegroundColor Red
+    $hardFail = $true
+}
+
+foreach ($f in $suiteFiles) {
+    $short = ($f.BaseName -replace '^Invoke-', '' -replace 'Tests$', '').ToLowerInvariant()
+    $pr = Invoke-GateSuite -ScriptPath $f.FullName -InSession
+    $pt = Get-GateTally $pr.Output
+    $pstatus = Get-GateStatus -Passed $pt.Passed -Failed $pt.Failed -Code $pr.ExitCode
+
+    if ($pstatus -ne 'ok') {
+        Write-Host ("         FAIL parity {0}: in-session status {1} (passed={2} failed={3} exit={4})" -f `
+            $short, $pstatus, $pt.Passed, $pt.Failed, $pr.ExitCode) -ForegroundColor Red
+        Write-Host $pr.Output
+        $hardFail = $true
+        continue
+    }
+
+    # The -File count smoke-test already printed for this suite. Compared rather than assumed:
+    # a suite that silently ran FEWER tests in one mode is the same class of defect as one that
+    # failed, and Assert-SUSuiteFloor only proves declared == ran within a single run.
+    $want = $null
+    if ($smokeOut -and $smokeOut -match ("(?m)^\s*OK\s+" + [regex]::Escape($short) + "\s+suite:\s+(\d+)\s+passed")) {
+        $want = [int]$Matches[1]
+    }
+
+    if ($null -eq $want) {
+        # Not a pass. Say which half is missing, because "compared nothing" reads identically to
+        # "compared and agreed" once the line scrolls past.
+        Write-Host ("         ok   parity {0}: in-session {1} passed (no -File count to compare{2})" -f `
+            $short, $pt.Passed, $(if ($Only) { ' under -Only' } else { ' - smoke printed none' })) -ForegroundColor DarkGray
+        if (-not $Only) { $hardFail = $true }
+    } elseif ($want -ne $pt.Passed) {
+        Write-Host ("         FAIL parity {0}: -File ran {1} passed, in-session ran {2}" -f `
+            $short, $want, $pt.Passed) -ForegroundColor Red
+        $hardFail = $true
+    } else {
+        Write-Host ("         ok   parity {0}: {1} passed in both modes" -f $short, $pt.Passed) -ForegroundColor DarkGray
+    }
 }
 
 # --- phase ledger -------------------------------------------------------------
