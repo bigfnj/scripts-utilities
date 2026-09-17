@@ -368,6 +368,89 @@ superseded no-op. No reboot is owed for this symptom.
 
 ---
 
+## Browsing the web from an agent
+
+Use `browse <url>`. It is the toolbox's read-a-web-page command
+(`tools/browse`, installed by `scripts/install-browse.ps1`), and it exists
+because driving Playwright by hand is both the slowest way to read a page and
+one of the more detectable. Do not reach for Playwright first; it is rung 3 of
+four, and it is reached automatically.
+
+### The ladder
+
+`browse` tries rungs in order and stops at the first that returns readable
+text. The winner is recorded per-host in
+`<toolbox>\state\browse-journal.json`, so the next fetch of that host starts
+there.
+
+| rung | what it is | when it runs |
+|---|---|---|
+| `direct` | `httpx`, or `curl_cffi` with a Chrome TLS fingerprint if installed | always first |
+| `reader` | `r.jina.ai`, fetched server-side from Jina's IPs | only with `--allow-reader` |
+| `chrome` | CDP attach to the real Chrome from `scripts\start-browse-chrome.ps1` | when earlier rungs return nothing, or thin output |
+| handoff | not a fetch: exits 3 and tells you to ask a human | when a challenge survives the browser |
+
+Exit codes are distinct because the right next move differs: `0` ok, `3`
+blocked, `4` robots disallowed, `5` payment required, `6` unreachable, `2`
+usage. A `5` means the site sells machine access (Cloudflare pay-per-crawl or
+an x402 gateway) and there is no bypass to find.
+
+### Measured on this box, 2026-09-17
+
+One residential IP, one sample per cell, eight public targets. Numbers here so
+nobody re-derives them, and so a later regression is visible:
+
+- **The full ladder read 7 of 8.** `direct` won 4 (news.ycombinator.com,
+  developers.cloudflare.com, scrapfly.io, medium.com), `chrome` won 3
+  (stackoverflow.com, glassdoor.com, indeed.com, all three of which answered
+  rung 1 with a Cloudflare 403). reddit.com was declined on robots, correctly.
+- **`curl_cffi` changed 0 of 8 outcomes**, httpx versus `impersonate="chrome"`,
+  interleaved. It is still in the catalog, because the published benchmark it
+  is justified by is real and a different IP or target set may differ - but on
+  this machine it bought nothing measurable. Reproduce with
+  `browse <url> --rung direct --no-impersonate` against the default.
+- **A real Chrome clears Cloudflare's managed challenge by itself**, on a
+  brand-new profile, if you wait on the page instead of re-navigating.
+  stackoverflow sat at 41 chars of interstitial and cleared to 5,875 chars
+  after ~3 s of polling; a 3 s sleep plus a fresh `goto` failed twice.
+
+### Rules
+
+- **Never point an agent at the everyday Chrome profile.** Use
+  `scripts\start-browse-chrome.ps1`, which defaults to a dedicated profile
+  under the toolbox and *refuses* the default one. Two independent reasons:
+  from Chrome 136 the browser silently ignores `--remote-debugging-port` on the
+  default user-data-dir (it starts, opens no port, and the client then reports
+  a healthy connection and hangs), and a CDP port has no authentication of its
+  own, so anything that reaches it drives that browser. The managed policy on
+  this box also denies reads of browser profiles and keychains.
+- **A refusal is not a transient error.** Do not retry `browse` in a loop on
+  exit 3. Since mid-2025 a Cloudflare block is increasingly a policy setting
+  rather than a detection result, and no local cleverness argues with a policy.
+  Ask the user to open the page in the live browser and clear it once; the
+  dedicated profile keeps the clearance.
+- **Do not add proxies, CAPTCHA solvers or fingerprint spoofing here.** That is
+  a different tool with a different risk profile, and this repo is public.
+- **`robots.txt` is consulted and obeyed** under the product token
+  `toolbox-browse`. `--ignore-robots` exists; have a reason.
+- **`--allow-reader` discloses the URL to a third party.** Off by default for
+  that reason, not because it is slow.
+
+### Two things that will otherwise waste your time
+
+- **`WebFetch` failures on some sites are not fixable from here.** Anthropic's
+  `Claude-User` is not in Cloudflare's signed-agent cohort (that list is the
+  ChatGPT agent, Goose, Browserbase and Anchor Browser), and the `WebFetch`
+  user-agent is not configurable - anthropics/claude-code#7696 was closed as a
+  duplicate. When `WebFetch` is blocked, use `browse`.
+- **From a Bash tool call, a toolbox `.cmd` shim needs its extension.** Git
+  Bash appends `.exe` when searching PATH, not `.cmd`, so `browse` and
+  `ffmpeg` both come back "command not found" while `browse.cmd` and
+  `ffmpeg.cmd` work. From PowerShell the bare name resolves normally. This
+  applies to every wrapped tool in `native\bin`, not just this one.
+
+---
+
 ## Adding a tool - workflow
 
 1. **Confirm it's missing:** check both manifests (above).

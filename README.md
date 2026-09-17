@@ -253,6 +253,31 @@ threshold). A `bge-reranker-base` cross-encoder runs via
 the toolbox `onnxruntime` (`-SkipReranker` to omit). The model set is defined in `catalog.json`
 under `llm`.
 
+### Optional — web reading (`scripts/install-browse.ps1`)
+
+`browse <url>` reads a web page and escalates only as far as it has to: `httpx` first, then an
+opt-in third-party reader, then a CDP attach to the real Chrome on this machine. It exists
+because hand-driving Playwright is both the slowest way to read a page and, measured, one of the
+more detectable — an independent May 2026 benchmark over 31 targets scored unpatched Playwright
+at 24 OK / 5 blocked against 28 / 0 for a raw-CDP driver, so the whole open-source stealth
+ecosystem is worth about five targets in thirty-one. The leverage is elsewhere: not starting a
+browser for pages that do not need one, and using a real browser when one is needed.
+
+Measured on one residential IP, 2026-09-17, eight public targets: the full ladder read seven,
+`httpx` won four and the browser rung won three — all three of which had answered `httpx` with a
+Cloudflare 403. The eighth was declined on `robots.txt`, which is the intended outcome, not a
+failure. A real Chrome clears Cloudflare's managed challenge by itself if you wait on the page
+rather than re-navigating.
+
+`scripts/start-browse-chrome.ps1` starts that browser on a **dedicated** profile and refuses
+Chrome's default one, for two independent reasons: from Chrome 136 the browser silently ignores
+`--remote-debugging-port` on the default user-data-dir, and a CDP port has no authentication of
+its own. The tool solves no CAPTCHAs, rotates no proxies and spoofs no fingerprints; a refusal is
+answered by asking a human to clear it once in that window. Rules and exit codes in
+`docs/agent-rules.md`, usage in `docs/tools-reference.md`. The two optional upgrades
+(`trafilatura`, `curl_cffi`) are `default: false` catalog entries, installed with `-WithExtras`;
+without them `browse` still works and says so on every run.
+
 ### Optional — deletion forensics (`scripts/install-deletion-forensics.ps1`)
 
 Answers "which process deleted this?". Two sensors: Sysmon recording event 26
@@ -350,7 +375,10 @@ lib/AgentDiscovery.ps1              agent-block discovery and safe block rewriti
 lib/SmokeLint.ps1                   lint rules the smoke test enforces on itself
 lib/SysmonConfig.ps1                Sysmon config rendering and validation
 modules/                            cli-tools, security, extras groups
+tools/browse/                       the `browse` CLI: a pip package so its shim stays in contract
 scripts/build-devtoolbox.ps1        Python + native DevToolbox builder
+scripts/install-browse.ps1          optional `browse` web-read CLI into the toolbox venv
+scripts/start-browse-chrome.ps1     real Chrome on a dedicated profile with a CDP port
 scripts/install-ghidra.ps1          optional digest-verified Ghidra/JDK
 scripts/install-llm.ps1             optional local LLM stack
 scripts/install-machine-scope.ps1   one-elevation machine-scope pre-install

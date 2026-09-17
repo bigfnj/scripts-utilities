@@ -19,6 +19,15 @@ CLAUDE.local.md
 # Archives
 *.zip
 
+# Python build artefacts. `scripts/install-browse.ps1` runs `pip install tools/browse`,
+# and setuptools writes build/ and *.egg-info/ INSIDE the source tree - so the first
+# install after a clone leaves ~8 generated files staged for anyone running `git add`.
+# The first Python package in a PowerShell repo, hence the first need for these.
+tools/**/build/
+tools/**/*.egg-info/
+__pycache__/
+*.pyc
+
 # Generated per-workstation install inventory
 manifest/tools.json
 logs/

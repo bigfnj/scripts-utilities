@@ -45,6 +45,12 @@ Repo is at `75c32a2`+ on `main`, pushed, tree clean, one worktree, no stray bran
 smoke 74/3/0, core 27, installer 104, render 23, smokelint 18, triage 31. The 3 smoke warnings
 (`cdb`, `poolmon`, the SYSTEM task unreadable unelevated) are expected, not regressions.
 
+**Baseline moved 2026-09-17** when `tools/browse` and its two scripts landed: smoke **78/3/0**
+(four new checks in a `browse` group) and installer **108** (+4). Same 3 warnings, plus a fourth
+DEGRADED line inside the browse group whenever no CDP browser is running - that one is
+informational and does not count as a warning. Ledger phase `after-browse` records both
+transitions as growth.
+
 **Do this first, and it settles two things at once.** Install the Windows SDK "Debugging Tools for
 Windows" (and the WDK), then `.\bootstrap.ps1 -Only security`. It clears the `cdb` and `poolmon`
 warnings, and because it makes bootstrap actually *install* something it exercises the one
@@ -710,6 +716,27 @@ scoped the way it is rather than being scoped to "every file".
 - `install-machine-scope.ps1`: consider moving per-package scope overrides (the
   `$NoScopeFlag` list) into `catalog.json` as a `no_scope_flag` boolean field,
   so the script and the catalog stay in sync automatically.
+
+- `tools/browse`: three things about it are recorded rather than resolved, added
+  2026-09-17 with the tool.
+  - **The `reader` rung has never been exercised.** `fetch_reader` (r.jina.ai) is
+    written and wired but `--allow-reader` was not used in any of the runs that
+    validated the other rungs, so its only evidence is that it parses. It is also
+    the one rung that discloses the URL to a third party, which is why it is
+    opt-in and why nothing has needed it yet. Prove it or drop it.
+  - **`curl_cffi` earned its catalog entry on a published benchmark, not on this
+    box.** Measured 2026-09-17, httpx versus `impersonate="chrome"` interleaved
+    over the same eight targets from one residential IP: **0 of 8 outcomes
+    changed**. Kept because the published result is real and another IP or target
+    set may differ, and because `--no-impersonate` makes the comparison
+    repeatable. If a later sweep also finds nothing, remove the entry rather than
+    carrying a dependency that buys nothing here.
+  - **`browse` is not in `manifest/tools.json`.** It follows the Ghidra/LLM
+    provisioner pattern (its own `install-browse.ps1`, outside the catalog), so
+    the manifest never learns about it and the smoke test's Phase-1 binary sweep
+    cannot see it. The dedicated `browse` group in `smoke-test.ps1` covers it
+    instead, which is stronger than a presence check - but the asymmetry is worth
+    a decision rather than an accident.
 
 ---
 

@@ -745,6 +745,32 @@ qpdf, ghostscript, LibreOffice, 7z, rg, fd, jq, yq, exiftool, aria2c, rclone,
 DuckDB, Node.js, uv/uvx. Sysinternals (procdump, handle, sigcheck, ...) is on
 PATH too. Set CODEX_TOOLBOX to override the toolbox root path.
 
+### Reading web pages (including sites that block agents)
+
+  browse      The web-read command: browse <url> [--json]. It ESCALATES ON ITS
+              OWN - httpx first, then the real Chrome over CDP - and remembers
+              per host which rung worked. Do not hand-drive Playwright for this:
+              that is rung 3 and it is reached automatically.
+              Site blocks you? Run this once, leave it open for the session:
+                $RepoRoot\scripts\start-browse-chrome.ps1
+              It uses a DEDICATED profile and refuses Chrome's default one,
+              which Chrome 136+ silently opens no debug port for. Measured
+              2026-09-17: a real Chrome clears Cloudflare's managed challenge
+              by itself, so 3 of 8 targets that answered httpx with a 403 read
+              fine through that rung.
+              Exit 3 = refused. Ask the user to clear the challenge in that
+              browser window; never retry in a loop. Exit 4 = robots.txt said
+              no. Exit 5 = the site charges for machine access; no bypass.
+              A WebFetch that fails on a site may not be fixable: Claude-User
+              is not a Cloudflare signed agent and its UA is not configurable.
+              Use browse instead.
+              Install: $RepoRoot\scripts\install-browse.ps1
+              Rules, exit codes, measurements: $RepoRoot\docs\agent-rules.md
+              FROM A BASH TOOL CALL a .cmd shim needs its extension -
+              browse.cmd, ffmpeg.cmd - because Git Bash appends .exe and not
+              .cmd when searching PATH. From PowerShell the bare name works.
+              True of every wrapped tool in native\bin, not just this one.
+
 ### Developer CLI tools - on PATH (winget; user scope unless noted)
 
   pwsh        PowerShell 7, MACHINE scope at %ProgramFiles%\PowerShell\7, side by

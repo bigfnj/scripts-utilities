@@ -609,6 +609,53 @@ jupyter-lab --no-browser --port 8889     # headless, specific port
 jupyter nbconvert --to script notebook.ipynb   # convert to .py
 ```
 
+### browse - read a web page
+
+Install once: `.\scripts\install-browse.ps1` (add `-WithExtras` for
+`trafilatura` and `curl_cffi`). Policy, exit codes and the measured results are
+in `docs/agent-rules.md`; this is how to drive it.
+
+```powershell
+browse https://example.com/article              # text to stdout
+browse https://example.com/article --json       # structured, for an agent
+browse https://example.com --rung direct        # force one rung
+browse --selftest                               # health check, exits non-zero on a real fault
+```
+
+It escalates on its own: `httpx`, then the real Chrome over CDP, and it
+remembers per-host which one worked. The browser rung needs a browser running:
+
+```powershell
+.\scripts\start-browse-chrome.ps1               # dedicated profile, CDP on 9222
+browse https://news.site/story                  # now reaches rung 3 if needed
+.\scripts\start-browse-chrome.ps1 -Stop         # close it
+```
+
+Leave that Chrome open across a research session. A site that challenges the
+first visit is usually clear on the second, and anything you sign into by hand
+in that window stays signed in.
+
+Reading the header it prints:
+
+```text
+# rung=chrome status=403 (initial nav; superseded client-side) robots=allow chars=7751
+```
+
+`status=403` with a healthy `chars` is normal on the browser rung and is not a
+failure: Cloudflare answers the first navigation with the interstitial's status
+and then replaces the document once its challenge resolves, so that number
+describes a page that no longer exists. Judge the run by `chars` and the exit
+code, never by that status.
+
+Three flags worth knowing:
+
+- `--allow-reader` adds a rung that fetches through `r.jina.ai`, from Jina's
+  IPs rather than yours. Off by default because it discloses the URL.
+- `--no-impersonate` makes rung 1 use `httpx` even when `curl_cffi` is present,
+  which is how the two are A/B'd on a real target.
+- `--ua honest` self-identifies as `toolbox-browse` instead of sending a Chrome
+  UA. Expect more refusals: blanket anti-AI rules are aimed at exactly that.
+
 ---
 
 ## Local LLM stack (optional - Ollama)
@@ -651,6 +698,8 @@ for Mistral-native workflows, `qwen2.5:3b` as the light everyday model.
 | Compare command performance | `hyperfine` |
 | Count lines of code | `tokei` |
 | Download video/audio from the web | `yt-dlp` (pairs with toolbox ffmpeg) |
+| Read a web page (incl. one that blocks agents) | `browse <url>` - never Playwright by hand |
+| Drive a real browser for a blocked site | `scripts\start-browse-chrome.ps1` then `browse --rung chrome` |
 | Run a JS/TS script (sandboxed) | `deno` (also yt-dlp's JS challenge runtime) |
 | Analyze a network capture | `tshark` |
 | Identify top pool consumers (live, no crash) | `poolmon` (WDK, elevated) |

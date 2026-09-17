@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "toolbox-browse"
+version = "0.1.0"
+description = "Escalating web fetch for agent-driven research on the Windows dev toolbox"
+requires-python = ">=3.11"
+
+# DELIBERATELY EMPTY. Every import this tool needs is already in the toolbox venv
+# (httpx, bs4, lxml, playwright - see scripts/build-devtoolbox.ps1), and the three
+# optional upgrades (trafilatura, curl_cffi, h2) are catalog.json entries so they
+# install through the pip-toolbox channel like every other Python package here.
+# Declaring them here would let `pip install tools/browse` pull packages that the
+# catalog never recorded, which is the untracked-install shape docs/agent-rules.md
+# forbids.
+dependencies = []
+
+[project.scripts]
+# The console script is the whole reason this is a package rather than a loose .py
+# next to rerank.py. pip generates browse.exe in the venv Scripts dir, and
+# New-VenvCliWrappers (lib/common.ps1) then wraps it into native\bin with the same
+# single-target byte shape as the other 172 shims. A loose script would need a
+# hand-written two-argument wrapper, which Get-ShimTarget cannot parse, so the
+# smoke test's stale-shim check would silently skip it.
+browse = "toolbox_browse.cli:main"
+
+[tool.setuptools]
+packages = ["toolbox_browse"]

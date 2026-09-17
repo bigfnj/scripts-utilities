@@ -415,6 +415,60 @@ if ($adGen.Reason) {
 # safety it had never checked" failure this file was built out of.
 Write-Host ("  regime: {0} - {1}" -f $adRegime, $adTally) -ForegroundColor DarkGray
 
+# -- browse (web read) ---------------------------------------------------------
+# Optional tool, so absence is a WARN. Everything after that is a FAIL, because an
+# INSTALLED browse that cannot read a page is the failure mode that matters: it is
+# the one a session will reach for, and a silent fallback to hand-driven Playwright
+# is exactly what this tool exists to stop.
+#
+# The load-bearing check is `browse --selftest`, whose first phase extracts a known
+# fixture offline. That phase CAN fail - break the extractor and it does - while the
+# network and browser phases report DEGRADED rather than failing, since neither a
+# missing network nor a closed browser is a defect in the tool. Their DEGRADED lines
+# are surfaced here on purpose: a check that hides what it skipped is a check nobody
+# can trust.
+Test-Hdr "browse (web read)"
+$brShim = Join-Path $tbRoot (Join-Path 'native\bin' 'browse.cmd')
+if (-not (Test-Path -LiteralPath $brShim)) {
+    Test-Warn "browse not installed (optional: scripts\install-browse.ps1)"
+} else {
+    # Same reader the stale-shim group uses, so a wrapper this gate cannot parse is
+    # caught here rather than silently dropping out of that group's coverage.
+    $brTarget = Get-ShimTarget -Lines @(Get-Content -LiteralPath $brShim -ErrorAction SilentlyContinue)
+    if (-not $brTarget) {
+        Test-Fail "browse.cmd does not match the shim contract - the stale-shim check cannot see it"
+    } elseif (-not (Test-Path -LiteralPath $brTarget)) {
+        Test-Fail "browse.cmd points at a missing target: $brTarget (re-run scripts\install-browse.ps1)"
+    } else {
+        Test-Ok "browse.cmd resolves to $brTarget"
+    }
+
+    # A version behind the repo means somebody edited tools\browse and never
+    # reinstalled, so the CLI being exercised is not the CLI under review.
+    $brRepoInit = Join-Path $REPO_ROOT (Join-Path 'tools\browse\toolbox_browse' '__init__.py')
+    $brWant = $null
+    if (Test-Path -LiteralPath $brRepoInit) {
+        $m = [regex]::Match([IO.File]::ReadAllText($brRepoInit), '__version__\s*=\s*"([^"]+)"')
+        if ($m.Success) { $brWant = $m.Groups[1].Value }
+    }
+    $brHave = (& $brShim --version) -join ' '
+    if (-not $brWant) {
+        Test-Warn "could not read __version__ from tools\browse - version drift unchecked"
+    } elseif ($brHave -match [regex]::Escape($brWant)) {
+        Test-Ok "browse $brWant matches the repo"
+    } else {
+        Test-Fail "installed browse is '$brHave' but the repo says $brWant - re-run scripts\install-browse.ps1"
+    }
+
+    $brOut = & $brShim --selftest
+    $brCode = $LASTEXITCODE
+    foreach ($line in @($brOut)) {
+        if ($line -match 'DEGRADED|FAIL') { Write-Host "    $($line.Trim())" -ForegroundColor DarkGray }
+    }
+    if ($brCode -eq 0) { Test-Ok "browse --selftest passed (extraction verified against its fixture)" }
+    else { Test-Fail "browse --selftest exited $brCode - extraction is broken, see the lines above" }
+}
+
 # -- Deletion forensics --------------------------------------------------------
 # Optional sensors, so absence is a WARN not a FAIL. Degradation, however, is a FAIL:
 # a sensor that is installed but not actually capturing is worse than one that is absent,

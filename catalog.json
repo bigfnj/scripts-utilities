@@ -145,6 +145,19 @@
       "notes": "write layered Photoshop .psd files from Python (import-only; no CLI)"
     },
     {
+      "name": "trafilatura", "group": "extras", "channel": "pip-toolbox",
+      "id": "trafilatura", "binary": "trafilatura", "import": "trafilatura",
+      "detect": "trafilatura --version",
+      "default": false,
+      "notes": "main-content extraction for the `browse` CLI (tools/browse, installed by scripts/install-browse.ps1). OPTIONAL: browse falls back to a bs4+lxml extractor when this is absent and prints a DEGRADED line on every run saying so, so a box without it still works and still tells you. default:false because it pulls a handful of transitive deps (courlan, htmldate, justext, dateparser) into the SHARED venv; none of them pin numpy or pillow, which is the pairing that has broken rembg/scikit-image/pdfplumber here before, but check before adding more. Quality difference is real: bs4 returns the whole cleaned body, trafilatura finds the article column."
+    },
+    {
+      "name": "curl_cffi", "group": "extras", "channel": "pip-toolbox",
+      "id": "curl_cffi", "binary": null, "import": "curl_cffi", "detect": null,
+      "register_manifest": false, "default": false,
+      "notes": "HTTP client with a real browser TLS/HTTP2 fingerprint, used by the `browse` CLI's first rung when present. OPTIONAL, and browse says so on every run when it is missing. Worth having for the reason a May 2026 benchmark measured: curl_cffi scored 26 OK / 2 blocked over 31 anti-bot targets, tying a 130 MB patched Chromium fork from a 6.4 MB wheel, because the TLS handshake and HTTP/2 frame order are what the gate cross-checks - and httpx cannot change either. Import-only here (its CLI is not used), hence register_manifest:false."
+    },
+    {
       "name": "cuda-toolkit", "group": "extras", "channel": "winget-machine",
       "id": "Nvidia.CUDA", "binary": "nvcc", "detect": "nvcc --version",
       "default": false,
