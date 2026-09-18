@@ -17,6 +17,36 @@ param()
 # cmdlet. $PSScriptRoot rather than $repoRoot so this needs nothing computed first.
 . (Join-Path $PSScriptRoot 'SUTestGuard.ps1')
 
+# THERE IS DELIBERATELY NO `Set-StrictMode -Version Latest` HERE, unlike Invoke-RenderTests.ps1.
+# It was tried, measured and reverted; this is the record so nobody repeats the investigation.
+#
+# Strict run: 11 passed, 20 failed, every failure the same message - "The property 'Dir' cannot be
+# found on this object". The cause is NOT this fixture. $facts below already matches the Facts
+# object New-ForensicsReport.ps1:299-305 builds, property for property. The mismatch is in the
+# subject: Get-FxTriage walks a HETEROGENEOUS set of four collections
+#     foreach ($set in @($Facts.TopProcesses, $Facts.Bursts, $Facts.Novel, $Facts.Sentinels))
+# and reads $x.Name / $x.Image / $x.Dir off each member blind. TopProcesses carries Name+Count and
+# no Dir; Bursts carries Image+Count+Seconds and no Name. Both are the correct production shapes,
+# and under StrictMode both throw.
+#
+# Measured escalation, in this order:
+#   production shape as-is            -> throws on 'Dir'  (from TopProcesses)
+#   + Dir on TopProcesses             -> throws on 'Name' (from Bursts)
+#   + Dir and Name everywhere, $null  -> passes
+#
+# That last state is the trap, and it is why the fixture was left alone. Those properties do not
+# exist on the real objects, so a future author filling one in with a plausible value is doing the
+# natural thing - and it was measured: give the bolted-on TopProcesses.Dir a real directory and
+# $okDir silently widens, so a finding citing a directory the model was never shown comes back
+# KEPT with Rejected = 0. Every "is DISCARDED" test above would then pass for the wrong reason,
+# which is the one failure this suite exists to prevent. A fixture that lies to satisfy a linter
+# is worse than a suite without the linter.
+#
+# What would unblock it is one line in scripts\ForensicsReport.Triage.ps1 - probe with
+# $x.PSObject.Properties['Dir'] instead of $x.Dir, exactly as the renderer already does at
+# ForensicsReport.Render.ps1:414 for its own optional property. That file is frozen by owner
+# decision, so the change was NOT made and this comment stands in its place.
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $repoRoot 'scripts\ForensicsReport.Triage.ps1')
 
