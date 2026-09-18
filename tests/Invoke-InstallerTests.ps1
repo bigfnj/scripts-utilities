@@ -1615,6 +1615,96 @@ It 'a START marker with no matching END is refused, not guessed at' {
     $threw -and ($after -eq $before)
 }
 
+# A TEMP FIXTURE, NEVER THE REAL TARGETS, and that is not tidiness. Remove-StaleBackups DELETES
+# files, and the files the three production callers point it at live in %USERPROFILE%,
+# %USERPROFILE%\.claude and %USERPROFILE%\.codex. A negative test that handed a real deleter a
+# real profile path is precisely the 2026-09-10 shape SUTestGuard.ps1 exists for: its shadow
+# throws on any deletion outside TEMP, so a test drifting onto a profile path fails loudly rather
+# than pruning the user's CLAUDE.md history. $abRoot is under TEMP; nothing below leaves it.
+function New-SUBackupFixture {
+    # Returns the target path. LastWriteTime runs OPPOSITE to the name order, and this axis is
+    # non-degenerate on purpose - the first version of this fixture set the two in the SAME order,
+    # and a mutation that sorted by LastWriteTime then SURVIVED the whole suite.
+    #
+    # Why mtime is the wrong field at all: Copy-Item preserves the SOURCE's LastWriteTime, so on
+    # this box every real backup carries the PREVIOUS write's timestamp - measured 2026-09-17,
+    # CLAUDE.md.bak-20260917-150230 has mtime 20260911-131028, six days out. The name is the only
+    # field the writer actually stamped, so the newest name must win however the mtimes fall.
+    param([string[]]$Stamps, [string]$Leaf = 'FIXTURE.md')
+    $dir = Join-Path $abRoot ("prune-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $target = Join-Path $dir $Leaf
+    Set-Content -LiteralPath $target -Value 'live content' -Encoding UTF8
+    $age = 0
+    foreach ($s in $Stamps) {
+        $b = "$target.bak-$s"
+        Set-Content -LiteralPath $b -Value "backup $s" -Encoding UTF8
+        # Descending: the FIRST stamp (oldest name) gets the NEWEST mtime.
+        [IO.File]::SetLastWriteTime($b, (Get-Date).AddDays(-1 - $age))
+        $age += 7
+    }
+    return $target
+}
+
+It 'Remove-StaleBackups keeps the newest N by the TIMESTAMP IN THE NAME and deletes the rest' {
+    # 34 files / 356 KB of .bak-<timestamp> had accumulated across the four agent files before
+    # this existed, because all three writers copied and none ever deleted. The survivors must be
+    # the newest, and "newest" must come off the name: see New-SUBackupFixture above for why
+    # mtime is the wrong field, and note the fixture's mtimes run the other way on purpose.
+    $stamps = @('20260901-010101', '20260902-010101', '20260903-010101',
+                '20260904-010101', '20260905-010101', '20260906-010101')
+    $target = New-SUBackupFixture -Stamps $stamps
+    $removed = @(Remove-StaleBackups -FilePath $target -Keep 3)
+    $left = @(Get-ChildItem -LiteralPath (Split-Path $target -Parent) -File | ForEach-Object { $_.Name } | Sort-Object)
+    $want = @('FIXTURE.md', 'FIXTURE.md.bak-20260904-010101',
+              'FIXTURE.md.bak-20260905-010101', 'FIXTURE.md.bak-20260906-010101')
+    if (($left -join ',') -ne ($want -join ',')) {
+        Write-Host "     wanted: $($want -join ', ')" -ForegroundColor Red
+        Write-Host "     got   : $($left -join ', ')" -ForegroundColor Red
+    }
+    (($left -join ',') -eq ($want -join ',')) -and ($removed.Count -eq 3) -and
+        # the live file is never a candidate, however many backups there are
+        (Test-Path -LiteralPath $target)
+}
+
+It 'Remove-StaleBackups leaves a hand-made .bak- and another file entirely alone' {
+    # This box holds .bak-preSSEtune-20260724 and .bak-preWSfix-20260723 next to the files these
+    # callers touch - backups a human made on purpose. A "<name>.bak-*" glob is entitled to delete
+    # them, so only the writers' own yyyyMMdd-HHmmss shape counts. And the prune is scoped to ONE
+    # target: a sweep of the directory would take the sibling agent files' history with it.
+    $target = New-SUBackupFixture -Stamps @('20260901-010101', '20260902-010101',
+                                            '20260903-010101', '20260904-010101')
+    $dir = Split-Path $target -Parent
+    $hand = "$target.bak-preRelease-20260724"
+    Set-Content -LiteralPath $hand -Value 'human' -Encoding UTF8
+    $other = Join-Path $dir 'OTHER.md'
+    Set-Content -LiteralPath $other -Value 'other' -Encoding UTF8
+    Set-Content -LiteralPath "$other.bak-20260101-010101" -Value 'other old' -Encoding UTF8
+    $removed = @(Remove-StaleBackups -FilePath $target -Keep 2)
+    (($removed.Count -eq 2)) -and (Test-Path -LiteralPath $hand) -and
+        (Test-Path -LiteralPath "$other.bak-20260101-010101") -and
+        (-not (Test-Path -LiteralPath "$target.bak-20260901-010101")) -and
+        (Test-Path -LiteralPath "$target.bak-20260904-010101")
+}
+
+It 'Remove-StaleBackups deletes NOTHING under -DryRun' {
+    # A run that promised to change nothing must not delete either, and a prune is the one place
+    # where "nothing to undo afterwards" is the whole point. Mirrors the guard Remove-AgentBlocks
+    # uses three lines from its own .bak- write.
+    $target = New-SUBackupFixture -Stamps @('20260901-010101', '20260902-010101', '20260903-010101')
+    $before = @(Get-ChildItem -LiteralPath (Split-Path $target -Parent) -File).Count
+    $prev = $script:DryRun
+    try {
+        $script:DryRun = $true
+        $removed = @(Remove-StaleBackups -FilePath $target -Keep 1)
+    } finally { $script:DryRun = $prev }
+    $after = @(Get-ChildItem -LiteralPath (Split-Path $target -Parent) -File).Count
+    # And the positive control in the same test: with the flag restored it really does prune, so
+    # a function that had simply stopped working could not pass this.
+    $live = @(Remove-StaleBackups -FilePath $target -Keep 1)
+    ($removed.Count -eq 0) -and ($after -eq $before) -and ($before -eq 4) -and ($live.Count -eq 2)
+}
+
 # The fixture root goes with the section that made it. Invoke-SmokeLintTests.ps1 cleans its own in
 # a finally and $scratch is cleaned at the top of this file; this one was introduced on 2026-09-11
 # with neither, and run-gate.ps1 -Phase runs each suite TWICE (once via smoke-test, once directly),
@@ -1778,6 +1868,50 @@ It 'Add-UserPathEntry asks the machine hive BEFORE it writes, and returns on yes
     }
     foreach ($b in $bad) { Write-Host "     $b" -ForegroundColor Red }
     $bad.Count -eq 0
+}
+
+It 'all three .bak- writers prune, so no fourth one can be added without noticing' {
+    # THE ALLOW-LIST INVERTED. Three sites built "<file>.bak-<yyyyMMdd-HHmmss>" and not one of
+    # them ever deleted a backup: 34 files / 356 KB had piled up across the four agent files,
+    # growing by up to 8 per non-dry-run bootstrap run. The fix is one helper and three calls, and
+    # the way it silently un-fixes itself is a fourth writer that copies the line and not the
+    # prune - so this test derives the writer set from the SOURCE and requires each one to call
+    # the helper, rather than checking the three it knows about.
+    $bad = @()
+    $writers = @()
+    foreach ($rel in $pathEditorFiles) {
+        foreach ($fn in $pathEditorAsts[$rel].FindAll({ param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+            # An ExpandableStringExpressionAst is the only way to spell this, since the name
+            # interpolates Get-Date - so the text of the whole function body is the wrong place to
+            # look and the string node is the right one.
+            #
+            # '.bak-' IMMEDIATELY FOLLOWED BY AN INTERPOLATION is what distinguishes a WRITER from
+            # a READER, and the distinction is load-bearing rather than cosmetic: the first run of
+            # this test flagged Remove-StaleBackups itself, whose "$leaf.bak-*" GLOB also contains
+            # the substring. A writer stamps something in; the pruner matches a wildcard.
+            $stamped = @($fn.Body.FindAll({ param($n)
+                ($n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) -and
+                ($n.Extent.Text -match '\.bak-\$') }, $true))
+            if ($stamped.Count -eq 0) { continue }
+            $writers += "$rel/$($fn.Name)"
+            $calls = @($fn.Body.FindAll({ param($n)
+                $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
+                ForEach-Object { $_.GetCommandName() })
+            if ($calls -notcontains 'Remove-StaleBackups') {
+                $bad += ("{0}:{1} {2} writes a .bak- and never prunes" -f
+                         $rel, $stamped[0].Extent.StartLineNumber, $fn.Name)
+            }
+        }
+    }
+    # A FLOOR, because a predicate that matched nothing would report every writer compliant. The
+    # three are Remove-AgentBlocks and Write-AgentBlock in lib\common.ps1, and
+    # Remove-StaleAgentBlocks in bootstrap.ps1.
+    if ($writers.Count -lt 3) {
+        Write-Host "     found only $($writers.Count) .bak- writer(s) ($($writers -join ', ')) - the sweep is not reaching them" -ForegroundColor Red
+    }
+    foreach ($b in $bad) { Write-Host "     $b" -ForegroundColor Red }
+    ($bad.Count -eq 0) -and ($writers.Count -ge 3)
 }
 
 It 'Remove-StalePathEntries refuses the machine hive unelevated rather than throwing at it' {

@@ -247,6 +247,80 @@ function Remove-MachinePathEntry {
     return 'Removed'
 }
 
+# -- Timestamped backups -------------------------------------------------------
+function Remove-StaleBackups {
+    <#
+        Keep the $Keep most recent "<FilePath>.bak-<yyyyMMdd-HHmmss>" siblings and delete the
+        rest. Returns the paths it removed, so a caller can report instead of assume.
+
+        ONE HELPER, THREE CALLERS. Three sites wrote that exact name and none of them ever
+        deleted one: Remove-AgentBlocks and Write-AgentBlock below, and bootstrap.ps1's
+        Remove-StaleAgentBlocks. Measured on this box 2026-09-17, before this function existed:
+        32 files / 291 KB across %USERPROFILE%, %USERPROFILE%\.claude and %USERPROFILE%\.codex -
+        10, 9 and 13 respectively - growing by up to 8 per non-dry-run bootstrap run. The agent
+        files are ~7 KB each and the block is rewritten on every run whether or not it changed,
+        so the growth is unbounded and almost entirely duplicates.
+
+        KEEP = 3, AND THE REASON IS WHAT MAKES IT DEFENSIBLE. Each backup is the target file as
+        it stood immediately before one idempotent rewrite of one fenced block. One copy is
+        enough to undo the newest write; the second and third exist because a bad block can be
+        deployed and only noticed a run or two later, which is exactly how the `$$><script.txt`
+        corruption survived. Beyond that they are indistinguishable duplicates. Three per target
+        bounds the four agent files at 12 files / ~84 KB instead of the 32 measured above.
+
+        SORTED BY THE TIMESTAMP IN THE NAME, NEVER BY LastWriteTime, and that is measured rather
+        than preferred. Copy-Item PRESERVES the source's LastWriteTime, so every backup here
+        carries the mtime of the PREVIOUS write's content - probed 2026-09-17,
+        CLAUDE.md.bak-20260917-150230 has mtime 20260911-131028, six days off. The name is the
+        only field the writer actually stamped.
+
+        THE TIMESTAMP SHAPE IS REQUIRED, not just the ".bak-" prefix. This box also holds
+        hand-made backups named .bak-preSSEtune-20260724 and .bak-preWSfix-20260723 that a
+        human made on purpose; a "<name>.bak-*" glob would be entitled to delete them the day
+        one of these callers is pointed at that file. Anything not matching the writers' own
+        format is left alone.
+
+        NO-OP UNDER -DryRun, mirroring the guard Remove-AgentBlocks uses a few lines below: a
+        run that promised to change nothing must not delete anything either.
+
+        DEGRADED LOUDLY, never silently. A locked or vanished backup warns and the prune moves
+        on - failing a bootstrap over a housekeeping delete would be the worse trade - but the
+        warning is emitted, because a prune that quietly does nothing is indistinguishable from
+        one that is not wired up.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [ValidateRange(1, 100)][int]$Keep = 3
+    )
+    $dir = Split-Path -Path $FilePath -Parent
+    $leaf = Split-Path -Path $FilePath -Leaf
+    if (-not $dir -or -not (Test-Path -LiteralPath $dir)) { return @() }
+
+    # -Filter is the provider's own wildcard, so a leaf containing [ ] does not have to be
+    # escaped the way -Include would demand; the regex below is what actually decides.
+    $candidates = @(Get-ChildItem -LiteralPath $dir -Filter "$leaf.bak-*" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '\.bak-\d{8}-\d{6}$' } |
+        Sort-Object -Property Name -Descending)
+    if ($candidates.Count -le $Keep) { return @() }
+
+    $doomed = @($candidates | Select-Object -Skip $Keep)
+    if ($script:DryRun) {
+        Write-Info "[DRY-RUN] would prune $($doomed.Count) old backup(s) of $leaf, keeping the newest $Keep"
+        return @()
+    }
+    $removed = @()
+    foreach ($old in $doomed) {
+        try {
+            Remove-Item -LiteralPath $old.FullName -Force
+            $removed += $old.FullName
+        } catch {
+            Write-Warn "could not prune old backup $($old.Name) ($($_.Exception.Message)); it will be retried next run"
+        }
+    }
+    if ($removed.Count) { Write-Info "pruned $($removed.Count) old backup(s) of $leaf, kept the newest $Keep" }
+    return $removed
+}
+
 # Strip fenced agent-discovery blocks (WIN_DEVTOOLS and/or legacy CODEX_TOOLBOX)
 # from the standard agent files. Backs each file up before rewriting. Shared by
 # the uninstaller and the legacy-cleanup path.
@@ -277,6 +351,9 @@ function Remove-AgentBlocks {
         $backup = "$file.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
         Copy-Item -LiteralPath $file -Destination $backup -Force
         Set-Content -LiteralPath $file -Value $cleaned.Trim() -Encoding UTF8
+        # AFTER the copy, never before: pruning first would keep $Keep - 1 old copies plus the
+        # one about to be written, so the guaranteed depth would silently be one short.
+        Remove-StaleBackups -FilePath $file | Out-Null
         Write-Ok "removed agent block(s): $file"
     }
 }
@@ -690,6 +767,14 @@ function Write-AgentBlock {
     $backup = "$FilePath.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
     if (Test-Path $FilePath) { Copy-Item $FilePath $backup -Force }
     Set-Content $FilePath $content -Encoding UTF8
+    # THE PRUNE LIVES HERE, not in Write-AgentDiscovery, and that is a hard constraint rather
+    # than a preference. lib\AgentDiscovery.ps1 extracts Write-AgentDiscovery's body by
+    # EVALUATING its assignment statements, and refuses any that call a command outside
+    # $script:ADAllowedCommands = @('Join-Path'). A prune call added up there would make the
+    # extractor refuse, and smoke-test.ps1's deployed-vs-generated check - the one that caught
+    # the $$><script.txt corruption - would report "could not reach the generator" instead.
+    # Here it is invisible to the extractor and still covers all four agent files.
+    Remove-StaleBackups -FilePath $FilePath | Out-Null
     Write-Ok "agent block [$Marker] -> $FilePath"
 }
 
