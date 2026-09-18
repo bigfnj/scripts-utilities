@@ -72,8 +72,22 @@ function New-ADFixture {
 }
 
 function Get-ADResult {
+    <#
+        -RepoRoot IS A REAL DIRECTORY, and a fake drive letter broke this suite in CI only.
+
+        It was $fixtureRoot. Join-Path on a drive that does not exist writes a NON-TERMINATING error
+        and returns empty, so locally the `$x = Join-Path $RepoRoot "docs"` fixture evaluated to
+        '' and the extractor succeeded. GitHub Actions sets $ErrorActionPreference = 'stop' for
+        `shell: powershell`, which the suite inherits from the step - so in CI the same error
+        became terminating, the extractor's catch fired, and the "allow-listed command is
+        accepted" test failed there while passing here.
+
+        Measured 2026-09-18. That is the THIRD environment divergence this repo has hit in two
+        days, after in-session-vs--File invocation and markdownlint's presence on PATH. Using a
+        directory that actually exists removes the whole class from this suite.
+    #>
     param([string]$CommonPath)
-    Get-AgentDiscoveryBody -CommonPath $CommonPath -RepoRoot 'T:\repo'
+    Get-AgentDiscoveryBody -CommonPath $CommonPath -RepoRoot $fixtureRoot
 }
 
 try {
@@ -183,7 +197,7 @@ It 'a statement that is neither an assignment nor Write-AgentBlock is reported' 
 }
 
 It 'a missing common.ps1 is a refusal, not an exception' {
-    $r = Get-AgentDiscoveryBody -CommonPath (Join-Path $fixtureRoot 'nope.ps1') -RepoRoot 'T:\repo'
+    $r = Get-AgentDiscoveryBody -CommonPath (Join-Path $fixtureRoot 'nope.ps1') -RepoRoot $fixtureRoot
     ($r.Reason) -and (-not $r.Body)
 }
 

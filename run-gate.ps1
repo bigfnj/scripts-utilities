@@ -177,7 +177,16 @@ function Invoke-GateSuite {
         if ($InSession) {
             # Set-Location first, because CI's run: block executes with the repo root as its
             # working directory and a suite is free to depend on that.
-            $cmd = "Set-Location -LiteralPath '{0}'; & '{1}'" -f $repoRoot, $ScriptPath
+            #
+            # AND $ErrorActionPreference = 'Stop', because that is what CI actually does. GitHub
+            # Actions sets it for `shell: powershell` and the suite inherits it from the step
+            # wrapper, while this gate's children start at the default 'Continue'. Measured
+            # 2026-09-18: Join-Path against a non-existent DRIVE writes a non-terminating error
+            # and returns empty, so a fixture using 'T:\repo' evaluated fine locally - and under
+            # Stop the same error became terminating and failed one test in CI only. Matching the
+            # preference here is what makes this check CI-parity rather than merely
+            # invocation-parity.
+            $cmd = "Set-Location -LiteralPath '{0}'; `$ErrorActionPreference = 'Stop'; & '{1}'" -f $repoRoot, $ScriptPath
             $out = & $ps51 -NoProfile -ExecutionPolicy Bypass -Command $cmd 2>&1 | Out-String
         } else {
             $out = & $ps51 -NoProfile -ExecutionPolicy Bypass -File $ScriptPath 2>&1 | Out-String
