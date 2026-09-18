@@ -147,6 +147,23 @@ that matters and is long enough not to be mistaken for a nav label.</p></article
 SELFTEST_WANT = "the only sentence"
 SELFTEST_REJECT = "should not appear"
 
+# The offline r.jina.ai envelope fixture, transcribed from a REAL response
+# (example.com, 2026-09-17) rather than invented, including the cached-snapshot
+# warning that response actually carried. Three things have to hold at once: the
+# page survives, the header does not reach the text, and the staleness warning is
+# not swallowed - so breaking any one of the three fails the check below.
+SELFTEST_READER = """Title: Example Domain
+
+URL Source: https://example.com/
+
+Published Time: Tue, 15 Sep 2026 23:41:26 GMT
+
+Warning: This is a cached snapshot of the original page, consider retry with caching opt-out.
+
+Markdown Content:
+This domain is for use in documentation examples without needing permission.
+"""
+
 
 def have(module: str) -> bool:
     """Is an optional upgrade importable? Never raises, never imports."""
@@ -518,6 +535,45 @@ def fetch_direct(url: str, ua: str, timeout: float, impersonate: bool = True) ->
 
 # -- rung 2: reader ------------------------------------------------------------
 
+# r.jina.ai answers with an ENVELOPE, not the page: a block of "Key: value" lines
+# and then this marker, after which the extracted text begins.
+READER_ENVELOPE_END = "Markdown Content:"
+
+
+def reader_unwrap(body: str) -> tuple[str, list[str]]:
+    """Split r.jina.ai's header block off the page text. Returns (text, notes).
+
+    THE HEADER IS NOT PAGE TEXT, and counting it as page text was not cosmetic.
+    Measured against example.com on 2026-09-17: 366 chars reported, of which 226
+    were Title/URL Source/Published Time/Warning lines and 140 were the page. That
+    inflates `chars`, moves results across the MIN_TEXT line, and - because run()
+    keeps whichever rung returned the most text - gave this rung a ~200-char head
+    start over `direct` and `chrome` on every comparison. A reader result could
+    win the ladder, and end it, on the strength of Jina's own preamble.
+
+    The Warning line is kept as a note rather than dropped: Jina serves CACHED
+    snapshots and says so in-band. That same measurement got a snapshot two days
+    old, which browse reported as an ordinary live read. No other rung can hand
+    back stale content, so the caveat has nowhere else to come from.
+
+    An unrecognised envelope degrades to today's behaviour - the whole response as
+    text - and SAYS SO, rather than returning an empty page if Jina's format moves.
+    """
+    head, sep, rest = body.partition(READER_ENVELOPE_END)
+    if not sep:
+        return body.strip(), [
+            "reader envelope not recognised - the whole response is being counted as page text"
+        ]
+    notes = [f"dropped {len(head)} chars of r.jina.ai envelope (header, not page text)"]
+    for line in head.splitlines():
+        line = line.strip()
+        low = line.lower()
+        if low.startswith("warning:"):
+            notes.append(f"STALE? r.jina.ai said: {line}")
+        elif low.startswith("published time:"):
+            notes.append(f"r.jina.ai reported {line}")
+    return rest.strip(), notes
+
 
 def fetch_reader(url: str, timeout: float) -> Result:
     """Third-party server-side reader. Opt-in because it discloses the URL.
@@ -535,9 +591,17 @@ def fetch_reader(url: str, timeout: float) -> Result:
             r = client.get(endpoint, headers={"Accept": "text/plain"})
             res.status, res.final_url = r.status_code, url
             if 200 <= r.status_code < 300:
-                res.text = r.text.strip()
                 res.notes.append("extractor: r.jina.ai (server-side)")
+                text, envelope_notes = reader_unwrap(r.text)
+                res.text = text
+                res.notes.extend(envelope_notes)
                 res.notes.append("PRIVACY: the url was disclosed to r.jina.ai")
+            else:
+                # A non-2xx used to leave NO note at all, so a refusal printed as
+                # "rung=reader status=451 chars=0" with nothing said about it -
+                # indistinguishable from a rung that was never tried. Jina refuses
+                # with 401/402/429/451 depending on quota and target.
+                res.notes.append(f"reader refused: HTTP {r.status_code} and no text returned")
     except Exception as exc:  # noqa: BLE001
         res.notes.append(f"reader failed: {type(exc).__name__}: {exc}")
     return res
@@ -663,6 +727,29 @@ def selftest(cdp: str, timeout: float) -> int:
             print(f"  FAIL     extraction ({name}) produced {len(text)} chars")
             print(f"           wanted {SELFTEST_WANT!r} present and {SELFTEST_REJECT!r} absent")
             print(f"           got: {text[:200]!r}")
+
+    # Rung 2's envelope parse, offline. This belongs beside the extraction checks
+    # rather than in the network section: the reader rung is opt-in BECAUSE it
+    # discloses the URL, so its check must not fire a third-party request on every
+    # smoke test. The live proof is a recorded manual measurement instead.
+    reader_text, reader_notes = reader_unwrap(SELFTEST_READER)
+    reader_stale = any(n.startswith("STALE?") for n in reader_notes)
+    if (
+        reader_text.startswith("This domain is")
+        and "URL Source:" not in reader_text
+        and reader_stale
+    ):
+        print(
+            f"  OK       reader envelope: {len(reader_text)} chars of page, "
+            "header dropped, staleness kept"
+        )
+    else:
+        failures += 1
+        print(
+            f"  FAIL     reader envelope unwrap produced {len(reader_text)} chars, "
+            f"stale_noted={reader_stale}"
+        )
+        print(f"           got: {reader_text[:120]!r}")
 
     # The install command is install-browse.ps1 -WithExtras, NOT "bootstrap -Only
     # extras": both catalog entries are default:false, so a group run skips them
