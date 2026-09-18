@@ -102,46 +102,6 @@ refusal against. Needs a real blocked URL before the detector can be trusted on 
 
 ## Housekeeping - LOW
 
-### Four files under `logs/` grow without a retention policy
-
-Audited 2026-09-18, measured on this box, ranked by growth rate. `Remove-StaleBackups` added this
-round covers **only** `<leaf>.bak-yyyyMMdd-HHmmss` agent-file backups; none of these share that
-pattern or that directory.
-
-| # | pattern | writer | on disk now | per run |
-|---|---|---|---|---|
-| 1 | `logs/fresh-workstation/setup-*.log` | `fresh-toolbox-setup-runner.ps1`, `Start-Transcript` | 5 files, 141 KB | 1 file, 7-103 KB |
-| 2 | `logs/path-backup-*.json` | `lib/path-registry.ps1`, `Backup-PathRegistry` | 5 files, 20 KB | 1 file, 2-6 KB |
-| 3 | `logs/machine-path-intended-*.txt` | `scripts/consolidate-path.ps1` | 0 files (new today) | 1 file, 2-4 KB |
-| 4 | `logs/gate-phases.log` | `run-gate.ps1`, `Add-Content` | 15 lines, 1.5 KB | 1 line, ~100 B |
-
-Notes that change what to do about each:
-
-- **(1) is the only one with real volume.** The transcript captures winget output, so a full
-  fresh-setup run is ~103 KB and a failed quick run is ~7 KB. `Stop-Transcript` is in a `finally`,
-  so the handle is always closed - this is purely retention.
-- **(2) has documented recovery value.** `consolidate-path.ps1 -Restore` and `-FromBackup` read
-  these, and `Backup-PathRegistry`'s own docblock calls the 2026-09-09 file "the only surviving
-  record" of the pre-outage PATH order. Do not prune this one without keeping that file.
-- **(3) is new this round and is my doing.** Renaming the fixed `machine-path-pending.txt` to a
-  timestamp made the filename true (it is written *before* elevation and was left behind claiming a
-  pending change that had already been applied) and turned one overwritten file into a growing set.
-- **(4) is a non-issue by design.** 15 lines across the repo's whole history; the ledger's value is
-  the history.
-
-**DONE, as reporting rather than pruning**, 2026-09-18. `scripts/smoke-test.ps1` has a
-`logs retention` group that counts and sizes all four patterns on every run, warning at 25 files or
-10 MB per pattern - thresholds chosen to be reachable (about twenty more runs at one file per run)
-rather than decorative, and mutation-tested by dropping the bar to 2 and watching two OK lines become
-WARNs.
-
-Deliberately no pruner, and the trade is the reason: under 200 KB is at stake in total, this box has
-lost ~123,605 files to a script that deleted what it should not have, and two of the four patterns
-are **inputs** rather than output. The remaining decision, if anyone ever wants automatic pruning, is
-recorded here: the blast radius of each is narrow and fixed (a literal prefix plus a timestamp
-suffix, one directory, nothing else matches), and that should be stated in the proposal rather than
-discovered afterwards.
-
 ### The `%TEMP%` fixture sweep's 30-minute window is an assumption, not a measurement
 
 `tests/Invoke-InstallerTests.ps1`. Three module-scope fixture roots (`installer-tests-*`,
@@ -189,6 +149,10 @@ starts:
 - **Relocating the three inputs out of `logs/`.** Touches seven files and resets the ledger baseline
   for every checkout at once. **Copy, do not move** - one of the three is the only surviving record
   of the pre-outage PATH order.
+- **`logs/` retention - DONE as reporting, no pruner.** A `logs retention` smoke group counts and
+  sizes all four growing patterns, warning at 25 files or 10 MB. The record holds the growth table
+  and the reason there is deliberately no deleter: under 200 KB total is at stake, and two of the
+  four patterns are inputs.
 
 ---
 
