@@ -67,26 +67,6 @@ function Sync-EnvPath {
     $env:PATH = ($paths | Where-Object { $_ } | Select-Object -Unique) -join ';'
 }
 
-# Append an entry to the persistent user PATH. Returns $true unless the directory is missing.
-#
-# THROUGH Get-RawPath / Set-RawPath, never [Environment]::Get/SetEnvironmentVariable - the same
-# prohibition Remove-MachinePathEntry states below, applied to the hive where it had been ignored.
-# Both halves of that API are wrong for an edit and the second is permanent: Get EXPANDS %VAR% on
-# read, Set writes the value back as REG_SZ, and a REG_SZ PATH never expands a %VAR% again.
-#
-# The user hive looks like it has nothing to lose - measured 2026-09-11, 3 entries, none of them
-# %VAR%-based - but its value KIND is RegistryValueKind::ExpandString, exactly like the machine
-# hive's. One write through the framework API demotes it, and the damage is then silent and
-# deferred: the next %VAR% entry anyone adds by hand simply never expands, in a hive that looks
-# fine and whose kind nobody thinks to check.
-#
-# NO -DryRun BRANCH, and that is the shape this function already had rather than a decision taken
-# here. bootstrap.ps1's Register-ToolboxUserPath guards its own call site (:335), but
-# lib\catalog.ps1:94 and :104 do not - under -DryRun Install-WingetTool returns $true WITHOUT
-# installing, so a path_fallback tool whose binary is absent reaches this function and writes the
-# user PATH during a run that promised to change nothing. Deliberately left open: this change is
-# confined to the registry MECHANISM, and closing that gap is a behaviour change belonging either
-# to the catalog call sites or to a guard here. Recorded so the next reader need not rediscover it.
 function Invoke-Native {
     <#
         Run a native command with its output captured and its stderr survivable, returning the
@@ -127,6 +107,36 @@ function Invoke-Native {
     } finally { $ErrorActionPreference = $prev }
 }
 
+# Append an entry to the persistent user PATH. Returns $true unless the directory is missing.
+#
+# THIS COMMENT SITS ABOVE THE FUNCTION IT DESCRIBES AGAIN. It was stranded above Invoke-Native
+# when that function was inserted between the two, so its "this function" and its "NO -DryRun
+# BRANCH" paragraph read as claims about a wrapper that has neither a PATH nor a registry write.
+#
+# THROUGH Get-RawPath / Set-RawPath, never [Environment]::Get/SetEnvironmentVariable - the same
+# prohibition Remove-MachinePathEntry states below, applied to the hive where it had been ignored.
+# Both halves of that API are wrong for an edit and the second is permanent: Get EXPANDS %VAR% on
+# read, Set writes the value back as REG_SZ, and a REG_SZ PATH never expands a %VAR% again.
+#
+# The user hive looks like it has nothing to lose - measured 2026-09-11, 3 entries, none of them
+# %VAR%-based - but its value KIND is RegistryValueKind::ExpandString, exactly like the machine
+# hive's. One write through the framework API demotes it, and the damage is then silent and
+# deferred: the next %VAR% entry anyone adds by hand simply never expands, in a hive that looks
+# fine and whose kind nobody thinks to check.
+#
+# THE -DryRun GUARD BELOW IS THE ONE THIS FUNCTION SPENT A MIGRATION WITHOUT, and the gap was
+# reachable, not theoretical. bootstrap.ps1's Register-ToolboxUserPath guards its own call site
+# (:407), but lib\catalog.ps1:94 and :104 did not - under -DryRun Install-WingetTool returns
+# $true WITHOUT installing, so a path_fallback tool whose binary is absent arrived here and the
+# registry was written by a run that promised to change nothing. Measured 2026-09-17 with the
+# registry helpers stubbed: Install-CatalogItem on a winget-machine item with an existing
+# path_fallback directory produced ONE user-hive write under -DryRun, and printed "added user
+# PATH entry" while doing it. Four of catalog.json's tools declare a path_fallback and all four
+# of those directories exist on this box.
+#
+# The guard is Remove-UserPathEntry's idiom, deliberately: report and leave. It returns $true
+# rather than the sibling's bare return because a dry run that reported an install FAILURE it
+# had not had would be a different lie in the same place.
 function Add-UserPathEntry {
     param([string]$Path)
     if (-not (Test-Path $Path)) {
@@ -170,6 +180,10 @@ function Add-UserPathEntry {
         ([System.Environment]::ExpandEnvironmentVariables($_)).TrimEnd('\') -ieq $resolved.TrimEnd('\')
     } | Select-Object -First 1
     if (-not $exists) {
+        if ($script:DryRun) {
+            Write-Info "[DRY-RUN] would add user PATH entry: $resolved"
+            return $true
+        }
         Set-RawPath -Scope User -Value ((@($entries) + $resolved) -join ';')
         Write-Ok "added user PATH entry: $resolved"
     }

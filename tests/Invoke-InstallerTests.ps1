@@ -1870,6 +1870,55 @@ It 'Add-UserPathEntry asks the machine hive BEFORE it writes, and returns on yes
     $bad.Count -eq 0
 }
 
+It 'Add-UserPathEntry cannot reach its registry write under -DryRun' {
+    # SOURCE-LEVEL for the same reason as everything else in this section: gate.yml's "No test
+    # reaches a writer that cannot be redirected" step forbids this suite from CALLING
+    # Add-UserPathEntry, which writes the real user hive and takes no path to redirect. The
+    # runtime proof was taken out of band with Get-RawPath/Set-RawPath stubbed, 2026-09-17: one
+    # user-hive write under -DryRun before this guard, zero after, and Install-CatalogItem on a
+    # winget-machine item with an existing path_fallback reproduced it end to end - because
+    # Install-WingetTool returns $true under -DryRun without installing anything.
+    #
+    # CONDITION AND ORDER, never presence. A $script:DryRun mention anywhere in the function
+    # satisfies "there is a guard" while deciding nothing: after the write it is dead, and without
+    # a return it is a comment with a CPU cost. So the if must TEST $script:DryRun, RETURN, and
+    # sit before the Set-RawPath - which is exactly the shape Remove-UserPathEntry has had all
+    # along, three lines away.
+    $fn = Get-SUFunctionAst -Ast $pathEditorAsts['lib\common.ps1'] -Name 'Add-UserPathEntry'
+    $bad = @()
+    if (-not $fn) { $bad += 'lib\common.ps1 is missing Add-UserPathEntry' }
+    else {
+        $write = @($fn.Body.FindAll({ param($n)
+            ($n -is [System.Management.Automation.Language.CommandAst]) -and
+            ($n.GetCommandName() -eq 'Set-RawPath') }, $true))
+        if ($write.Count -eq 0) { $bad += 'Add-UserPathEntry no longer writes at all' }
+        $guards = @($fn.Body.FindAll({ param($n)
+            ($n -is [System.Management.Automation.Language.IfStatementAst]) -and
+            ($n.Clauses[0].Item1.Extent.Text -match '\$script:DryRun') -and
+            (@($n.FindAll({ param($m)
+                $m -is [System.Management.Automation.Language.ReturnStatementAst] }, $true)).Count -gt 0) }, $true))
+        if ($guards.Count -eq 0) {
+            $bad += 'no if-statement tests $script:DryRun and returns, so a dry run still reaches the write'
+        } elseif ($write.Count) {
+            $gOff = ($guards | ForEach-Object { $_.Extent.StartOffset } | Measure-Object -Minimum).Minimum
+            $wOff = ($write | ForEach-Object { $_.Extent.StartOffset } | Measure-Object -Minimum).Minimum
+            if ($gOff -ge $wOff) { $bad += 'the -DryRun guard sits at or after the registry write' }
+        }
+        # The sibling is the reference, so it has to still hold the shape this test asserts. If
+        # Remove-UserPathEntry ever loses its own guard, "mirror the sibling" stops meaning
+        # anything and this test would be pinning a pattern nothing else follows.
+        $sib = Get-SUFunctionAst -Ast $pathEditorAsts['lib\common.ps1'] -Name 'Remove-UserPathEntry'
+        if (-not $sib) { $bad += 'lib\common.ps1 is missing Remove-UserPathEntry' }
+        elseif (@($sib.Body.FindAll({ param($n)
+            ($n -is [System.Management.Automation.Language.IfStatementAst]) -and
+            ($n.Clauses[0].Item1.Extent.Text -match '\$script:DryRun') }, $true)).Count -eq 0) {
+            $bad += 'Remove-UserPathEntry lost the -DryRun guard this test mirrors'
+        }
+    }
+    foreach ($b in $bad) { Write-Host "     $b" -ForegroundColor Red }
+    $bad.Count -eq 0
+}
+
 It 'all three .bak- writers prune, so no fourth one can be added without noticing' {
     # THE ALLOW-LIST INVERTED. Three sites built "<file>.bak-<yyyyMMdd-HHmmss>" and not one of
     # them ever deleted a backup: 34 files / 356 KB had piled up across the four agent files,
