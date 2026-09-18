@@ -23,7 +23,7 @@ justifies the category.
 ## Where to pick up - handoff, 2026-09-18
 
 Repo is on `main`, pushed, CI **green on both jobs** (`suites` and `checks`). Gate green:
-`checks=6 smoke=87/4/0 agentdiscovery=19 core=27 gatechecks=43 installer=131 render=28 smokelint=18
+`checks=7 smoke=87/4/0 agentdiscovery=19 core=27 gatechecks=47 installer=137 render=28 smokelint=18
 triage=31`, and parity green on all seven suites under CI's invocation *and* CI's error preference.
 All seven suites also pass under `Set-StrictMode -Version Latest`, and the smoke test passes from
 inside a git worktree.
@@ -79,6 +79,16 @@ the same day:
   `bootstrap.ps1` gates readiness on that file existing. Now written twice, with `Invoke-Checked
   -Soft` recording probe failures into the ledger; the build still exits non-zero. Side benefit that
   mattered as much: `pip check` is the first probe, and its throw had been hiding the other five.
+- **The last five backlog items were then cleared, and three of them were wrong about themselves.**
+  Two named a fix that would not have worked. Full write-up in `docs/engineering-record.md`; the
+  transferable part is that **an entry's proposed remedy is a hypothesis and only its measurement is
+  a finding.** Highlights: `subprocess.run`'s `timeout=` does not bound the call when stdout is a
+  pipe and the process leaves a grandchild holding the write end (measured: 2s asked, 20.2s elapsed;
+  a temp file gives 0.1s and no timeout at all), so soffice was never slow and the probe was waiting
+  on `soffice.bin`. The fixture sweep now deletes on process OWNERSHIP rather than a guessed age.
+  And the "needs dataflow analysis" null-read lint became a seventh `env-reads` gate check by asking
+  a cheaper question: not whether a null can reach a dereference, but whether the read was written in
+  a form that cannot produce one.
 
 **The single most useful thing learned, worth applying before anything below.** A test that passes
 locally and fails in CI is an **environment divergence**, and there were three, all of which had
@@ -96,96 +106,20 @@ fail locally. If you add a test, ask what on this box it is quietly reading.
 
 ---
 
-## Correctness - MEDIUM
+## Open items: NONE
 
-### `browse`'s journal records the rung that returned the MOST TEXT, not the rung that was NEEDED
+Empty on purpose, and stated rather than left to inference: an empty file and a file whose sections
+happen to be blank read the same, which is how the handoff above gets mistaken for a task list.
 
-`tools/browse/toolbox_browse/cli.py`, `run()` and `journal_save()`. The driver keeps whichever rung
-produced the most characters and writes that host into the journal, so the next fetch of that host
-starts there. A thin-but-working page therefore teaches the journal to prefer a more expensive rung
-over a few extra characters.
+The five that were here on the morning of 2026-09-18 are all fixed, and the group is worth reading
+in `docs/engineering-record.md` before trusting any future entry in this file: **three of the five
+overstated their own difficulty and two named a fix that was wrong.** One "needed a rule that needed
+measurement" and needed neither, one "needed a real blocked URL" when the detection it wanted was
+already sitting in a status code, and one "would need dataflow analysis" when a cheap total rule
+closed it outright. An entry's proposed remedy is a hypothesis; only its measurement is a finding.
 
-Observed 2026-09-17 while proving the reader rung: `example.com` was pinned to `reader` when
-`direct` had served it perfectly. The entry was removed by hand. Inert in practice today, because
-the reader rung is opt-in behind `--allow-reader` and the browser rung needs a running Chrome - but
-the preference is wrong in principle and will bite the moment either is routinely on.
-
-A fix needs a rule for "needed", and that needs more than one target to measure against. Candidate:
-record the FIRST rung that cleared `MIN_TEXT`, and only prefer a later rung when an earlier one
-returned nothing at all.
-
-### `diagnose()` never runs on the reader rung, so a reader refusal cannot set `.challenge`
-
-Same file. `fetch_direct` and `fetch_chrome` both call `diagnose()`; `fetch_reader` does not, so a
-`r.jina.ai` response that is itself a refusal comes back as a thin success rather than a named
-block.
-
-Deliberately not fixed when found: running `CHALLENGE_TEXT` over Jina's markdown envelope is exactly
-the false-positive class that function's own comment documents (an article about bot detection was
-once reported as a DataDome challenge), and no blocked target was available to measure a real
-refusal against. Needs a real blocked URL before the detector can be trusted on this rung.
-
----
-
-## Housekeeping - LOW
-
-### The native probe's `soffice` step outlived its 120s timeout and stalled a build - MECHANISM UNCONFIRMED
-
-`scripts/build-devtoolbox.ps1`, the `native_tooling_smoke_test.py` body written by
-`Write-SmokeScripts`. `slow = {"soffice": 120, "magick": 120}` gives LibreOffice a 120-second
-budget, and `subprocess.run(..., stdout=PIPE, stderr=STDOUT, timeout=slow.get(name, 30))` is
-supposed to bound it.
-
-Observed 2026-09-18, once: a build sat on `run native toolbox smoke` for roughly four minutes.
-`Win32_Process` showed **both** `soffice.exe --version` (the direct child) and
-`soffice.bin --version` (its grandchild) still alive, created 11:29:54, well past the 120s mark.
-The build later completed normally and reported only the expected `pip check` failure, so all six
-probes did eventually run.
-
-**What is NOT established.** The plausible mechanism is the classic Windows one - the timeout fires,
-`subprocess.run` kills the direct child, and the following `communicate()` blocks because a
-surviving grandchild still holds the inherited stdout handle - but that was not proved. A kill of
-those two processes was attempted at about the same moment and was refused by a policy classifier,
-so whether the recovery came from that attempt, from LibreOffice answering on its own, or from
-something else is genuinely unknown. One observation, no repro.
-
-Worth confirming rather than fixing blind, because if the mechanism is real then the timeout does
-not bound the step at all and any build can hang indefinitely on it. Cheap confirmation: run the
-probe with LibreOffice already holding a profile lock (open a document first) and watch whether the
-120s budget is honoured. If it is not, the fix is `Popen` plus an explicit process-tree kill rather
-than a larger number - a bigger timeout would only move the hang.
-
-### The `%TEMP%` fixture sweep's 30-minute window is an assumption, not a measurement
-
-`tests/Invoke-InstallerTests.ps1`. Three module-scope fixture roots (`installer-tests-*`,
-`agentblock-*`, `builder-tests-*`) have cleanups at column 0 rather than in a `finally`, which the
-file documents, so a throw at module scope strands a directory. The self-healing sweep at the top of
-the suite collects them, and this round it was age-gated to 30 minutes so two concurrent runs stop
-deleting each other's live fixtures (before the gate: two concurrent runs scored 106/2 with the
-failures landing on the catalog fixture tests).
-
-30 minutes is three orders of magnitude beyond the observed run time (seconds), so it is a safe
-number - but it is a number, and nothing asserts the suite finishes inside it. If this suite ever
-grows a long-running test, the gate becomes wrong in the dangerous direction. Currently 0 orphans on
-this box, so the sweep is working.
-
-### A null environment read cannot be linted here, and there are 30 of them
-
-`[Environment]::GetEnvironmentVariable(...)` returns `$null` for a value that does not exist, and a
-method call on the result throws. One instance was fixed this round -
-`scripts/smoke-test.ps1`'s 4095-char PATH truncation check could not fire on a fresh profile because
-`$null.TrimEnd(';')` threw and the file sets neither `Stop` nor `StrictMode`, so it printed red,
-continued, and emitted no verdict at all.
-
-Measured across the repo: **30 such reads in 7 files** (`bootstrap.ps1`, `lib/common.ps1`,
-`modules/security.ps1`, `scripts/build-devtoolbox.ps1`, `scripts/smoke-test.ps1`,
-`scripts/uninstall-toolbox.ps1`, `tests/Invoke-InstallerTests.ps1`). **Zero** are a direct
-`GetEnvironmentVariable(...).Method` chain, so every one goes through an intermediate variable and a
-precise lint would need dataflow analysis. A crude AST rule would false-positive heavily.
-
-Recorded rather than attempted, so the next person does not start by writing the lint. The tractable
-version is narrower: make `lib/path-registry.ps1`'s `Get-RawPath` the only PATH reader and give it a
-non-null contract, then the remaining reads are non-PATH and individually reviewable.
+What remains below is not open work: one deferred decision with its cost written down, and a note
+about where per-package install knobs belong.
 
 ---
 

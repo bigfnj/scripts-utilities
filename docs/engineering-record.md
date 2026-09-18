@@ -382,3 +382,117 @@ exit 0 while the manifest still records the entry and smoke still warns - and an
 list still fails the build. The risk of that mechanism is obvious and worth writing down now: an
 allowlist is how a real failure eventually gets waved through, so it should be short, exact-match
 only, and require a reason string per entry.
+
+## The last five backlog items - all FIXED, 2026-09-18
+
+Worth reading as a group before trusting any future entry in this repo, because **three of the five
+overstated their own difficulty** and two named a fix that was wrong. The backlog header already
+warns that its claims have been wrong in both directions; this is the sharpest example so far. An
+entry's proposed remedy is a hypothesis, not a finding, and the measurement is the only part to
+trust.
+
+### browse journalled the most VERBOSE rung, not the cheapest that worked - FIXED
+
+`tools/browse/toolbox_browse/cli.py`. The entry said a fix "needs a rule for 'needed', and that
+needs more than one target to measure against." **It needed no measurement at all.** The normal path
+already journalled correctly, breaking on the first rung that was usable and not thin. The bug was
+confined to the fallback that runs when EVERY rung came back thin, where one variable was serving
+two different questions: `best` is the most verbose result, which is right for what to PRINT and
+wrong for what to REMEMBER.
+
+Observed 2026-09-17: `example.com` (~180 chars, thin by definition since `MIN_TEXT` is 400) was
+pinned to `reader` because Jina's envelope adds characters, though `direct` had served the page
+perfectly. Every later fetch of that host then began at a rung that discloses the URL to a third
+party, to win a few characters.
+
+Extracted as `journal_rung()` so one definition answers it and the selftest can exercise it
+directly - the alternative was a test that re-spelled the expression, which tests a copy. Mutation:
+returning the fallback instead fails the new selftest check, which names both character counts.
+
+### The reader rung's refusals were invisible to the machine-readable field - FIXED, differently
+
+Same file. The entry said this "needs a real blocked URL before the detector can be trusted on this
+rung." That was true of the approach it assumed - scanning Jina's markdown with `CHALLENGE_TEXT`,
+which is the false-positive class `diagnose()`'s own header documents - and the approach was the
+wrong one. `fetch_reader` already detected refusals **by status code**, and its comment even listed
+them: 401, 402, 429, 451. Naming the refusal from the status needs no text scanning and no blocked
+target.
+
+The real defect was narrower and worse than "cannot set `.challenge`": the note said
+"reader refused: HTTP 451" while `.challenge` stayed empty, so `--json` reported no block directly
+beside a note saying there was one. A field that disagrees with the note next to it is worse than no
+field.
+
+Fixed with a `READER_REFUSAL` table, and **the `reader-` prefix on every value is load-bearing**:
+`emit()` branches on it, because the standing advice - clear the challenge once in the live browser -
+is actively wrong for someone else's quota. The selftest pins that invariant, since an entry added
+without the prefix would silently fall into the browser branch.
+
+**Found while fixing it**, and unrelated to the entry: a reader 402 was being reported as the TARGET
+charging for machine access. It broke the rung loop early, returned `EX_PAYMENT`, and printed "the
+site charges for machine access" - three wrong statements about a third party running out of quota.
+All three are now scoped to non-reader rungs. `blocked` also prefers a target-level challenge over a
+reader-service one, or a reader refusal that happened to run first would mask a real Cloudflare
+block found later.
+
+### The native probe's soffice step: mechanism CONFIRMED, and the fix is smaller than proposed
+
+The entry recorded one observation with no repro and guessed at a Windows pipe-inheritance
+mechanism. **Confirmed on 2026-09-18, synthetically, with no GUI app involved:** a child that
+spawns a grandchild inheriting stdout, then exits.
+
+```text
+stdout=PIPE       asked 2.0s, elapsed 20.2s, TimeoutExpired
+stdout=temp file  asked 2.0s, elapsed  0.1s, COMPLETED
+```
+
+CPython's `subprocess.run` kills the direct child on timeout and then calls `communicate()` a second
+time with **no timeout**, which waits for an EOF the surviving grandchild never sends. `soffice.exe`
+launches `soffice.bin` and returns, which is exactly that shape.
+
+The proposed fix was a process-tree kill. The real one is smaller: capture to a temp file instead of
+a pipe, and there is no pipe to wait on. Note the second column - the file variant did not merely
+bound the call, it removed a **false** timeout. The direct child had been exiting immediately all
+along, so soffice was never slow; the probe was waiting on `soffice.bin`'s lifetime and then
+recording that as a harmless 30-second version-check warning. Applied to both generated probes, and
+`lib/GateChecks.ps1` has no opinion here - the installer suite asserts the condition as source text,
+because these bodies are Python inside here-strings.
+
+### The fixture sweep's 30-minute window - FIXED by removing the clock, not by tuning it
+
+`tests/Invoke-InstallerTests.ps1`. The age gate was a guess that nothing asserted, and the entry
+correctly said so. It now sweeps on OWNERSHIP: each fixture root carries a marker with its creating
+process's PID **and start time**, and a root is abandoned when that process is gone. That cannot be
+true of a run still in progress, so the property the gate was protecting no longer rests on an
+estimate.
+
+The start time is not decoration - Windows recycles PIDs, so a bare number is not an identity.
+Every uncertainty resolves to "do not delete": an unreadable marker, a protected process, our own
+PID. On this box that bias is the only defensible one, and it has a test that fails if anyone
+inverts it for tidiness. The only remaining clock is a fallback for roots created before the
+mechanism existed.
+
+Five tests, both directions, and four mutations each failing exactly one: ignoring the start time,
+not writing the marker, inverting the unreadable-marker bias, and re-introducing a pipe in the probe
+check above.
+
+### 30 null environment reads "needing dataflow analysis" - FIXED, and the premise was wrong
+
+The entry said a precise lint "would need dataflow analysis", because none of the reads is a direct
+`.Method` chain - every one goes through a variable, so tracing whether a null can reach a
+dereference genuinely would need it. **That is the wrong question.** Asking instead whether the read
+was written in a form that cannot produce a null makes the rule trivial and total: `[string]$null`
+is `''`, so the cast is free on a value that exists.
+
+All 24 real read sites now carry it. The entry's "30" counted comments and `SetEnvironmentVariable`
+writes. Its proposed fix - route everything through `Get-RawPath` - was also wrong and would have
+changed behaviour: `Get-RawPath` reads the RAW registry value with `DoNotExpandEnvironmentNames`,
+while these reads return the EXPANDED value, and Sync-EnvPath needs the expanded one to build a
+child process PATH.
+
+`lib/GateChecks.ps1` gained a seventh check, `env-reads`, which is AST rather than grep for two
+reasons: the cast has to be the PARENT of the call, which no regex can establish, and a mention in a
+comment or a string is not a read. It has a floor, so zero reads found is a failure rather than a
+clean sweep of nothing. Mutation: removing one cast fails it with the exact file and line. Adding
+the check also failed the registry pin until its name was added there deliberately, which is that
+pin working as designed.
