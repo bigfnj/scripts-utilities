@@ -119,32 +119,73 @@ intentional, not an accident.
 
 ## Scoped, not done: a measurement instead of an attempt
 
-### The suites never run under `Set-StrictMode`
+### `Set-StrictMode` across the suites - DONE for six of seven
 
-Open in spirit, but no longer vague. The backlog said three defences in `lib/ShimPlan.ps1` and
-`lib/path-registry.ps1` are written against conditions StrictMode would surface, and that closing
-it means "expect real work". Measured 2026-09-18, running each suite under
-`Set-StrictMode -Version Latest` with `$ErrorActionPreference = 'Stop'`:
+Measured, then done, 2026-09-18. The starting position was **49 failures across four suites**, which
+looked like 49 problems and was four:
 
-| suite | under StrictMode |
-|---|---|
-| AgentDiscovery | 19 passed, 0 failed |
-| Core | 27 passed, 0 failed |
-| GateChecks | 43 passed, 0 failed |
-| Installer | 124 passed, **1 failed** |
-| Render | 4 passed, **19 failed** |
-| SmokeLint | 9 passed, **9 failed** |
-| Triage | 11 passed, **20 failed** |
+| suite | before | after |
+|---|---|---|
+| AgentDiscovery | 19 / 0 | 19 / 0 |
+| Core | 27 / 0 | 27 / 0 |
+| GateChecks | 43 / 0 | 43 / 0 |
+| Installer | 124 / **1** | 126 / 0 |
+| Render | 4 / **19** | 28 / 0 |
+| SmokeLint | 9 / **9** | 18 / 0 |
+| Triage | 11 / **20** | 11 / **20** - see the STOP below |
 
-**49 failures across four suites.** Each one is either a latent bug in the code under test or an
-artefact of the test harness, and telling those apart is the work. That is a scoped project with a
-known starting point, not a cleanup, and it should be taken on deliberately rather than squeezed
-into a session doing something else. `scripts/build-devtoolbox.ps1` already runs under StrictMode,
-which is why the Installer suite is nearly clean.
+**What the 49 actually were.** Two causes, each in two places:
 
-Note for whoever picks it up: turn it on **one suite at a time**, Render first (19 failures, the
-smallest self-contained subject), and resist the temptation to soften an assertion to make StrictMode
-pass. A test that stops asserting is worse than a test that does not run.
+- *One value unrolled on the way out of a function.* All 10 SmokeLint and Installer failures were
+  `.Count` read off a function result. A function's output is ENUMERATED on return, so a
+  `@()`-bounded collection leaves as `$null` when empty and as a bare scalar when it holds one
+  item, and Windows PowerShell answers `$null.Count` with 0 - which is why they read green.
+- *Fixtures that did not match the shape of real data.* The 39 Render and Triage failures were
+  properties the production objects always carry and the fixtures never supplied. A burst has seven
+  properties and the renderer formats all seven; the fixture had three.
+
+**The finding that justified the whole exercise.** Those tests were not merely "not throwing" - they
+were asserting against nonsense. Measured on the pre-fix Render fixture: the hero tile read
+`Largest burst: rm.exe at .`, the burst meta read `<div class="meta"> to  &middot;  deletions ...`,
+the burst directory `<ul>` never rendered at all, and the Sentinel-paths tile printed
+`<span class="value">4</span>` directly above `<p class="none">None this period.</p>` - contradicting
+itself in two adjacent elements, under 23 green tests. StrictMode did not create work here. It
+revealed that some existing coverage was fictional.
+
+Render gained 5 assertions (23 -> 28) that check rendered output rather than absence of a throw, two
+of them reaching escape sites nothing had reached before.
+
+### Triage cannot get StrictMode without one line in a frozen file
+
+**STOPPED deliberately**, and this is the decision to revisit rather than the work.
+
+The Triage fixture is already production-accurate, property for property. The defect is in the
+frozen subject: `Get-FxTriage` walks a heterogeneous set and reads members blind -
+
+```powershell
+foreach ($set in @($Facts.TopProcesses, $Facts.Bursts, $Facts.Novel, $Facts.Sentinels)) {
+    foreach ($x in @($set)) {
+        $n = if ($x.Name) { $x.Name } elseif ($x.Image) { $x.Image } else { $null }
+        if ($x.Dir) { $okDir.Add(...) }
+```
+
+`TopProcesses` has `Name` + `Count` and no `Dir`; `Bursts` has `Image` + `Count` + `Seconds` and no
+`Name`. Both are correct production shapes and both throw under StrictMode. It is two properties,
+not one: fixing `Dir` then throws on `Name`.
+
+**The one-line fix** is `$x.PSObject.Properties['Dir']` instead of `$x.Dir`, which is exactly what
+`ForensicsReport.Render.ps1` already does for its own optional property. Not made, because
+`scripts/ForensicsReport.Triage.ps1` is in the frozen forensics subsystem.
+
+**And the tempting alternative is a trap, which is the part worth keeping.** Adding `Dir` to the
+`TopProcesses` fixture makes the suite pass - and the moment anyone gives that bolted-on field a
+plausible directory, `$okDir` widens and a finding citing a path that was never shown comes back
+*kept*. Every "is DISCARDED" test in that suite would then pass for the wrong reason, which is the
+one failure the suite exists to prevent. So the passing state is worse than the failing one, and
+that is why it was not taken.
+
+The prompt builder is unaffected: `ConvertTo-FxTriagePrompt` reads `Novel` and `Sentinels`, which do
+carry `Dir`, and both its tests pass under StrictMode. All 20 failures are inside `Get-FxTriage`.
 
 ### `logs/` holds three inputs inside a directory whose name invites deletion
 

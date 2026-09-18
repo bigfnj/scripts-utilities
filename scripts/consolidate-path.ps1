@@ -265,8 +265,8 @@ if ($Restore) {
 # --- read + report -------------------------------------------------------------
 $machine = Get-RawPath -Scope Machine
 $user = Get-RawPath -Scope User
-$mEntries = Split-PathList $machine
-$uEntries = Split-PathList $user
+$mEntries = @(Split-PathList $machine)
+$uEntries = @(Split-PathList $user)
 
 Write-Head "Current PATH  (mode: $mode)"
 Write-Info2 ("machine : {0,5} chars, {1} entries" -f $machine.Length, $mEntries.Count)
@@ -276,7 +276,7 @@ Write-Info2 ("session : {0,5} chars  <- what this process actually received" -f 
 # shorter than machine+user (de-duplication, per-process edits, a parent that started earlier), so
 # "shorter" alone cries wolf - it did, on a freshly consolidated 1818-char PATH. What truncation
 # actually looks like is a final entry chopped mid-string, leaving a directory that cannot exist.
-$sessEntries = Split-PathList $env:Path
+$sessEntries = @(Split-PathList $env:Path)
 if ($sessEntries.Count -gt 0) {
     $lastEntry = $sessEntries[-1]
     if (-not (Test-Path -LiteralPath $lastEntry -ErrorAction SilentlyContinue)) {

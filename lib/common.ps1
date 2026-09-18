@@ -169,7 +169,7 @@ function Add-UserPathEntry {
     }
 
     $raw = Get-RawPath -Scope User
-    $entries = Split-PathList $raw
+    $entries = @(Split-PathList $raw)
     # EXPANDED TO COMPARE, RAW TO RE-EMIT. Reading through the framework API used to expand every
     # entry for free, so a hand-written '%LOCALAPPDATA%\DevToolbox\native\bin' was recognised as
     # already present. Comparing the literal text alone would miss it and append a second,

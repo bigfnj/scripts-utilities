@@ -1249,6 +1249,61 @@ It 'Test-PathPlanChanged says CHANGED for a reorder, because order IS priority' 
         (Test-PathPlanChanged -BeforeMachine @('P:\a') -AfterMachine @('P:\a', 'P:\c'))
 }
 
+It 'Split-PathList serves BOTH shapes: @() for .Count, and enumeration for a pipeline' {
+    # THE DEFENCE THAT DID NOT DEFEND, AND THE FIX THAT BROKE FOUR TESTS. Split-PathList carried a
+    # comment promising it "always" returns an ARRAY so a later .Count cannot throw under strict
+    # mode. Its body was `return @(...)`, and a function's output is ENUMERATED on the way out, so
+    # the @() is unwrapped again: empty leaves as $null, one item leaves as a bare string.
+    # Measured under 5.1 with Set-StrictMode -Version Latest, (Split-PathList '').Count and
+    # (Split-PathList 'C:\only').Count both THREW, while two entries gave 2 - which is why it went
+    # unnoticed.
+    #
+    # Reachable on the FIRST-RUN path: a fresh Windows profile has 0 or 1 user PATH entries,
+    # scripts\consolidate-path.ps1 reads $uEntries.Count right after calling this and sets
+    # $ErrorActionPreference = 'Stop', and fresh-toolbox-setup-runner.ps1 sets StrictMode and then
+    # invokes the consolidator IN-SESSION, so it inherits it.
+    #
+    # THE OBVIOUS FIX IS WRONG, and this test exists mainly to stop someone applying it. `return
+    # ,$entries` does make .Count work - and it breaks every caller that pipes or accumulates:
+    # lib\common.ps1's Remove-MachinePathEntry does `@(Split-PathList $raw | Where-Object {...})`,
+    # which then receives ONE object (the inner array) and matches nothing, and lib\ShimPlan.ps1
+    # does `$entries += Split-PathList ...`, which appends the array as a single element. Tried it
+    # on 2026-09-18: 4 existing Remove-MachinePathEntry tests went red.
+    #
+    # So the contract is "yields the entries", the CALLER wraps in @() when it wants .Count, and
+    # BOTH shapes are asserted here - because a future reader who sees only the .Count half will
+    # reach for the comma again.
+    #
+    # Strict mode is forced INSIDE the probe rather than inherited: lib\ is consumed by scripts
+    # that set it independently, so the contract must hold regardless of this harness.
+    $probe = {
+        param($Lib)
+        Set-StrictMode -Version Latest
+        . $Lib
+        $out = @()
+        # Shape 1: the caller wraps, which is what every .Count site now does.
+        foreach ($v in @('', 'C:\only', 'C:\a;C:\b')) {
+            try { $out += ('count:{0}' -f @(Split-PathList $v).Count) }
+            catch { $out += ('THREW-count:' + $_.Exception.Message) }
+        }
+        # Shape 2: the pipeline gets ONE OBJECT PER ENTRY, which is what Remove-MachinePathEntry
+        # and ShimPlan's accumulation depend on. A comma-wrapped return yields 1 here, not 2.
+        try {
+            $piped = @(Split-PathList 'C:\a;C:\b' | Where-Object { $_ -like 'C:*' })
+            $out += ('piped:{0}' -f $piped.Count)
+        } catch { $out += ('THREW-pipe:' + $_.Exception.Message) }
+        # NO COMMA. `return ,$out` here made $r a ONE-element array holding the array, so the
+        # assertions below compared against a single joined string - the very trap this test is
+        # about, made one level up while writing it. The caller's @() does the collecting.
+        return $out
+    }
+    $r = @(& $probe (Join-Path $repoRoot 'lib\path-registry.ps1'))
+    foreach ($line in $r) { if ($line -like 'THREW*') { Write-Host ("       $line") -ForegroundColor DarkYellow } }
+    if ($r -contains 'piped:1') { Write-Host "       the pipeline yielded ONE object - a comma-wrapped return would do this" -ForegroundColor DarkYellow }
+    ($r.Count -eq 4) -and ($r[0] -eq 'count:0') -and ($r[1] -eq 'count:1') -and
+        ($r[2] -eq 'count:2') -and ($r[3] -eq 'piped:2')
+}
+
 Write-Host "`n== the elevated child must be handed the flags the parent was ==" -ForegroundColor Cyan
 
 $cpPath = Join-Path $repoRoot 'scripts\consolidate-path.ps1'

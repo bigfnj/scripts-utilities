@@ -189,12 +189,18 @@ non-null contract, then the remaining reads are non-PATH and individually review
 
 ## Scoped elsewhere
 
-Two items are open but already measured, and the measurement lives in
-`docs/engineering-record.md` rather than here so it is read before work starts:
+The measurement lives in `docs/engineering-record.md` rather than here so it is read before work
+starts:
 
-- **`Set-StrictMode` across the suites.** 49 failures across four suites (Render 19, Triage 20,
-  SmokeLint 9, Installer 1; AgentDiscovery, Core and GateChecks are clean). Do it one suite at a
-  time, and do not soften an assertion to make it pass.
+- **`Set-StrictMode` across the suites - DONE for six of seven.** Was 49 failures across four
+  suites; now 0 across six. It was two causes, not 49: a value unrolled on the way out of a
+  function, and fixtures that did not match the shape of real data. Read the record for what those
+  tests were actually asserting against before StrictMode exposed it.
+- **Triage is the seventh, and it is STOPPED on purpose.** Its 20 failures need one line in
+  `scripts/ForensicsReport.Triage.ps1` (`$x.PSObject.Properties['Dir']` in place of `$x.Dir`,
+  which the sibling renderer already does), and that file is frozen. The record explains why the
+  obvious fixture workaround is worse than the failure: it would make every "is DISCARDED" test in
+  that suite pass for the wrong reason. **This is an owner decision, not pending work.**
 - **Relocating the three inputs out of `logs/`.** Touches seven files and resets the ledger baseline
   for every checkout at once. **Copy, do not move** - one of the three is the only surviving record
   of the pre-outage PATH order.

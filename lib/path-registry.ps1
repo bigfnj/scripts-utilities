@@ -95,10 +95,42 @@ public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wP
     }
 }
 
-# Always an ARRAY. The runner sets Set-StrictMode -Version Latest, and under strict mode a
-# pipeline that yields 0 or 1 items is $null or a scalar, so a later .Count throws
-# "The property 'Count' cannot be found on this object" and kills an otherwise fine install.
-function Split-PathList { param([string]$Value) return @(@($Value -split ';') | Where-Object { $_.Trim() }) }
+# NOT "always an array" - that is what this comment used to promise, and it was never true. The
+# diagnosis was right and the remedy was not: see the body. Callers that want .Count wrap the call
+# in @(); callers that pipe or accumulate get one object per entry. Both shapes are asserted by
+# tests\Invoke-InstallerTests.ps1, including the comma-wrapped return that breaks the second one.
+function Split-PathList {
+    # THE @() HERE CANNOT PROTECT THE CALLER, and the comment above used to claim it did.
+    #
+    # A function's output is ENUMERATED on the way out, so this @() is unwrapped again: an empty
+    # result leaves as $null and a one-item result leaves as a bare string. Measured under 5.1
+    # with Set-StrictMode -Version Latest:
+    #
+    #   (Split-PathList '').Count             THROWS  "The property 'Count' cannot be found"
+    #   (Split-PathList 'C:\only').Count      THROWS
+    #   (Split-PathList 'C:\a;C:\b').Count    2       (which is why it went unnoticed)
+    #
+    # REACHABLE ON THE FIRST-RUN PATH. A fresh Windows profile has 0 or 1 user PATH entries;
+    # scripts\consolidate-path.ps1 reads $uEntries.Count immediately after calling this and sets
+    # $ErrorActionPreference = 'Stop'; and fresh-toolbox-setup-runner.ps1 sets
+    # Set-StrictMode -Version Latest and then invokes the consolidator IN-SESSION, so it inherits
+    # strict mode. The PATH consolidation step of a fresh-workstation run therefore terminated on
+    # exactly the machine that runner exists for. Found by audit 2026-09-18.
+    #
+    # REJECTED, MEASURED: `return ,$entries`. The unary comma does make .Count work, and it breaks
+    # every caller that PIPES or accumulates instead - lib\common.ps1's Remove-MachinePathEntry
+    # does `@(Split-PathList $raw | Where-Object {...})`, which then receives ONE object (the
+    # inner array) rather than one per entry and matches nothing, and lib\ShimPlan.ps1 does
+    # `$entries += Split-PathList ...`, which appends the array as a single element. Tried it: 4
+    # existing tests went red. A function cannot satisfy both shapes at once.
+    #
+    # So the CALLER declares what it wants, which is the idiomatic answer: every site that reads
+    # .Count wraps the call in @(). The @() below is kept because it makes the pipeline shape
+    # explicit for a reader even though it does not survive; the contract is "yields the entries",
+    # and .Count is the caller's problem.
+    param([string]$Value)
+    return @(@($Value -split ';') | Where-Object { $_.Trim() })
+}
 
 # Named Test-PathAdmin, not Test-Admin: uninstall-toolbox.ps1 has Test-IsElevated, run-gate.ps1
 # and smoke-test.ps1 inline their own, and a file dot-sourced into all of them must not win a

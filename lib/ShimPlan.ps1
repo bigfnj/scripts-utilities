@@ -857,8 +857,8 @@ function Get-PathHygienePlan {
     }
     if ($cfgNames -notcontains 'entries') { throw 'path-hygiene config has no entries array.' }
 
-    $mEntries = Split-PathList $MachineRaw
-    $uEntries = Split-PathList $UserRaw
+    $mEntries = @(Split-PathList $MachineRaw)
+    $uEntries = @(Split-PathList $UserRaw)
     $composed = @($mEntries + $uEntries)
 
     $enumArgs = @{}
