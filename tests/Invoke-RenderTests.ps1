@@ -25,6 +25,17 @@ param()
 # cmdlet. $PSScriptRoot rather than $repoRoot so this needs nothing computed first.
 . (Join-Path $PSScriptRoot 'SUTestGuard.ps1')
 
+# AFTER the guard, BEFORE the subject, deliberately. gate.yml asserts the deletion guard is the
+# FIRST dot-source in every suite; Set-StrictMode is not a dot-source so it cannot disturb that,
+# and putting it here means the renderer below and every It body run strict.
+#
+# WHAT IT BOUGHT, measured: 4 passed, 19 failed on the first strict run, all 19 the same cause -
+# the $bursts fixture below supplied three of a burst's seven properties. Because
+# '{0:yyyy-MM-dd HH:mm:ss}' -f $null is an EMPTY STRING and not an error, the burst rows had
+# rendered with a blank time range and no directory list since the day this suite was written,
+# and every assertion in it passed anyway. StrictMode is not the point; the fixture was wrong.
+Set-StrictMode -Version Latest
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $repoRoot 'scripts\ForensicsReport.Render.ps1')
 
@@ -39,21 +50,64 @@ function It {
 
 # A path carrying an injection attempt, threaded through every collection the renderer reads so
 # no single escaped site can carry the test.
-$evil = 'C:\Users\Admin\<script>alert(1)</script>\"quoted" & ampersand'
+#
+# Split into parent + leaf so each record's Dir below is the real parent of its Path BY
+# CONSTRUCTION. [IO.Path]::GetDirectoryName - which is what the gather loop uses - cannot be
+# called on this string at all: <, > and " are invalid path characters and it throws under .NET
+# Framework, so deriving Dir the production way here would break the injection fixture. The
+# concatenation is the honest alternative; $evil is byte-identical to what it was.
+$evilDir = 'C:\Users\Admin\<script>alert(1)</script>'
+$evil = $evilDir + '\"quoted" & ampersand'
 $now = Get-Date
 
+# Dir is part of the delete-record contract, not an extra: the gather loop computes it once per
+# event (New-ForensicsReport.ps1:138) and Render.ps1:178 says in so many words that every record
+# already carries the parent so nothing downstream has to Split-Path. This fixture omitted it.
+# Measured consequence, not a guess: `$Sentinels | ForEach-Object { $_.Dir }` on records without
+# Dir emits NOTHING rather than four $nulls, so Group-Object produced ZERO groups and the
+# Sentinel paths tile rendered a headline of "4" above a drawer reading "None this period." -
+# the tile contradicting itself in two adjacent elements, under 23 green tests.
+#
+# IsSentinel is DELIBERATELY still absent here, and that is not an oversight. Production records
+# carry it, but the renderer probes for it with PSObject.Properties['IsSentinel'] rather than
+# reading it blind, precisely so a caller handing over raw records still gets the right answer -
+# and the "precomputed IsSentinel flag" test below exists to compare the flag-present path
+# against the flag-absent fallback. Adding it here would make both sides of that comparison the
+# same path and silently retire the test.
 $deletes = @(
-    [pscustomobject]@{ Time = $now; Pid = '4242'; Guid = 'g-real'; User = 'X'; Image = 'C:\bin\rm.exe'; Path = $evil },
-    [pscustomobject]@{ Time = $now; Pid = '4242'; Guid = 'g-real'; User = 'X'; Image = 'C:\bin\rm.exe'; Path = 'C:\Users\Admin\.ssh\id_rsa' },
+    [pscustomobject]@{ Time = $now; Pid = '4242'; Guid = 'g-real'; User = 'X'; Image = 'C:\bin\rm.exe'; Path = $evil; Dir = $evilDir },
+    [pscustomobject]@{ Time = $now; Pid = '4242'; Guid = 'g-real'; User = 'X'; Image = 'C:\bin\rm.exe'; Path = 'C:\Users\Admin\.ssh\id_rsa'; Dir = 'C:\Users\Admin\.ssh' },
     # Same PID, different process. This is the pid-reuse case: on a real box a short-lived
     # process inherits a recycled pid, and a pid-keyed join hands it the other one's argv.
-    [pscustomobject]@{ Time = $now; Pid = '4242'; Guid = 'g-reused'; User = 'X'; Image = 'C:\Windows\system32\cmd.exe'; Path = 'C:\Users\Admin\.cache\y' },
+    [pscustomobject]@{ Time = $now; Pid = '4242'; Guid = 'g-reused'; User = 'X'; Image = 'C:\Windows\system32\cmd.exe'; Path = 'C:\Users\Admin\.cache\y'; Dir = 'C:\Users\Admin\.cache' },
     # No matching process-start event at all: the process began before the window did.
-    [pscustomobject]@{ Time = $now; Pid = '9999'; Guid = 'g-absent'; User = 'X'; Image = 'C:\bin\rm.exe'; Path = 'C:\Users\Admin\.cache\x' }
+    [pscustomobject]@{ Time = $now; Pid = '9999'; Guid = 'g-absent'; User = 'X'; Image = 'C:\bin\rm.exe'; Path = 'C:\Users\Admin\.cache\x'; Dir = 'C:\Users\Admin\.cache' }
 )
 $byImage  = @([pscustomobject]@{ Name = 'C:\bin\rm.exe'; Count = 2 })
 $byDir    = @([pscustomobject]@{ Name = $evil; Count = 1 })
-$bursts   = @([pscustomobject]@{ Image = 'C:\bin\rm.exe'; Count = 90; Seconds = 12 })
+# A burst carries SEVEN properties in production (New-ForensicsReport.ps1:188-193) and the
+# renderer formats all seven. This fixture supplied three; Start, End, Total and Dirs were
+# absent. Measured on the pre-fix fixture: the meta line rendered as
+#   <div class="meta"> to  &middot;  deletions from this process in the whole window</div>
+# - both timestamps AND the total blank, because '{0:N0}' -f $null is '' and not '0' - the hero
+# said "Largest burst: rm.exe at ." and the directory <ul> was skipped entirely by
+# `if (@($b.Dirs).Count)`. None of that threw.
+#
+# The values are constrained rather than decorative:
+#   Seconds is DERIVED in production - [math]::Max(1, [int](($End - $Start).TotalSeconds)) - so
+#     End must be Start + Seconds, or the fixture states two different burst durations and a
+#     renderer that read the wrong one would still look right.
+#   Total is the process's count across the WHOLE window and is therefore > Count, which counts
+#     only the densest sub-window. Equal values would let the two be swapped undetectably.
+#   Dirs is Group-Object output in production, so it is built with Group-Object here instead of
+#     hand-rolled into a pscustomobject: the renderer reads .Name/.Count off a real GroupInfo.
+#     $evil is threaded through it like every other collection the renderer reads, because this
+#     is a fifth escape site and nothing reached it before.
+$burstStart = $now.AddMinutes(-9)
+$burstDirs  = @(@($evil, $evil, 'C:\Users\Admin\.cache') | Group-Object | Sort-Object Count -Descending)
+$bursts   = @([pscustomobject]@{ Image = 'C:\bin\rm.exe'; Count = 90; Total = 140
+                                 Start = $burstStart; End = $burstStart.AddSeconds(12)
+                                 Seconds = 12; Dirs = $burstDirs })
 $novel    = @([pscustomobject]@{ Image = 'rm.exe'; Dir = $evil; Count = 1 })
 $coverage = [pscustomobject]@{ Oldest = $now.AddHours(-50); SpanHours = 50.4; FileSize = 2GB
                                MaxSize = 2GB; Full = $false; ProjectedHours = 124.0 }
@@ -148,6 +202,55 @@ It 'two processes sharing a recycled pid do not share a command line' {
     ($html -notmatch '<td class="t">[34]</td><td class="p">cmd\.exe /c ping')
 }
 
+Write-Host "`n== a burst says WHEN it happened, and how big the window really was ==" -ForegroundColor Cyan
+# These four exist because the four properties they read were missing from the fixture above and
+# nothing noticed. Each asserts the RENDERED page rather than the fixture: a test that only
+# proves the renderer no longer throws would have been satisfied by adding the properties and
+# reading nothing back, which is the state this section is here to end.
+
+It 'the burst time range renders as two real timestamps, not two empty strings' {
+    # A SHAPE regex, not a re-run of the renderer's own format string: re-deriving
+    # '{0:yyyy-MM-dd HH:mm:ss}' -f $b.Start here would pass against $null on both sides.
+    # With Start or End absent the meta line is '<div class="meta"> to  &middot;' and this fails.
+    $html = New-Html
+    $html -match '<div class="meta">\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} to \d{2}:\d{2}:\d{2} &middot;'
+}
+It 'and the hero headline dates the largest burst' {
+    # The one number a reader sees first, and the only place $topBurst.Start is read. It said
+    # "Largest burst: rm.exe at ." for as long as this suite has existed.
+    $html = New-Html
+    $html -match 'Largest burst: rm\.exe at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\. A mass deletion'
+}
+It 'a burst reports the whole-window total as well as the burst count' {
+    # Two different numbers doing two different jobs: 90 files in 12 seconds, out of 140 from
+    # that process all week. A $null Total did not render as "0" - '{0:N0}' -f $null is an EMPTY
+    # string - so the sentence read " deletions from this process in the whole window", a blank
+    # where the number belongs, sitting beside a count of 90.
+    $html = New-Html
+    ($html -match '90 files / 12s \(7\.5/s\)') -and
+    ($html -match '140 deletions from this process in the whole window')
+}
+It 'the sentinel tile groups deletions by real directory, not into one blank row' {
+    # $Sentinels is grouped on $_.Dir. With Dir absent the pipeline emitted nothing, so the tile
+    # showed "4" in its headline and "None this period." in its drawer. Asserting the NAMES is
+    # what distinguishes "the tile rendered" from "the tile is right": the headline count was
+    # already correct in the broken version, which is exactly why nothing caught it.
+    $html = New-Html
+    ($html -match [regex]::Escape('<li><span class="k">C:\Users\Admin\.cache</span><span class="v">2</span></li>')) -and
+    ($html -match [regex]::Escape('<li><span class="k">C:\Users\Admin\.ssh</span><span class="v">1</span></li>')) -and
+    # ...and the grouped directory name is escaped, which is a sixth site nothing reached.
+    ($html -match [regex]::Escape('<li><span class="k">C:\Users\Admin\&lt;script&gt;alert(1)&lt;/script&gt;</span><span class="v">1</span></li>'))
+}
+It 'the burst directory breakdown reaches the page, escaped like every other untrusted text' {
+    # The fifth escape site in this renderer, and the only one no test reached. It was not
+    # under-asserted, it was unreachable: $b.Dirs was absent, so `if (@($b.Dirs).Count)` was
+    # false and the entire <ul> never rendered. The counts are asserted too, so a Dirs list
+    # rendered with the wrong tally is not mistaken for coverage.
+    $html = New-Html
+    ($html -match [regex]::Escape('<li>C:\Users\Admin\&lt;script&gt;alert(1)&lt;/script&gt;\&quot;quoted&quot; &amp; ampersand &mdash; 2</li>')) -and
+    ($html -match [regex]::Escape('<li>C:\Users\Admin\.cache &mdash; 1</li>'))
+}
+
 Write-Host "`n== a baseline that could not be read is not a baseline with nothing in it ==" -ForegroundColor Cyan
 
 function New-HtmlWithBaselineState {
@@ -197,8 +300,11 @@ It 'using the precomputed IsSentinel flag produces the same page as re-matching 
     $withFlag = @($deletes | ForEach-Object {
         $m = $false
         foreach ($pat in $pats) { if ($_.Path -match $pat) { $m = $true; break } }
+        # Dir is carried across too. It is not read off -Deletes by the renderer today, but a
+        # projection of a delete record that quietly drops a contract property is a trap for
+        # whoever next passes $withFlag as -Sentinels.
         [pscustomobject]@{ Time = $_.Time; Pid = $_.Pid; Guid = $_.Guid; User = $_.User
-                           Image = $_.Image; Path = $_.Path; IsSentinel = $m }
+                           Image = $_.Image; Path = $_.Path; Dir = $_.Dir; IsSentinel = $m }
     })
     $common = @{ ByImage = $byImage; ByDir = $byDir; Bursts = $bursts; Coverage = $coverage
                  UsnMax = 2GB; Procs = $procsFixture; StateChanges = $stateChanges; Days = 7
