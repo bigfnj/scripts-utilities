@@ -263,7 +263,23 @@ Install-CatalogItem -Item (Get-CatalogItem -Name "ollama") | Out-Null
 Set-UserEnvVar -Name "TOOLBOX_LLM_URL" -Value $llm.endpoint
 
 if ($IncludeLlamaCpp) {
-    Write-Warn "llama.cpp engine is not implemented yet (tracked in BACKLOG.md); installing Ollama only"
+    # REFUSES, where it used to warn and carry on. A flag named -IncludeLlamaCpp that prints a
+    # warning and then installs exactly what it would have installed anyway is the shape this repo
+    # keeps removing: the caller asked for a thing, was told "not yet" in passing, and got a
+    # SUCCESS exit code for a run that did not do what was requested. Anything scripting this would
+    # read exit 0 as "llama.cpp is installed".
+    #
+    # llama.cpp is DEFERRED, not pending - the reason is in docs\engineering-record.md, and it is
+    # that Ollama already satisfies the endpoint contract this stack is built around. The flag is
+    # kept rather than deleted so the refusal can say where the decision lives.
+    throw @"
+-IncludeLlamaCpp is not implemented, and it is deliberately deferred rather than pending.
+See docs\engineering-record.md ("An opt-in llama.cpp engine for the local-LLM stack") for the
+reason and for the design if it is ever wanted.
+
+Re-run without -IncludeLlamaCpp to install the Ollama stack, which serves the same
+OpenAI-compatible endpoint contract at $($llm.endpoint).
+"@
 }
 
 # VRAM-tiered model selection

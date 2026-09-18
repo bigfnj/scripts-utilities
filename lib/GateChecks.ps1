@@ -48,8 +48,11 @@ $script:GCControlByteRegex = [regex]::new('[\x00-\x08\x0B\x0C\x0E-\x1F]')
 
 $script:GCSourceExtensions = @('.ps1', '.psm1', '.json', '.yml', '.md', '.xml', '.cmd')
 
-# Extensions a markdownlint finding may carry, used only to relativize its output.
-$script:GCRunnableCheckNames = @('parse', 'wiring', 'guard-order', 'writers', 'control-bytes', 'markdown')
+# There is deliberately NO second list of check names here. One was added with this file and had
+# zero readers - dead metadata that would have drifted from the registry the first time a check was
+# added or renamed, while looking authoritative. Get-GateCheckTable is the only list, and the test
+# suite compares it against names WRITTEN DOWN IN THE TEST, because an enumeration compared against
+# itself can never notice a deletion.
 
 
 function New-GCFinding {

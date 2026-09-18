@@ -77,10 +77,21 @@ public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wP
         # HWND_BROADCAST, WM_SETTINGCHANGE, SMTO_ABORTIFHUNG, 5 s - a hung top-level window must
         # not wedge the installer.
         $sent = [Win32.NativeEnv]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$res)
+        # Write-Warning, NOT Write-Warn2, and the difference is a latent CommandNotFoundException.
+        #
+        # This file deliberately defines no logging functions - its own Write-Ok would fight the one
+        # consolidate-path.ps1 defines, which takes a positional $t where lib\common.ps1's takes
+        # -Msg. That is fine for Write-Ok, because BOTH callers supply one and both bind
+        # positionally. Write-Warn2 exists in consolidate-path.ps1 ALONE.
+        #
+        # So these two branches were reachable only from a single caller, and the first time anyone
+        # dot-sourced this file without also having consolidate-path.ps1's logging vocabulary, a
+        # FAILED broadcast - already the unhappy path - would have thrown CommandNotFound on top of
+        # it. Found by audit 2026-09-18. Write-Warning is a built-in and needs no caller contract.
         if ($sent -ne [IntPtr]::Zero) { Write-Ok 'broadcast WM_SETTINGCHANGE (new processes pick up the PATH without a logon)' }
-        else { Write-Warn2 'WM_SETTINGCHANGE broadcast returned 0 - sign out and back in for the PATH to take effect.' }
+        else { Write-Warning 'WM_SETTINGCHANGE broadcast returned 0 - sign out and back in for the PATH to take effect.' }
     } catch {
-        Write-Warn2 "could not broadcast the environment change ($($_.Exception.Message)) - sign out and back in."
+        Write-Warning "could not broadcast the environment change ($($_.Exception.Message)) - sign out and back in."
     }
 }
 

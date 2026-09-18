@@ -46,40 +46,29 @@ function Test-IsElevated {
         [System.Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Invoke-Native {
-    <#
-        Run a native uninstaller with its output captured and its stderr survivable, and return
-        the exit code beside the captured lines.
-
-        THIS SCRIPT IS THE ONE THAT CANNOT AFFORD TO DIE HALFWAY. Under this file's
-        $ErrorActionPreference = 'Stop', PowerShell 5.1 turns a native command's stderr into a
-        TERMINATING NativeCommandError whenever it has redirected that stream - which an outer
-        capture does even when the call site itself has no redirection. A package that REFUSES
-        to uninstall (in use, needs elevation, no matching install) writes the refusal to
-        stderr, so the exact case section 1 checks for was the case that killed the run, and it
-        died before sections 2-4 had reversed the PATH entries, cleared the env vars or stripped
-        the agent blocks. Half-uninstalled, with the machine-state reversal still pending.
-
-        Measured 2026-09-11 under 5.1: a merged or 2>$null-redirected native stderr throws under
-        Stop in every host-stream condition tested, and so does an unredirected one as soon as
-        any enclosing call applies 2>&1 - which is how this script is run from a log-capturing
-        parent. Setting Continue for the one statement is the only shape that holds in both.
-
-        Rejected: `| Out-Null`. It addresses a different problem (native stdout leaking into a
-        function's return value) and does nothing about stderr; see build-devtoolbox.ps1's
-        Invoke-NativeCapture, which this mirrors.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$FilePath,
-        [string[]]$Arguments = @()
-    )
-    $prev = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        $out = & $FilePath @Arguments 2>&1
-        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = @($out) }
-    } finally { $ErrorActionPreference = $prev }
-}
+# Invoke-Native COMES FROM lib\common.ps1, which this script already dot-sources above. It used to
+# be redefined here with a byte-for-byte identical body, and that copy was removed 2026-09-18
+# because the duplication was the risk rather than the protection: a local definition SHADOWS the
+# imported one, so the next change to common.ps1's wrapper would have silently left this script on
+# the old behaviour - the exact divergence the comment below says this script cannot tolerate.
+#
+# THE REASON IT IS WRAPPED AT ALL, kept because it is measured and it is the thing a future reader
+# will be tempted to undo. This script is the one that cannot afford to die halfway. Under its
+# $ErrorActionPreference = 'Stop', PowerShell 5.1 turns a native command's stderr into a TERMINATING
+# NativeCommandError whenever it has redirected that stream - which an outer capture does even when
+# the call site has no redirection of its own. A package that REFUSES to uninstall (in use, needs
+# elevation, no matching install) writes that refusal to stderr, so the exact case section 1 checks
+# for was the case that killed the run, and it died before sections 2-4 had reversed the PATH
+# entries, cleared the env vars or stripped the agent blocks. Half-uninstalled, with the
+# machine-state reversal still pending.
+#
+# Measured 2026-09-11 under 5.1: a merged or 2>$null-redirected native stderr throws under Stop in
+# every host-stream condition tested, and so does an unredirected one as soon as any enclosing call
+# applies 2>&1 - which is how this script runs from a log-capturing parent. Scoping Continue to the
+# one statement, restored in a finally, is the only shape that holds in both.
+#
+# Rejected: `| Out-Null`. It addresses native stdout leaking into a return value and does nothing
+# about stderr.
 
 # Anything that could not be reversed. Non-empty at the end means the uninstall is INCOMPLETE
 # and the exit code says so; "toolbox uninstall complete" is reserved for a clean run.

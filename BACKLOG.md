@@ -2,925 +2,213 @@
 
 ## How to work this list
 
-Items came out of a four-agent audit on 2026-09-10 (dead code, non-operable code, leaks and
-performance, cross-cutting and security). Everything below **reproduced against the code** -
-each entry names the file, the line and the measurement or repro that established it. Where an
-audit claim did not reproduce it was dropped rather than recorded, so treat these as verified
-starting points, not as suspicions to re-litigate.
+**Open work only.** What was refuted, retracted or decided deliberately lives in
+`docs/engineering-record.md`. Read that first: a decision kept in a backlog reads identically to a
+task once it has scrolled past, and this list carried two entries that had already been fixed, so
+acting on either meant hunting a bug that was not there.
 
-Severity is about consequence, not effort. **HIGH** means it silently produces a wrong answer or
-destroys something. Fixed items are struck through with the date.
+Every entry below names the file, the symbol and the measurement or repro that established it. An
+entry with none of those is not a finding.
 
-**Line anchors written before 2026-09-11 are stale; symbol names are not.** A backlog audit that
-day re-derived every reference. The most-edited files moved the most, so resolve an entry by its
-function name and re-grep rather than trusting its `file:line`. Corrections worth carrying:
-`Write-ActivationHelpers` is `build-devtoolbox.ps1:981-1005`; `Install-Tessdata` is `:840-865`;
-`Write-Manifest`/`Run-Smoke` are `:1320`/`:1323`, not `:874`/`:877`; the bootstrap readiness gate
-is `bootstrap.ps1:520-522`; `Get-ForensicsHealth` is `install-deletion-forensics.ps1:160`, and the
-`Copy-Item` that entry 2 cites is gone entirely, replaced by `[IO.File]::WriteAllText` at `:424`;
-`Get-InteractiveUser`/`Get-DownloadsPath` were renamed and moved to
-`ForensicsReport.Core.ps1:205`/`:283` as `Get-FxInteractiveUser`/`Get-FxDownloadsPath`; the
-consolidate-path shim writer moved wholesale into `lib/ShimPlan.ps1` as `Invoke-ShimWrite`
-(`:577-607`); `Write-AgentBlock`'s unpruned `.bak-` write is `lib/common.ps1:690`, and there is a
-**second** one at `:277` in `Remove-AgentBlocks` that no entry mentions.
+**Resolve an entry by its symbol, never by its `file:line`.** Line anchors in this repo have gone
+stale repeatedly and symbol names have not. If you cannot find the symbol, the entry may already be
+closed - check the engineering record before re-deriving it.
 
-Three figures in this file were also re-measured and are wrong as written: the `.store\wix\5.0.2`
-damage is **47 files / 19.3 MB**, not 14 / 9.9 MB (the load-bearing half holds - `wix.exe` is
-absent and `~/.nuget/packages/wix` does not exist); the `AGENTS.md` backup accumulation is **26**
-files across the four deploy targets, not "9+"; and the AST rule described as "no native command
-in the builder is piped" is now repo-wide, covers stderr redirection as well, and treats `lib\`
-and `modules\` as exposed. The markdown-lint finding appears **twice** with contradictory status -
-the later entry is right, `markdownlint BACKLOG.md` exits 0, and only the CI wiring is missing.
-
-One method note that cost the audit a wrong answer first: `Get-ScheduledTask` silently omits
-ACL-restricted tasks and reported both `\PcMaintenance` and `\DeletionForensicsReport` as absent.
-`schtasks /query /tn` distinguishes them - "cannot find the file specified" is real absence,
-"Access is denied" is presence under a restrictive ACL.
+**Before you propose a new file deleter, state its blast radius and compare it to the prize.** This
+box lost ~123,605 files to a maintenance script once. "Report it" beats "delete it" unless the prize
+justifies the category.
 
 ---
 
-## Where to pick up - handoff, 2026-09-11
+## Where to pick up - handoff, 2026-09-18
 
-Repo is at `75c32a2`+ on `main`, pushed, tree clean, one worktree, no stray branches. Gate green:
-smoke 74/3/0, core 27, installer 104, render 23, smokelint 18, triage 31. The 3 smoke warnings
-(`cdb`, `poolmon`, the SYSTEM task unreadable unelevated) are expected, not regressions.
+Repo is on `main`, pushed, CI **green on both jobs** (`suites` and `checks`). Gate green:
+`checks=6 smoke=82/4/0 agentdiscovery=19 core=27 gatechecks=43 installer=125 render=23 smokelint=18
+triage=31`, and parity green on all seven suites under CI's invocation *and* CI's error preference.
 
-**Baseline moved 2026-09-17** when `tools/browse` and its two scripts landed: smoke **78/3/0**
-(four new checks in a `browse` group) and installer **108** (+4). Same 3 warnings, plus a fourth
-DEGRADED line inside the browse group whenever no CDP browser is running - that one is
-informational and does not count as a warning. Ledger phase `after-browse` records both
-transitions as growth.
+The previous 29 open items are closed: fixed, refuted, or recorded as decisions in
+`docs/engineering-record.md`. What follows is what this round surfaced.
 
-**Do this first, and it settles two things at once.** Install the Windows SDK "Debugging Tools for
-Windows" (and the WDK), then `.\bootstrap.ps1 -Only security`. It clears the `cdb` and `poolmon`
-warnings, and because it makes bootstrap actually *install* something it exercises the one
-native-stderr site still marked UNPROVEN: `Install-WingetTool`'s `winget @args` install path.
-Every run so far found every tool already present, so that path has never been provoked. It is the
-most-travelled install path in the repo.
+**The single most useful thing learned, worth applying before anything below.** A test that passes
+locally and fails in CI is an **environment divergence**, and there were three, all of which had
+been invisible:
 
-**Then, in rough order of value:**
+1. **Invocation.** `run-gate.ps1` launches each suite as a `powershell.exe -File` child;
+   `gate.yml` invokes `.\tests\X.ps1` in-session. A `GetNewClosure()` scriptblock resolves
+   *functions* through global scope, which a nested script's scope is not.
+2. **Error preference.** GitHub Actions sets `$ErrorActionPreference = 'stop'` for
+   `shell: powershell`; the local gate's children start at `Continue`.
+3. **Installed tools.** The `checks` job installs `markdownlint`; the `suites` job does not.
 
-1. Wire markdownlint into `run-gate.ps1`. `markdownlint-cli` is installed globally and
-   `.markdownlint.json` exists; nothing consumes either except a synthetic `%TEMP%` fixture. Two
-   backlog entries have asked for this.
-2. Fix the `machine-path-pending.txt` writer (see its entry below). Small, and it is a filename
-   that cannot be false.
-3. Move `path-backup-*.json`, `shim-sources.json` and `gate-phases.log` out of `logs/`. They are
-   inputs sitting in a directory whose name invites deletion.
-4. Parameterise the hardcoded `C:` in `modules/security.ps1`'s USN probe.
-
-**Two habits this round paid for, worth keeping.** Reproduce a measurement before recording it:
-five written-down claims failed when probed, including two of my own and one that had the
-native-stderr rule exactly backwards. And provoke each site individually rather than fixing "the
-same shape" in bulk, because winget and fsutil answer on stdout while npm genuinely uses stderr,
-so only one of six sites was an active crash.
+`run-gate.ps1` now re-runs every suite in-session under `Stop` and compares tallies, so all three
+fail locally. If you add a test, ask what on this box it is quietly reading.
 
 ---
 
-## Bugs - HIGH
+## Security - HIGH
 
-### 1. ~~The Sysmon config is hardcoded to one profile name, and `-Verify` says it is fine~~ DONE 2026-09-10
+### `Get-HFFile` puts the HuggingFace bearer token on curl's command line
 
-`config/sysmon-filedelete.xml` contains the literal `C:\Users\Admin` in **25 places**, including
-all three `FileDeleteDetected` *include* rules (`:150-152`). Sysmon's `begin with` does **not**
-expand environment variables, and `install-deletion-forensics.ps1:308` deploys the file with a
-bare `Copy-Item` - no substitution.
+`scripts/install-whisper.ps1`, `Get-HFFile`: the token is read from
+`%USERPROFILE%\.cache\huggingface\token` and then passed as a process argument,
+`@("-H", "Authorization: Bearer $tok")`, to `curl.exe`.
 
-On any machine whose profile is not named `Admin`, the include list matches nothing and the
-sensor records **zero deletions**, while `-Verify` (hash + service + driver boot-start) reports
-fully green and `smoke-test.ps1` passes. The repo ships a public `irm | iex` bootstrap and both
-`modules/security.ps1:82` and `smoke-test.ps1:278` recommend running this on a fresh workstation.
+A Windows process command line is readable by any other process on the box through
+`Get-CimInstance Win32_Process`, so the token is exposed for the lifetime of the download - and this
+machine runs Sysmon with `ProcessCreate` capture, which records command lines to an event log.
 
-This is the cardinal sin of the whole effort: a forensics sensor that is verifiably, invisibly
-blind. Silence looks exactly like "nothing was deleted".
+The function already knows: its own comment says nothing may echo `$curlArgs` and cites
+`install-ghidra.ps1`'s `Get-Json` on what a logged token costs here. Not echoing it does not help,
+because the argument vector *is* the exposure.
 
-**Fixed 2026-09-10.** `config/sysmon-filedelete.xml` is now a template using `|USERPROFILE|`,
-rendered at deploy time into ProgramData by `lib/SysmonConfig.ps1`. The pipe was chosen because
-it is illegal in every Windows path, which makes "no placeholder survived" a total assertion
-rather than a hopeful one - braces and percent signs are both legal in real paths.
+**Fix sketch, in preference order.** `curl -K <configfile>` reads options from a file, so
+`header = "Authorization: Bearer ..."` in a short-lived file under `%TEMP%` keeps it off every
+command line; delete the file in a `finally`. `--netrc-file` is the other supported route.
+`Invoke-WebRequest` with a header hashtable avoids a command line entirely but is Schannel-backed,
+which `docs/agent-rules.md` records as failing inside agent sandboxes.
 
-Three things came out of doing it that were not in the original write-up:
-
-- **The fix contained the bug.** `install-deletion-forensics.ps1` self-elevates, and in the
-  elevated child `$env:USERPROFILE` is the CONSENTING ADMINISTRATOR's profile. Rendering there
-  would have watched the admin's profile on any managed workstation and left the sensor blind
-  for exactly the user losing files. The profile is now resolved in the unelevated parent and
-  passed through as `-ProfilePath`.
-- **One boolean was hiding three facts.** "The deployed config matches the repo" is really
-  *rendered-from-the-current-template*, *Sysmon-accepted-it*, and *the-live-rules-name-this-
-  profile*, and they can disagree - a second user logging in makes the third false while the
-  first stays true. `-Verify` and the smoke test now report them separately. Collapsing them
-  is how the original bug survived review.
-- **The hash comparison existed in two hand-written copies** (the installer's health check and
-  the smoke test). Both now call the same renderer. Two copies of one comparison is how they
-  drift, and one being right while the other is wrong is worse than both being wrong.
-
-Validated by a free oracle that existed only on the day: this machine's deployed config matched
-the repo byte-for-byte and its profile IS `Admin`, so rendering the template for `Admin` had to
-reproduce the deployed file exactly. It did - all 27 rules identical, the only difference being
-the new banner comment. `tests/Invoke-InstallerTests.ps1` (12 tests) then proves the validator
-REJECTS an unrendered template, a config rendered for a nonexistent profile, malformed XML, and
-an empty include list - with a positive control, because a validator that rejects everything
-looks perfect until you need it to accept something.
+Mitigating, and the reason this is HIGH rather than urgent: `install-whisper.ps1` is manual-only -
+nothing in the repo invokes it - and the token is a read scope.
 
 ---
 
-## Bugs - MEDIUM
+## Correctness - MEDIUM
 
-### 2. Nothing reads Sysmon's ACTIVE config - PARTLY FIXED 2026-09-10
+### `browse`'s journal records the rung that returned the MOST TEXT, not the rung that was NEEDED
 
-`install-deletion-forensics.ps1:167-168`, `:314-315`, `:353-357`. `ConfigCurrent` compares the
-hash of the deployed file to the repo copy - but `Copy-Item` at `:308` makes that true
-unconditionally, *before* `sysmon -c` runs, and the `sysmon -c` exit code is discarded
-(`$null = Invoke-Native ...`). "Sysmon config updated" prints regardless. If Sysmon rejects the
-XML, `-Verify` and the smoke test both report "config matches the repo copy" while the sensor
-runs the previous ruleset. The post-condition restates the pre-condition - the same shape as the
-deploy bug fixed in pc-maintenance with `Test-PMPayloadItemCurrent`.
+`tools/browse/toolbox_browse/cli.py`, `run()` and `journal_save()`. The driver keeps whichever rung
+produced the most characters and writes that host into the journal, so the next fetch of that host
+starts there. A thin-but-working page therefore teaches the journal to prefer a more expensive rung
+over a few extra characters.
 
-**Half of this is fixed.** The `sysmon -c` exit code is no longer discarded: a rejected ruleset
-now fails the install loudly instead of printing "Sysmon config updated" while the previous
-ruleset stays live. And `ConfigCurrent` no longer restates its own pre-condition - it compares
-the deployed file against the template rendered for this profile, which `Copy-Item` cannot make
-true in advance.
+Observed 2026-09-17 while proving the reader rung: `example.com` was pinned to `reader` when
+`direct` had served it perfectly. The entry was removed by hand. Inert in practice today, because
+the reader rung is opt-in behind `--allow-reader` and the browser rung needs a running Chrome - but
+the preference is wrong in principle and will bite the moment either is routinely on.
 
-**Still open: reading back what Sysmon ACTUALLY loaded.** Two routes, neither implemented:
+A fix needs a rule for "needed", and that needs more than one target to measure against. Candidate:
+record the FIRST rung that cleared `MIN_TEXT`, and only prefer a later rung when an earlier one
+returned nothing at all.
 
-- `sysmon -c` with NO trailing argument dumps the running config. **Danger: `sysmon -c --`
-  RESETS Sysmon to defaults**, so the argument array must be the literal `@('-c')` and never a
-  splatted variable that could be empty. The dump is Sysmon's own re-serialisation - comments
-  stripped, defaults materialised - so it cannot be hash-compared; the check has to be
-  semantic (assert the include prefixes begin with the resolved profile).
-- Better: **Sysmon writes event 16 (`SYSMONEVENT_SERVICE_CONFIGURATION_CHANGE`) carrying
-  `ConfigurationFileHash`** - the hash of the ruleset it ACCEPTED, written by the thing being
-  verified rather than by the installer. The post-condition becomes "the newest event 16 is
-  later than the moment we applied, and its hash matches the rendered file". Needs one elevated
-  observation to pin the `ALGO=HEX` format before it can be relied on, which is why it is not
-  in yet. `New-ForensicsReport.ps1` already queries event 4; adding 16 would also let the
-  report's coverage panel say which ruleset was live during the window.
+### `diagnose()` never runs on the reader rung, so a reader refusal cannot set `.challenge`
 
-Both require elevation, so neither can live in the unelevated smoke test - they belong in
-`install-deletion-forensics.ps1 -Verify`. An unelevated SKIP is the honest answer there; a PASS
-would be the very defect this backlog is about.
+Same file. `fetch_direct` and `fetch_chrome` both call `diagnose()`; `fetch_reader` does not, so a
+`r.jina.ai` response that is itself a refusal comes back as a thin success rather than a named
+block.
 
-### 3. ~~The weekly report lands in `C:\Windows\TEMP` when nobody is logged in~~ DONE 2026-09-10
-
-`New-ForensicsReport.ps1:156-175`. `Get-InteractiveUser` falls back to the *current process*
-identity when `Win32_ComputerSystem.UserName` is null - under the SYSTEM task with nobody signed
-in that is `S-1-5-18`, and `Get-DownloadsPath` then resolves a SYSTEM profile that does not
-exist. The task is `-StartWhenAvailable`, so a machine that was off at Sunday 04:00 runs at boot
-*before* anyone logs in: the likely case, not the edge case. pc-maintenance's
-`Get-PMInteractiveUserSid` deliberately refuses this and flags `Inferred`; port that behaviour.
-
-### 4. ~~SIX smoke-test checks named "functional" cannot fail~~ DONE 2026-09-10
-
-`smoke-test.ps1:59-62, 84-93, 137-140, 166-172`. The pattern is
-`try { $v = gh --version 2>&1; Test-Ok } catch { Test-Fail }` - a native command exiting non-zero
-does not raise a PowerShell exception, so the catch is unreachable once the tool is on PATH.
-Demonstrated: `cmd /c "echo boom 1>&2 & exit 3"` takes the OK branch. `markdownlint` discards its
-output and calls `Test-Ok` unconditionally. `hyperfine` (`:108-110`) does it correctly - check
-`$LASTEXITCODE` like that one. Related: `:88` builds two files and a `Compare-Object` for the
-`delta` check and never uses the result, so **delta is never actually fed a diff**.
-
-**Fixed 2026-09-10, and it was SIX sites, not four** - `cdb` had the same shape, and the
-manifest `detect` probe was subtler than any of them: a FAILING `winget list --id X -e` still
-prints "No installed package found matching input criteria", which is non-empty and therefore
-truthy. (That branch only fires for `install_method = "existing"`, and npcap is the only such
-tool, whose detect is a real PowerShell expression - so it was fragile rather than actively
-misfiring. The audit's example, WinDbg, has method "winget" and never reaches it.)
-
-Two things surfaced only by RUNNING the fixed checks, both of which would otherwise have
-shipped:
-
-- **`... | Select-Object -First 1` sets `$LASTEXITCODE` to -1 even when the command SUCCEEDED.**
-  It raises StopUpstreamCommandsException to short-circuit, which kills the native process
-  mid-write. Pairing an exit-code check with `-First 1` therefore INVENTS failures - a healthy
-  `gh` immediately reported "exited -1". Collect the whole stream, then take the line.
-- **markdownlint was right to exit 1.** `Set-Content` appends a newline on top of the fixture's
-  explicit backtick-n, so the file ended with a blank line. The fixture was fixed rather than
-  the assertion loosened.
-
-`delta` was never actually fed a diff - it wrote two files, computed a `Compare-Object` nothing
-read, and ran `delta --version`. It now receives a literal unified diff and must render the
-changed line.
-
-A lint in the gate now fails any `try` block that calls `Test-Ok` without inspecting an exit
-code or comparing anything. Verified against git history: it flags exactly the six original
-sites, and zero afterwards. Its first draft was broader and wrongly flagged blocks that GATHER
-inside a try and decide outside it - a better pattern than the one being outlawed, and a lint
-that cries wolf gets switched off within a week.
-
-### 5. ~~Unverified binaries are kept, despite the comment saying they never are~~ DONE 2026-09-10
-
-`build-devtoolbox.ps1:482-493`. `Expand-Archive` writes ~151 Sysinternals executables *before*
-the signature check, and the catch only warns - nothing is deleted. The downstream gate at `:785`
-is `Test-Path sigcheck64.exe`, now true, so the readiness smoke passes against unverified
-binaries. Only one file is ever checked although the comment says "binaries".
-
-### 6. ~~`install-llm.ps1` puts multi-GB models outside the toolbox and then asserts otherwise~~ DONE 2026-09-10
-
-`:73-79, 166, 194, 204`. `OLLAMA_MODELS` is set for *future* processes; when Ollama is already
-running the catalog install short-circuits, `Wait-Ollama` is satisfied by the **old** server, and
-`ollama pull` writes to `%USERPROFILE%\.ollama\models`. `:204` then asserts the toolbox path, and
-the uninstall story depends on it. This is the "Ollama desktop app blocks its service" problem
-expressed in code.
-
-### 7. ~~Group installs report success even when every install failed~~ DONE 2026-09-10
-
-`lib/catalog.ps1:131` pipes every result to `Out-Null`, so `cli-tools_install` prints
-`OK cli-tools group complete` regardless and bootstrap then prints `bootstrap complete`
-(`modules/cli-tools.ps1:11`, `extras.ps1:32`, `security.ps1:66`). Same family:
-`install-llm.ps1:106-113` warns on each failed reranker asset and still prints
-`OK reranker provisioned`; `:108`'s `if (Test-Path $out) { continue }` accepts a truncated
-partial download forever.
-
-### 8. ~~Manifest provenance is asserted rather than measured~~ DONE 2026-09-10
-
-`modules/security.ps1:135-137, 226-229, 323-326, 417-420` omit `-InstalledByToolbox`, which
-defaults to `$true`. The live manifest records `WinDbg` and `npcap` as toolbox-installed although
-npcap is documented as detect-only and `Install-WingetTool` returns early for a pre-existing
-WinDbg. Consequence: `uninstall-toolbox.ps1 -RemoveWingetTools` would `winget uninstall` a WinDbg
-the toolbox never installed.
-
-### 9. ~~A corrupt baseline silently destroys the novelty history~~ DONE 2026-09-10
-
-`New-ForensicsReport.ps1` `Read-FxBaseline` returns `$null` on **any** read or parse failure. The
-report then says "No baseline yet - this run establishes one", writes `runs = 1`, and every
-pairing is reported as novel next week. A lost history reads as a clean slate. Distinguish
-"absent" from "unreadable" and refuse to overwrite the latter. Related: `Sort-Object
-{ [datetime]$_.lastSeen }` sits outside the try/catch under `$ErrorActionPreference='Stop'`, so
-one entry missing `lastSeen` kills report generation outright.
-
-### 10. ~~The novelty baseline never forgets~~ DONE 2026-09-10
-
-`Write-FxBaseline` prunes only by count (top 5,000 by `lastSeen`), never by age, so the "New
-pairings" tile - which the renderer itself calls "the signal a WEEKLY report is actually for" -
-trends monotonically to zero and stays there. Add an age horizon.
-(The related trap, that investigating an incident folded it into the baseline, was fixed by
-`-NoBaseline` on 2026-09-10.)
-
-### 11. ~~The report generator's pure functions cannot be tested~~ DONE 2026-09-10
-
-`Get-FxPairKey`, `Read-FxBaseline`, `Write-FxBaseline`, `Get-InteractiveUser` and
-`Get-DownloadsPath` live in `New-ForensicsReport.ps1`, which begins reading the event log the
-moment it is dot-sourced - so no test can import them. That is why the 24x rewrite of
-`Get-FxPairKey` had to be validated by a throwaway differential harness that *restated* the
-function instead of importing it, and why the gather block was exercised by simulation rather
-than by running it. Extract them into `ForensicsReport.Core.ps1` alongside the existing
-`.Render` / `.Triage` split, and give them a real suite.
+Deliberately not fixed when found: running `CHALLENGE_TEXT` over Jina's markdown envelope is exactly
+the false-positive class that function's own comment documents (an article about bot detection was
+once reported as a DataDome challenge), and no blocked target was available to measure a real
+refusal against. Needs a real blocked URL before the detector can be trusted on this rung.
 
 ---
 
-## Bugs - LOW
+## Housekeeping - LOW
 
-- ~~**`security_desc` over-claims 4 of 6 items** (`modules/security.ps1:11`), and it is printed by
-  `bootstrap.ps1 -List` and `get.ps1` - i.e. *before* consent. It advertises installing WinDbg,
-  the WDK, console debuggers and Ghidra; the bodies only detect-and-wrap. `modules/cli-tools.ps1:7`
-  omits `pwsh` and `curl-libressl`.~~ DONE 2026-09-10
-- ~~**A stray literal backtick ships in the manifest** (`modules/security.ps1:401`): `-c '`.logopen`
-  in a double-quoted string, so the recorded command is paste-broken. `lib/common.ps1:532` has the
-  same text correctly.~~ DONE 2026-09-10
-- ~~**The GUI ignores its own per-tool checkboxes** (`gui/toolbox-gui.ps1:206-214`): `Get-RunnerArgs`
-  reads only the five global toggles, so unchecking a tool and pressing Install installs it.~~ DONE 2026-09-10
-- ~~**The GUI can hang forever** (`gui/toolbox-gui.ps1:192-201`): only stdout is drained inside the
-  wait loop; a child filling the ~4 KB stderr pipe never exits and `while (-not $proc.HasExited)`
-  spins. bootstrap's winget/pip children do write to stderr.~~ DONE 2026-09-10
-- ~~**Undisposed resources**: `Process` and `CancellationTokenSource` in `gui/toolbox-gui.ps1:66,
-  191, 277`; ~150 `X509Certificate2` per call in `lib/common.ps1:229-237`; `New-TemporaryFile` in
-  `smoke-test.ps1:26` creates a file only its *name* is used from and the cleanup removes a
-  directory instead (76 stray zero-byte `tmp*.tmp` currently in `%TEMP%`).~~ DONE 2026-09-10
-- ~~**A partial tessdata download is permanent** despite the warning saying "rerun to retry"
-  (`build-devtoolbox.ps1:445-458`): `Install-Tessdata` short-circuits on `Test-Path` before the
-  self-healing size check can run. Only `eng` and `osd` of 11 declared languages exist on this box,
-  and `bootstrap.ps1:351` counts files without checking size.~~ DONE 2026-09-11
+### Four files under `logs/` grow without a retention policy
 
-  The entry recorded half the mechanism. The `Test-Path` short-circuit was only the first gate:
-  `Get-Download`'s **size**-failure branch threw WITHOUT deleting the partial, while its SHA-256
-  branch had always cleaned up after itself. So aria2c left a corpse, the next run's `Test-Path`
-  found it, and the failure became permanent — the two halves each made the other invisible.
-  Both are fixed, and `bootstrap.ps1` now counts files `>= 100KB` with `eng.traineddata` required
-  by name, because pointing `TESSDATA_PREFIX` at a directory of zero-byte files breaks OCR harder
-  than leaving it unset.
-- ~~**`consolidate-path.ps1:241-245` overwrites the wrapper unconditionally**~~ DONE 2026-09-11,
-  and fixed TWICE independently: the planner keeps an existing wrapper whose target still exists,
-  and the writer refuses separately, so a planner-only regression cannot reach the disk. Measured
-  in production during the rebuild: 34 shims written, **118 existing wrappers left untouched**.
-  The original wording follows.
-- **`consolidate-path.ps1:241-245` overwrites `native\bin\<name>.cmd` unconditionally**, so a
-  winget package shipping `ffmpeg.exe` silently replaces the toolbox's own shim - the comment at
-  `:185-188` claims the opposite.
-- ~~**The deployed agent block is one section stale** (`lib/common.ps1:538-549`): the generator now
-  emits a Sysmon/deletion-forensics paragraph the four deployed `CLAUDE.md`/`AGENTS.md` copies do
-  not have, and nothing verifies deployed against generator.~~ DONE - **both halves are false as of
-  2026-09-11.** All four targets MATCH the generator (verified with the repo's own
-  `lib/AgentDiscovery.ps1` extractor), and `scripts/smoke-test.ps1:337-400` now compares deployed
-  against generated with three verdicts and FAILs on drift. That check earned its keep the same
-  day: a one-word edit to the template (1.5 GB -> 2 GB) failed the gate on all four targets until
-  they were regenerated. Current anchor for the paragraph is `lib/common.ps1:797-807`.
-  Code-side follow-up, still open: `lib/AgentDiscovery.ps1:6-9` and `scripts/smoke-test.ps1:337-339`
-  both cite "BACKLOG.md:242-245" and "lib\common.ps1:564-575" and both still assert the deployed
-  copies lack the paragraph. All four of those references are now wrong.
-- ~~**`fresh-toolbox-setup-runner.ps1:62-68, 87`** reads a leaked `$LASTEXITCODE` as bootstrap's
-  status (bootstrap has no trailing `exit`). It now also needs to handle
-  `consolidate-path.ps1` exit **2** (elevation declined), added 2026-09-10.~~ DONE 2026-09-10
-- ~~**`README.md:80`** says consolidate-path "needs elevation"; it now self-elevates.~~ DONE 2026-09-10
+Audited 2026-09-18, measured on this box, ranked by growth rate. `Remove-StaleBackups` added this
+round covers **only** `<leaf>.bak-yyyyMMdd-HHmmss` agent-file backups; none of these share that
+pattern or that directory.
 
----
+| # | pattern | writer | on disk now | per run |
+|---|---|---|---|---|
+| 1 | `logs/fresh-workstation/setup-*.log` | `fresh-toolbox-setup-runner.ps1`, `Start-Transcript` | 5 files, 141 KB | 1 file, 7-103 KB |
+| 2 | `logs/path-backup-*.json` | `lib/path-registry.ps1`, `Backup-PathRegistry` | 5 files, 20 KB | 1 file, 2-6 KB |
+| 3 | `logs/machine-path-intended-*.txt` | `scripts/consolidate-path.ps1` | 0 files (new today) | 1 file, 2-4 KB |
+| 4 | `logs/gate-phases.log` | `run-gate.ps1`, `Add-Content` | 15 lines, 1.5 KB | 1 line, ~100 B |
 
-**Three of these were not what the audit said, and the corrections matter more than the fixes.**
-The half-uninstall item was ALREADY closed by an earlier commit the same day - current behaviour
-was verified (exit 1, zero of three mutation steps reached, with a control proving "zero
-reached" is not vacuous) and nothing was changed. `catalog.json tools[].default` is NOT dead:
-`gui\toolbox-gui.ps1` reads it to pre-tick checkboxes, so only `optional` was removed. And the
-temp-file leak had grown from the recorded 138 to 154 by the time it was fixed, because the
-smoke test had been run repeatedly that day - the clearest possible confirmation the leak was
-ours.
+Notes that change what to do about each:
 
-**One fix introduced a bug that was caught in its own review.** Making provenance a measurement
-means the SECOND bootstrap run finds a tool already present and would DISOWN it, so a later
-`-RemoveWingetTools` would leave behind everything the toolbox installed. Provenance is now
-sticky: false -> true is a measurement we accept, true -> false is one we refuse.
+- **(1) is the only one with real volume.** The transcript captures winget output, so a full
+  fresh-setup run is ~103 KB and a failed quick run is ~7 KB. `Stop-Transcript` is in a `finally`,
+  so the handle is always closed - this is purely retention.
+- **(2) has documented recovery value.** `consolidate-path.ps1 -Restore` and `-FromBackup` read
+  these, and `Backup-PathRegistry`'s own docblock calls the 2026-09-09 file "the only surviving
+  record" of the pre-outage PATH order. Do not prune this one without keeping that file.
+- **(3) is new this round and is my doing.** Renaming the fixed `machine-path-pending.txt` to a
+  timestamp made the filename true (it is written *before* elevation and was left behind claiming a
+  pending change that had already been applied) and turned one overwritten file into a growing set.
+- **(4) is a non-issue by design.** 15 lines across the repo's whole history; the ledger's value is
+  the history.
 
-**A PowerShell engine bug, found while verifying the GUI stderr fix.** `Register-ObjectEvent`
-assigns `EventIdentifier`s without an interlock, so two events raised at the same instant on the
-stdout and stderr reader threads can share one id - measured 2 runs in 6, always the
-end-of-stream marker pair. `Remove-Event` then consumes both and throws, which under the GUI's
-`$ErrorActionPreference = 'Stop'` would have killed the click handler AFTER a successful
-install. Worth knowing before anyone writes another event-driven pump.
+**Recommendation: report the counts, do not add pruners.** See the rule at the top of this file. A
+one-line count per pattern in the smoke test costs nothing and carries no blast radius, and the total
+at stake across all four is under 200 KB. If a pruner is ever wanted, the blast radius of each is
+narrow and fixed (a literal prefix plus a timestamp suffix, one directory, no other files match), and
+that should be stated in the proposal rather than discovered afterwards.
 
-**Still open in this section:** `.bak-<timestamp>` files accumulating unpruned. The partial
-tessdata download and the unconditional shim overwrite were fixed on 2026-09-11; the stale
-deployed agent block is now *detected* by the gate rather than invisible, which is the half that
-was missing.
+### The `%TEMP%` fixture sweep's 30-minute window is an assumption, not a measurement
 
----
+`tests/Invoke-InstallerTests.ps1`. Three module-scope fixture roots (`installer-tests-*`,
+`agentblock-*`, `builder-tests-*`) have cleanups at column 0 rather than in a `finally`, which the
+file documents, so a throw at module scope strands a directory. The self-healing sweep at the top of
+the suite collects them, and this round it was age-gated to 30 minutes so two concurrent runs stop
+deleting each other's live fixtures (before the gate: two concurrent runs scored 106/2 with the
+failures landing on the catalog fixture tests).
 
-## Found while rebuilding the toolbox, 2026-09-11
+30 minutes is three orders of magnitude beyond the observed run time (seconds), so it is a safe
+number - but it is a number, and nothing asserts the suite finishes inside it. If this suite ever
+grows a long-running test, the gate becomes wrong in the dangerous direction. Currently 0 orphans on
+this box, so the sweep is working.
 
-Surfaced by the rebuild effort rather than by a sweep. Each names the file and the measurement.
+### The gate cannot print `gate passed` from inside a worktree
 
-### A degraded build still reports success
+`scripts/smoke-test.ps1`, the agent-discovery group. The generated block embeds `$RepoRoot`, and the
+group compares it against the four deployed copies in `%USERPROFILE%`, which name the main checkout.
+Run from `.claude/worktrees/agent-*`, four checks fail with `Managed by:` pointing at the worktree.
 
-`build-devtoolbox.ps1` `Install-Tessdata` collects a `$failed` list, prints it, and discards it,
-so a run that lands **0 of 11** languages still exits 0. `Install-Ghostscript` and
-`Install-Sysinternals` are best-effort by explicit and defensible design (a missing Ghostscript
-should not fail a whole toolbox build), but **nothing aggregates the three into one "this build is
-degraded" signal**, and the manifest is written *before* `Run-Smoke` runs (`:874` vs `:877`) while
-`bootstrap.ps1:436` gates readiness on that manifest existing. So the honest summary is: three
-independent soft failures, no combined verdict, and a readiness flag that cannot see any of them.
-Wanted: a single `degraded` array in the manifest that `smoke-test.ps1` reads and reports.
+Measured by two agents independently this round: baseline `73 passed / 3 warnings / 5 failed` from a
+worktree before either changed anything, with an identical failure set afterwards. The check even
+annotates the case correctly on the next line ("names a live checkout of this repo, not the one
+running this gate") and still counts it as a failure.
 
-### `Get-Download` misreports a network failure as a truncated file
+Consequence worth naming: an agent working in a worktree cannot get a clean gate, so "gate passed"
+stops being usable as its done-criterion and has to be replaced with "the failure set is unchanged
+from baseline". Repairing it the obvious way is actively harmful - it would deploy a `CLAUDE.md`
+into the user's profile pointing at a temporary worktree.
 
-Its aria2c leg ignores aria2c's exit code entirely and relies on the post-hoc size check to
-notice. It works, but the diagnostic is wrong: a DNS or TLS failure surfaces as "download failed
-or was unexpectedly small", which sends the reader looking at disk and mirrors rather than at the
-network. Capture and report the downloader's own exit code.
+Candidate fix: when the running checkout is a worktree (`git rev-parse --git-common-dir` differs from
+`--git-dir`), report the four as SKIPPED-with-reason rather than FAILED, and say so on every run.
 
-### The forensics report classifies a package-cache wipe as noise
+### A null environment read cannot be linted here, and there are 30 of them
 
-`tests/Invoke-CoreTests.ps1` carries a test named `'a package cache is NOT a sentinel, or the tile
-is noise'`, asserting that `C:\Users\Admin\.nuget\packages\x` does **not** match the sentinel
-regex. That is correct for routine churn and wrong for a mass-deletion event, and it is not
-hypothetical: the 2026-09-10 wipe took **3,384 files across 128 package versions** out of the
-NuGet cache, including `onnxruntime.dll` and the .NET runtime packs, which blocked builds
-entirely — and it was found by hand, days later, not by the weekly report.
+`[Environment]::GetEnvironmentVariable(...)` returns `$null` for a value that does not exist, and a
+method call on the result throws. One instance was fixed this round -
+`scripts/smoke-test.ps1`'s 4095-char PATH truncation check could not fire on a fresh profile because
+`$null.TrimEnd(';')` threw and the file sets neither `Stop` nor `StrictMode`, so it printed red,
+continued, and emitted no verdict at all.
 
-The missing signal is **volume in one burst**, not path. A single file deleted from a package
-cache is noise; several thousand in one sweep is the loudest thing that happened that week. Any
-fix has to keep both properties, because a sentinel list that promotes package caches
-unconditionally would make `plex-bif-orphans` own the hero tile forever (see the design note
-below on the two weekly SYSTEM tasks).
+Measured across the repo: **30 such reads in 7 files** (`bootstrap.ps1`, `lib/common.ps1`,
+`modules/security.ps1`, `scripts/build-devtoolbox.ps1`, `scripts/smoke-test.ps1`,
+`scripts/uninstall-toolbox.ps1`, `tests/Invoke-InstallerTests.ps1`). **Zero** are a direct
+`GetEnvironmentVariable(...).Method` chain, so every one goes through an intermediate variable and a
+precise lint would need dataflow analysis. A crude AST rule would false-positive heavily.
 
-### Machine-state damage the PATH/toolbox audit did not cover
-
-Recorded because it was invisible to every check this repo has. `%USERPROFILE%\.dotnet\tools`
-holds `.store\wix\5.0.2` (14 files, 9.9 MB) and **no top-level `wix.exe`**, so
-`dotnet tool list --global` reports wix installed while `wix` does not run — the same
-payload-survived-shim-died shape as the winget packages this rebuild exists to repair, and as the
-NuGet cache. `wix` is absent from `%USERPROFILE%\.nuget\packages`, so an offline repair needs the
-nupkg from inside `.store`. Not this repo's to fix; worth knowing that the pattern recurs across
-every package manager on the box.
-
-### Nothing lints this repo's own markdown
-
-`.markdownlint.json` exists at the repo root, and its only consumer is `smoke-test.ps1:209-222`,
-which lints a synthetic one-line fixture in `%TEMP%` and picks the config up incidentally via
-markdownlint-cli's cwd search. Neither CI nor `run-gate.ps1` ever lints `README.md`, `BACKLOG.md`
-or `docs/`. Measured on 2026-09-11: one live MD012 violation in `BACKLOG.md`, pre-existing and
-unnoticed.
-
-## Dead code
-
-Confirmed by AST across both repos (265 definitions, 3,950 call sites) and re-grepped by bare
-name including `.xml`/`.json`/`.psd1`/`.md`.
-
-- ~~`catalog.json`: `schema_version` (never validated), the whole `toolbox_layers` block,
-  `llm.runtime`, and `tools[].optional`.~~ **CLOSED, verified 2026-09-11.** `schema_version` is
-  enforced by `Get-Catalog`, and the bump to 2 is load-bearing rather than bookkeeping: an old
-  catalog against current code would silently skip the machine-PATH removal in
-  `uninstall-toolbox.ps1`. `toolbox_layers` is gone bar a `$comment` explaining its removal, and
-  `optional` has zero occurrences. `llm.runtime` is the only survivor of this bullet.
-- ~~`manifest/tools.json` write-only keys from `Add-WinManifest`: `last_verified`, `status`,
-  and `installed_version`.~~ **CLOSED.** All three removed, with comments recording why -
-  `installed_version` cost an `Invoke-Expression $Detect` per tool to compute something nothing
-  read.
-- ~~`$activatePs1` (`lib/common.ps1:442`) - assigned, never read.~~ **WRONG ON BOTH COUNTS,
-  withdrawn 2026-09-11.** There is no `$activatePs1` in `lib/common.ps1` at all; it lives in
-  `scripts/build-devtoolbox.ps1`, where it is assigned and then **read** as the target of
-  `Set-Content -Path $activatePs1`. Recorded rather than quietly deleted, because a dead-code list
-  that has been wrong once should say so - this entry survived because nobody re-grepped a bare
-  name that looked obviously dead.
-- The shipped activation helpers (`build-devtoolbox.ps1:521-534`) prepend the venv `Scripts`
-  directory to PATH, putting `python.exe` there - which `lib/common.ps1:202-208` and
-  `smoke-test.ps1:243-248` treat as a FAIL condition. Delete them or fix them.
-- `lib/common.ps1:202-208` - the doc block describing venv-CLI wrapping sits above
-  `Set-NodeSystemCaBundle`; the function it documents (`New-VenvCliWrappers`, `:252`) has none.
-- ~~`build-devtoolbox.ps1:738` writes `wrapper_exists = $true` as a literal inside the loop that
-  enumerates existing wrappers - it restates the loop's precondition and reads as a result.~~
-  GONE 2026-09-11: `wrapper_exists` no longer appears in any `.ps1` in the repo. The only
-  remaining occurrence in the tree was this backlog line describing it.
+Recorded rather than attempted, so the next person does not start by writing the lint. The tractable
+version is narrower: make `lib/path-registry.ps1`'s `Get-RawPath` the only PATH reader and give it a
+non-null contract, then the remaining reads are non-PATH and individually reviewable.
 
 ---
 
-## Optimization - measured, not guessed
+## Scoped elsewhere
 
-Timed under Windows PowerShell 5.1, which is what the scheduled task runs. Numbers are per
-100,000 events unless stated.
+Two items are open but already measured, and the measurement lives in
+`docs/engineering-record.md` rather than here so it is read before work starts:
 
-| Where | Cost | Fix | Status |
-|---|---|---|---|
-| `Get-FxPairKey` | 49,312 ms | String.Split + GetDirectoryName + caller-supplied `-Dir` | ~~done 2026-09-10~~ (24x) |
-| Sentinel classification | 28,129 ms | one compiled alternation | ~~done 2026-09-10~~ (24.6x) |
-| `Split-Path` for parent dirs, 4 sites | 8,824 ms | compute `Dir` once at gather | ~~done 2026-09-10~~ (46x) |
-| Dead event-1 query | ~10 s at 40k events | render the command line instead of discarding it | ~~done 2026-09-10~~ |
-| `& $add` closure per output line | 257 ms / 4,000 rows vs 10 ms | call `AppendLine` directly in the row loop only | ~~done~~ verified closed 2026-09-11 |
-| `ConvertTo-FxHtml` call overhead | 1,654 / 1,440 ms, 16,000 calls | inline in the row loop | ~~done 2026-09-11~~ (12-14x, 117 ms) |
-| `Split-Path -Leaf` per row | 318 ms / 4,000 rows vs 17 ms | `[IO.Path]::GetFileName` | ~~done~~ verified closed 2026-09-11 |
-| Renderer re-classifies sentinels | 15 regexes x 4,000 | pass the `IsSentinel` flag through | ~~done~~ verified closed 2026-09-11 |
-| `Find-Executable` fallback | 4,048 ms per exhaustive miss | ~~cache misses per run~~ | **REJECTED** - see below |
-| `build-devtoolbox.ps1:276,280` | 2 walks of one tree | one walk testing both names | ~~done 2026-09-11~~ (76.6 -> 37.9 ms) |
-| `ShimPlan` sibling rule renormalises | 555 ms real / 27,393 ms worst | memoise by input string, inline | ~~done 2026-09-11~~ (8.7x / 9.4x) |
-| `ShimPlan` `shadowed` predicate | 33.8 ms at real scale | ~~HashSet instead of `-notcontains`~~ | **REJECTED** - 31.4 ms, saves 2.4 ms |
-| `Add-UserPathEntry` duplicate entries | 2 entries in both hives | ask the machine hive before adding | ~~done 2026-09-11~~ |
-
-**Measured and REJECTED - do not "fix" these:**
-
-- Pre-compiling the 18 forbidden path patterns to a `Regex[]` was **slower** (481 ms vs 377 ms),
-  and raising `[regex]::CacheSize` changed nothing. The cache is not thrashing.
-- Combining the three `Get-WinEvent` passes into one `Id=@(1,4,26)` query saved only 18%
-  (1,073 ms -> 882 ms). Not worth the branching.
-- The `shadowed` hygiene predicate's `+=` growth and linear `-notcontains` in `lib/ShimPlan.ps1`.
-  A real quadratic shape, and at this box's real scale - 42 composed PATH entries providing 1,231
-  names - it is **33.8 ms against 31.4 ms** for a `HashSet`. 2.4 ms is not a reason to rewrite the
-  predicate that decides whether to delete a PATH entry. Its neighbour in the same entry, the
-  sibling rule, measured 555 ms and WAS fixed: same "genuinely quadratic" description, opposite
-  verdict, which is the whole reason that entry said measure first.
-- Wrapping a memoised lookup in a scriptblock (`& $normOf`). A closure call costs the same ~64 us
-  of dispatch as the function call it replaces, so it saves nothing - this is the third time the
-  repo has measured it, after the `& $add` renderer closure and the `[Predicate[byte]]` above.
-  When the cost IS dispatch, the only fix is fewer calls, not cheaper-looking ones.
-- `Sort-Object -Top` at `Render.ps1:258`: **`-Top` does not exist in Windows PowerShell 5.1**. It
-  would be green locally under pwsh and broken at 04:00 on a Sunday. The full sort of 100k
-  objects is only 1,019 ms anyway.
+- **`Set-StrictMode` across the suites.** 49 failures across four suites (Render 19, Triage 20,
+  SmokeLint 9, Installer 1; AgentDiscovery, Core and GateChecks are clean). Do it one suite at a
+  time, and do not soften an assertion to make it pass.
+- **Relocating the three inputs out of `logs/`.** Touches seven files and resets the ledger baseline
+  for every checkout at once. **Copy, do not move** - one of the three is the only surviving record
+  of the pre-outage PATH order.
 
 ---
-
-## Design decisions worth revisiting, not bugs
-
-- **~~Two~~ ONE weekly SYSTEM task now.** `\PcMaintenance` was **removed on 2026-09-11** at the
-  user's instruction, before its first-ever `-Apply` run (Sunday 2026-09-13 03:00), on the machine
-  it had just been implicated in wiping. Verified gone by two independent signals: `schtasks`
-  reports absent where it previously reported access-denied, and no registration file remains
-  under `System32\Tasks`. `DeletionForensicsReport` is still registered, and the payload plus 19
-  run logs were retained. The task XML was exported first, so it is reversible.
-
-  The note below is kept because the hazard returns the moment anyone re-registers that task.
-  pc-maintenance ran Sunday 03:00 with `-Apply`; the forensics report runs 04:00 over the last 7
-  days. Neither knew about the other. `plex-bif-orphans` deletes ~6,935 files per sweep at 100% recurrence,
-  which is a textbook burst by the report's own definition and would permanently own the hero
-  tile. The only reason it does not is incidental: the Plex media directory is a junction to
-  another volume, so the deletions fall outside the config's include prefix. Remove that junction
-  and the forensics headline becomes pc-maintenance, every week, forever. Make it an explicit
-  exclusion or an explicit comment, not an accident.
-- ~~**`bootstrap.ps1:302-307`** says PATH registration is user scope "(never machine)", while
-  `consolidate-path.ps1` and `smoke-test.ps1:211-212` treat machine scope as the correct end
-  state. Pick one.~~ **RATIFIED 2026-09-11: machine scope**, for the reason the contradiction
-  existed in the first place — some agent shells inherit the machine PATH only, so a user-scope
-  toolbox is invisible to exactly the audience this repo serves. The live registry had already
-  settled it: `native\bin` and `sysinternals` are in HKLM and absent from HKCU.
-
-  The documented model is now: `bootstrap.ps1` **stages** both entries in the user hive because
-  it runs unelevated by contract, and `scripts/consolidate-path.ps1` — which elevates, backs both
-  hives up and can `-Restore` them — owns the machine write. `smoke-test.ps1:261-263` already
-  encoded that ladder correctly (machine `OK`, user-only `WARN`, absent `FAIL`); only the prose
-  was wrong.
-
-  Two things surfaced while closing it that were not in the original entry:
-
-  - **The contradiction had a functional half, not just a prose half.**
-    `uninstall-toolbox.ps1:167` calls `Remove-UserPathEntry`, which is user-scope only
-    (`lib/common.ps1:72-87` — there was no machine-scope helper in `lib/` at all), for entries
-    that live in HKLM. So the toolbox could not reverse its own PATH side effect.
-    **CLOSED, re-checked 2026-09-11:** `Remove-MachinePathEntry` now exists at `lib/common.ps1:228`
-    returning `Removed` / `NotPresent` / `DryRun` / `NeedsElevation`, and
-    `scripts/uninstall-toolbox.ps1:244` calls it and handles `NeedsElevation`. The `:167` anchor
-    above is now `:244`, and `lib/common.ps1:72-87` is now `Remove-UserPathEntry` at `:188-227`. The two dead
-    `DevToolbox\native\bin` and `DevToolbox\sysinternals` entries sitting in the machine PATH
-    after the 2026-09-10 deletion **are** that gap, observed rather than theorised.
-  - **`docs/agent-rules.md`'s prohibition was narrowed, not dropped.** "Never add entries to the
-    system PATH" becomes "never add a *tool-specific* entry by hand; this repo owns exactly two,
-    declared in `catalog.json` and written by one script". A blanket licence to edit the system
-    PATH is not what the ratification buys.
-- **`Write-AgentBlock`** (`lib/common.ps1:430-431`) writes a new `.bak-<timestamp>` every run with
-  no pruning; 9+ copies of `AGENTS.md` already sit in the profile root.
-
----
-
----
-
-## Found during the consolidation round, 2026-09-11
-
-Each names the file and the measurement. Line numbers are deliberately omitted where a symbol
-name will do: every reference in this file predating this week is now stale for
-`build-devtoolbox.ps1`, `lib/common.ps1`, `consolidate-path.ps1` and `smoke-test.ps1`, which
-between them moved by hundreds of lines. Re-anchor by symbol, not by line.
-
-### A dry run can still write the real user PATH
-
-`Add-UserPathEntry` has no `-DryRun` branch. `bootstrap.ps1`'s `Register-ToolboxUserPath` guards
-its own call site, but `lib/catalog.ps1` does not: under `-DryRun`, `Install-WingetTool` returns
-`$true` **without installing**, so a `winget-machine` or `winget-default` tool with a
-`path_fallback` whose binary is absent reaches `Add-UserPathEntry` and writes the persistent user
-hive during a run that promised to change nothing. Left open deliberately during the registry
-migration, which was confined to the mechanism; closing it is a behaviour change belonging either
-to the catalog call sites or to a guard in the function.
-
-### `Find-Executable`'s miss cache is not the easy win it looks like
-
-BACKLOG measures the exhaustive miss at 4,048 ms and the obvious fix is a per-run cache. It is
-wrong. The dominant caller shape is probe, install, probe again (`Get-Python311` for uv,
-`Install-Ghostscript` for gswin64c), so a miss cache makes the install **unobservable** and
-returns `$null` from a box that now has the tool. Correctness needs invalidation threaded through
-every installer. Recorded in a comment at the function so nobody re-derives it as a quick fix.
-
-Measured while fixing the adjacent two-walk problem, and worth keeping because both alternatives
-lose: an unfiltered single walk is **86.1 ms**, slower than the 76.6 ms two-pass it would replace;
-`-Include` is **silently ignored under `-LiteralPath`** and returned every file in the package
-including `README.html`, so its apparent 19.4 ms was an inert filter. The shipped `-Filter` plus
-exact-name test is 37.9 ms, verified identical across 31 names x 27 packages.
-
-### Hot paths in `lib/ShimPlan.ps1` - ~~unmeasured~~ measured 2026-09-11, split verdict
-
-Both were described here as "genuinely quadratic shapes" with the instruction to measure before
-touching. Measured, they land on opposite sides, which is the best argument this file has for
-that instruction.
-
-**The sibling rule: FIXED.** `Get-ShimNormalKey` costs **78 us a call** - dispatch, not the two
-string operations inside it - and the innermost iteration of the four-deep loop called it on
-every pass. Old against new, at both shapes, asserting the same hit count:
-
-| shape | before | after | |
-|---|---|---|---|
-| real (deferred 6, bound 47, cands 3) | 555 ms | 64 ms | 8.7x |
-| worst (deferred 47, bound 47, cands 3) | 27,393 ms | 2,916 ms | 9.4x |
-
-Memoised **by input string**, not by name: the same string always normalises to the same key, so
-the cache is a property of `Get-ShimNormalKey` rather than of `$bound`'s contents and cannot go
-stale. A per-name cache would break silently the day a rule re-binds a name. 50 distinct paths
-are normalised now, in place of 5,076 and 311,469 calls.
-
-**The `shadowed` predicate: REJECTED**, 33.8 ms against 31.4 ms. See the rejected list above.
-
-**The trap, recorded because it nearly shipped:** the first draft of the memo wrapped the lookup
-in a `& $normOf` scriptblock, which saves nothing - a closure call costs the same dispatch as the
-function call it replaces. Three call sites of inline hashtable check is uglier and is the only
-version that is faster. When the cost is dispatch, the fix is fewer calls.
-
-### The repo's markdown is still unlinted
-
-`.markdownlint.json` exists and its only consumer is a synthetic one-line fixture in `%TEMP%`.
-Neither CI nor `run-gate.ps1` lints `README.md`, `BACKLOG.md` or `docs/`. One live MD012 violation
-was found and fixed by hand on 2026-09-11; nothing would have caught the next one.
-
-### Interesting, not actionable
-
-Every failure in this round's rebuild was a **native command's stderr under a global
-`$ErrorActionPreference = 'Stop'`**. Three different commands, three different disguises - uv's
-*success* message, Node's CA-bundle warning, and aria2's real error. `lib/common.ps1` had the
-lesson written down and applied at some call sites and not others. The generalisation now lives in
-`Invoke-NativeCapture`, and an AST test asserts no native command in the builder is piped.
-
-**Correction, measured 2026-09-11.** This entry used to say "the trigger is the PIPE, not the
-redirection". That is backwards. Probed under 5.1 with `Stop`, across three host-stream conditions
-(console inherited, parent-captured with `2>&1 | Out-String`, `Start-Process` with both standard
-streams redirected to files), the result was identical in all three:
-
-| shape | result |
-|---|---|
-| `$x = & cmd /c "echo e 1>&2 & exit /b 0" 2>&1` | **THREW** `NativeCommandError` |
-| `$x = & cmd /c "echo e 1>&2 & exit /b 0" 2>$null` | **THREW** - `2>$null` does not discard it |
-| `& cmd /c "echo e 1>&2 & exit /b 0" \| Out-Null` | survived |
-| `& cmd /c "echo e 1>&2 & exit /b 0" > $null` | survived |
-
-The **redirection** promotes stderr to ErrorRecords; a pipe on its own does not. The pipe still
-has to be barred, for a second measured reason that explains the original confusion: an
-**enclosing** `2>&1` - which is what every log-capturing parent applies - makes PowerShell
-redirect the inner command's stderr too, and then even an unpiped, unredirected native call raises
-the record. So `| Out-Null` is a latent form of the same defect rather than a different one, and
-the uv failure was almost certainly observed under exactly such a parent.
-
-### ~~Native stderr sites left OPEN in library and module files~~ FIXED 2026-09-11
-
-The sweep fixed the thirteen sites in scripts that set `Stop` *themselves*. Six more were the same
-defect reached by **dynamic scoping** and were left open on the grounds that they belong to the
-bootstrap install path and could not be validated without a real bootstrap run. They are fixed now,
-because the premise was checkable without one.
-
-Probed first, since the whole case rests on it: a function in a file that never mentions
-`$ErrorActionPreference`, dot-sourced by a script that set `Stop`, **THREW** on a redirected native
-call. `bootstrap.ps1` sets `Stop` at `:24` and dot-sources `lib/common.ps1` at `:27`, so all six ran
-under it.
-
-Then each site was provoked individually, because "same shape" is not "same behaviour" and the
-difference decides whether this was a crash fix or a precaution. **One of the six is confirmed
-active. Four are latent. One could not be provoked either way.**
-
-| site | measured under `Stop` |
-|---|---|
-| `Install-NpmGlobal` `npm install -g` | **ACTIVE.** `npm view <absent> 2>&1` THREW [RemoteException]. npm really does use stderr, so every npm failure path was killing the run |
-| `Install-WingetTool` `winget @args` | **UNPROVEN.** A failing winget *install* was not run on this box, and `winget list` surviving says nothing about it - the subcommands need not share a stream |
-| `Install-WingetTool` `winget list` | latent - survived for both a present and an absent package id; winget answers on stdout |
-| `security.ps1` `winget list WinDbg` | latent, same reason. Would have taken the security group down had it thrown, as it has no `catch` |
-| `security.ps1` `fsutil usn queryjournal` | latent - survived even for an absent volume; fsutil writes errors to stdout too |
-| `Install-NpmGlobal` `npm config get prefix` | latent - a pipe alone is safe; an enclosing `2>&1` is not |
-
-The unproven one is the repo's most-travelled install path, which is a reason to fix rather than
-a reason to wait. The four latent ones were fixed because the shape is banned uniformly and no
-reader can tell "safe today" from "safe" by looking at the call site.
-
-**This correction is the point of the entry.** The sites were first written up - by me, from a
-subagent's summary - as six crashes, including "npm threw on the SUCCESS path" and "the USN probe
-reported a problem whether or not it was". Neither survived being probed. Plausible reasoning
-about which stream a native tool uses is not evidence about which stream it uses.
-
-`Invoke-Native` **moved** from `bootstrap.ps1` into `lib/common.ps1`, which is where the exposure
-is, and reaches bootstrap, both modules and the library from one definition - the same argument
-that moved the shim byte contract into `lib/ShimFormat.ps1`.
-
-The gate now treats `lib\` and `modules\` as exposed regardless of whether they set the preference,
-because they are dot-sourced and never run standalone. It is still NOT every file:
-`scripts/smoke-test.ps1` holds seven of the shape and is genuinely safe, since `run-gate.ps1` runs
-it as a child process starting at `Continue`. A rule that has to be argued away is one nobody keeps.
-
-### `Invoke-Native` exists seven times, and mostly deserves to
-
-Counted rather than assumed: **7 definitions, 3 distinct bodies**. Five are byte-identical after
-stripping comment help; `install-deletion-forensics.ps1` adds a `-PassThru` parameter and
-`New-ForensicsReport.ps1` is a third variant. **Three** of the seven are in scripts that
-dot-source no library at all, so a local copy is the only option there:
-`scripts/install-ghidra.ps1:43`, `scripts/install-whisper.ps1:50`,
-`scripts/New-ForensicsReport.ps1:69`. (This paragraph said "four" when first written on
-2026-09-11 and was corrected the same day by a backlog audit.)
-
-**The fourth is the dangerous one, and counting it as justified hid that.**
-`scripts/install-deletion-forensics.ps1` dot-sources `lib/common.ps1` at `:89` and then defines
-its own `Invoke-Native` at `:106`, which **shadows the library copy with a different return
-contract**: `lib/common.ps1:90` always returns `@{ExitCode; Output}`, while the local one returns
-a bare exit code unless `-PassThru` is passed. The two are not interchangeable, so deleting the
-local definition as "redundant" would silently change the value every call site in that file
-reads. Either rename it, or give the shared one the `-PassThru` behaviour and delete the local -
-but do not treat it as the same tidy-up as the uninstaller's byte-identical copy.
-
-Only `uninstall-toolbox.ps1:49` is strictly redundant - it dot-sources `lib/common.ps1` fourteen
-lines earlier and then defines an identical body. **Left deliberately**: its comment-based help is
-uninstaller-specific ("THIS SCRIPT IS THE ONE THAT CANNOT AFFORD TO DIE HALFWAY", and why
-`| Out-Null` was rejected), and deleting eight duplicated lines at the cost of that reasoning is a
-bad trade. Consolidating would mean moving the prose, not just the code.
-
-`install-machine-scope.ps1` looks redundant and is not: it dot-sources `lib/catalog.ps1`, and
-`catalog.ps1` dot-sources nothing, so `Invoke-Native` does not reach it.
-
-`scripts/smoke-test.ps1` has seven more of the shape and is **not** exposed: it never sets `Stop`,
-and `run-gate.ps1` runs it as a child process, which starts at the default `Continue`. Widening the
-gate to files that do not set `Stop` would flag those seven for no reason, which is why the rule is
-scoped the way it is rather than being scoped to "every file".
 
 ## Features
 
-- Add the opt-in llama.cpp engine as a lean, no-service alternative to Ollama for
-  the local-LLM stack (`scripts/install-llm.ps1 -IncludeLlamaCpp`): detect a CUDA
-  GPU and fetch the matching prebuilt `ggml-org/llama.cpp` release into `native\`
-  (SHA-verified), wrap `llama-server`/`llama-cli`, and expose the same
-  OpenAI-compatible endpoint contract as the Ollama path.
-
-- `install-machine-scope.ps1`: consider moving per-package scope overrides (the
-  `$NoScopeFlag` list) into `catalog.json` as a `no_scope_flag` boolean field,
-  so the script and the catalog stay in sync automatically.
-
-- `tools/browse`: three things about it are recorded rather than resolved, added
-  2026-09-17 with the tool.
-  - **The `reader` rung has never been exercised.** `fetch_reader` (r.jina.ai) is
-    written and wired but `--allow-reader` was not used in any of the runs that
-    validated the other rungs, so its only evidence is that it parses. It is also
-    the one rung that discloses the URL to a third party, which is why it is
-    opt-in and why nothing has needed it yet. Prove it or drop it.
-  - **`curl_cffi` earned its catalog entry on a published benchmark, not on this
-    box.** Measured 2026-09-17, httpx versus `impersonate="chrome"` interleaved
-    over the same eight targets from one residential IP: **0 of 8 outcomes
-    changed**. Kept because the published result is real and another IP or target
-    set may differ, and because `--no-impersonate` makes the comparison
-    repeatable. If a later sweep also finds nothing, remove the entry rather than
-    carrying a dependency that buys nothing here.
-  - **`browse` is not in `manifest/tools.json`.** It follows the Ghidra/LLM
-    provisioner pattern (its own `install-browse.ps1`, outside the catalog), so
-    the manifest never learns about it and the smoke test's Phase-1 binary sweep
-    cannot see it. The dedicated `browse` group in `smoke-test.ps1` covers it
-    instead, which is stronger than a presence check - but the asymmetry is worth
-    a decision rather than an accident.
-
----
-
-## Post-merge audit, 2026-09-11 - deferred findings
-
-Three read-only audits over the 22 pushed commits. What they found and I fixed is in the commit
-log; this is what they found and I did **not** fix, with the reason.
-
-### The suites never run under Set-StrictMode, and three defences are written against it
-
-`Set-StrictMode -Version Latest` is set in `bootstrap.ps1`, `fresh-toolbox-setup-runner.ps1`,
-`gui/toolbox-gui.ps1`, `build-devtoolbox.ps1`, `install-llm.ps1`, `install-machine-scope.ps1` and
-`uninstall-toolbox.ps1` - and in **none** of the five suites, nor `run-gate.ps1`, nor
-`smoke-test.ps1`, nor `consolidate-path.ps1`. Both runners launch suites via
-`powershell.exe -File`, and strict mode does not cross a process boundary.
-
-So these comments describe a production condition the gate never reproduces:
-
-- `lib/ShimPlan.ps1` - "reading a property a ConvertFrom-Json object does not have THROWS"
-- `lib/ShimPlan.ps1` - "`$x = if (...) { @($one) }` yields a SCALAR ... Bit us here on the 44 sole names"
-- `lib/path-registry.ps1` - "the runner sets Set-StrictMode ... so a later `.Count` throws"
-
-The production claim is half-true: `fresh-toolbox-setup-runner.ps1` invokes `consolidate-path.ps1`
-in-process with `&`, so strict mode does propagate there - but the repair path the script itself
-prints (`-RebuildShims`) and the README instructions run it directly, with no strict mode. Adding
-`Set-StrictMode -Version Latest` to the suites would turn three arguments into three tested
-properties at no behavioural cost. Deferred only because it is a behaviour change to all five
-suites and this was already a long day.
-
-### lib/AgentDiscovery.ps1's allowlist is blind to method calls, and skips two arguments entirely
-
-The file executes source it extracted from `lib/common.ps1`, and guards that with an allowlist of
-one command (`Join-Path`), on the stated principle "refuse anything outside the allowlist rather
-than run it and hope". Two holes, both measured:
-
-- The walk filters on `CommandAst`. A static method call produces **zero** `CommandAst` nodes -
-  `InvokeMemberExpressionAst` is a disjoint branch of the hierarchy - so
-  `[IO.File]::ReadAllText(...)`, `[Environment]::SetEnvironmentVariable(...)` and
-  `[Diagnostics.Process]::Start(...)` all pass the allowlist and reach `[scriptblock]::Create`.
-- The two positional arguments of each `Write-AgentBlock` call are lifted as raw extent text and
-  spliced into the generated source without any allowlist check at all.
-
-Nothing fires today: `Write-AgentDiscovery`'s three assignments use only `Join-Path`, a plain
-`if/else` over two env vars, and a here-string with no `$( )` subexpressions. But the guard exists
-entirely for the future edit, and for the two most obvious future edits it is decorative. The file
-says "extraction fails closed instead; shadowing fails open" - for method calls it fails open.
-
-Same construction with no guard at all: `tests/Invoke-InstallerTests.ps1` lifts two assignments out
-of `smoke-test.ps1` and runs them through `Invoke-Expression`, on every gate run.
-
-### Remove-MachinePathEntry does not expand-to-compare, unlike its user-scope sibling
-
-`Add-UserPathEntry` and `Remove-UserPathEntry` expand entries for COMPARISON and re-emit the raw
-text, so a hand-written `%LOCALAPPDATA%\...` entry is recognised. `Remove-MachinePathEntry`
-compares raw-to-raw. Not a live bug - both callers derive the path from an env var as an absolute
-literal - but it would silently return `NotPresent` for a hand-edited `%VAR%` machine entry.
-
-### smoke-test.ps1's PATH length check cannot fire on a fresh profile
-
-`GetEnvironmentVariable('PATH','User')` returns `$null` when `HKCU\Environment\Path` does not
-exist, which is common on a newly created profile. `.TrimEnd(';')` on it then throws "You cannot
-call a method on a null-valued expression". `smoke-test.ps1` sets neither `Stop` nor `StrictMode`,
-so it prints red and continues - meaning the **4095-char truncation check never runs on exactly
-the machine most likely to need it**, and this repo ships a public `irm | iex` bootstrap. Every
-other consumer guards correctly (`Sync-EnvPath` filters with `Where-Object { $_ }`, `Get-RawPath`
-passes `''` as the default). This one dereference is unguarded.
-
-### ~~modules/security.ps1's USN probe reports a problem on every unelevated run~~ WRONG, corrected 2026-09-11
-
-**The premise does not hold.** This entry claimed `fsutil usn queryjournal C:` requires elevation,
-so the probe throws into an empty catch and the module reports "USN journal unreadable on C:" every
-time. Measured unelevated on 2026-09-11: it exits **0** and reports a **2,048 MB** journal, well
-over the module's 1 GB floor. No false problem is reported, and the empty catch is not being hit.
-
-Left standing from the entry: `C:` is still the only hardcoded system volume in a module -
-`install-deletion-forensics.ps1` correctly parameterises `$Volume`, and `$env:SystemDrive` would
-remove the assumption. That part is real and still open.
-
-Worth keeping as a record of the failure mode: the claim was plausible (fsutil *does* need
-elevation for most of its verbs), was never checked, and sat in the backlog long enough to be
-cited as a known issue. One command settled it.
-
-### Write-only diagnostic keys
-
-`lib/ShimPlan.ps1`'s shim-sources document writes `mode`, `priority_source`, `captured_at`, the
-`kept` block and `contested[].resolve_with`; the only reader consumes `priority_order` alone.
-`ForensicsReport.Core.ps1`'s baseline writes `key`, `firstSeen` and `updated`, never read back.
-These are human forensics rather than dead config, and deliberately kept - the same reasoning
-recorded at `Add-WinManifest` for `group` and `notes`. Listed so a future audit does not re-raise
-them as dead.
-
-### ~~Orphans~~ RESOLVED 2026-09-11, both decided rather than deleted
-
-`docs/fresh-workstation-audit.md` had zero inbound references. **Not deleted**, because only its
-"Findings resolved" section was historical: the "Remaining deliberate limitations" and the
-Go/no-go gate are still live, and the gate is the natural checklist for
-`tasks/fresh-toolbox-setup.md`. It now carries a dated how-to-read header, its gate step 2 says
-`run-gate.ps1` instead of `smoke-test.ps1`, and `tasks/fresh-toolbox-setup.md` section 5 links to
-it. Deleting a document to clear an orphan warning would have thrown away the content that made
-it worth keeping.
-
-`scripts/install-whisper.ps1` is genuinely manual-only: absent from `catalog.json`, from
-`docs/tools-reference.md`, and from every code path including the GUI, whose prose claims it
-shells out to `install-*.ps1` but in fact hard-codes only `uninstall-toolbox.ps1`. **Kept and
-labelled**: the README layout block now says "manual only; nothing invokes it", which is the
-honest state. Wiring it in as an opt-in switch beside `-InstallGhidra` / `-InstallLlm` is the
-open option if it is ever wanted.
-
-### `consolidate-path.ps1` writes a file whose name asserts the opposite of the truth
-
-`consolidate-path.ps1:535-538` writes `logs/machine-path-pending.txt` on the "Elevation required -
-NOTHING has been changed" branch. Nothing reads it and nothing deletes it, so after the elevated
-child succeeds seconds later the file remains, claiming a PATH change is pending that has already
-been applied. Deleted the stale copy 2026-09-11; the writer is unfixed. It should either remove
-the file after a successful elevated run or be renamed `machine-path-intended-<timestamp>.txt`.
-Same class as the log-line-that-cannot-fail: a filename is an assertion, and this one cannot be
-false.
-
-### `logs/` holds three INPUTS inside an ignored directory, with no stated retention
-
-`path-backup-*.json` is read by `-Restore` and `-FromBackup`, and five separate places in the repo
-record that `path-backup-20260909-203021.json` is the **only surviving record** of the 27-directory
-PATH order from the 2026-09-09 outage. `shim-sources.json` is the shim provenance fallback.
-`gate-phases.log` is the ledger `run-gate.ps1` compares against; delete it and drift detection
-silently restarts with no baseline. All three sit in a gitignored directory that nothing prunes
-and that a "clear the logs" instinct would empty. The README now says so, but the durable fix is
-to move these out of `logs/` into a directory whose name does not invite deletion.
-
-## Closing the consolidation round, 2026-09-11
-
-### ~~PATH carried two entries in both hives~~ FIXED
-
-`Add-UserPathEntry` only ever read the user hive, so every `bootstrap.ps1` run re-added the
-toolbox `native\bin` and `sysinternals` entries that the machine hive already carried. Windows
-composes machine-then-user, so neither user copy has ever won a lookup - removing them cannot
-change which `ffmpeg` or `rg` answers. Measured before changing anything: `user:1 machine:1` for
-both. Fixed with a new pure `Test-PathListProvides`, and both entries added to
-`config/path-hygiene.json` as `duplicate-in-machine`.
-
-**The order matters and is asserted by a test.** Adding those config entries is only safe
-BECAUSE of the guard: without it, `-Prune` removes the user copies and the next bootstrap run
-puts them straight back, and the two halves of this repo undo each other forever. The test
-asserts ORDER AND EFFECT, not presence, because a `Test-PathListProvides` call sitting anywhere
-in the function satisfies "the guard exists" while deciding nothing.
-
-### `config/path-hygiene.json` carries one entry that is already gone
-
-`%ProgramFiles%\Common Files\Oracle\Java\javapath` is in neither hive now. This is benign and
-self-reporting - `Get-PathHygienePlan` skips it with "not on the machine PATH any more" - and it
-is left in place deliberately, since the predicate is re-measured every run and the entry earns
-its place back the moment an Oracle JRE installer recreates it. Noted so the next reader does not
-mistake the skip line for a failure.
-
-### ~~The ledger hard-failed on a test count going UP~~ FIXED
-
-Any change to a unit-suite count failed the gate. The ledger's own history was the argument
-against it: `installer` went 38 -> 76 -> 79 -> 99 across four phases in one day, every one a
-DRIFT that had to be waved through, and a gate that is routinely waved through stops being read.
-A DECREASE still hard-fails; an INCREASE is a TRANSITION with the delta. Fails closed on `?`.
-
-### `subprocess.run(timeout=)` cannot kill a grandchild holding the pipe
-
-Hit twice today while scripting mutation runs in Python. `subprocess.run(..., capture_output=True,
-timeout=N)` against `powershell.exe` hangs past the timeout whenever the child spawns its own
-child that inherits the stdout handle: the timeout kills the direct child, then the parent blocks
-forever reading a pipe that the surviving grandchild still holds open. Redirect to a **file**
-instead of a pipe and the timeout behaves. Every mutation harness in `scratchpad/` does this now.
-Worth knowing before the next agent writes one.
-
-### The perf audit's numbers were optimistic where they were checkable
-
-Two audit figures were reproduced this round and neither held. `ConvertTo-FxHtml` was predicted at
-1,059 -> 17 ms (61x); measured twice it is 1,654 / 1,440 -> 117 / 119 ms (12-14x), because the
-audit timed bare `.Replace()` chains without the per-field `[string]` cast and empty check that
-preserve behaviour. The earlier BACKLOG figure for the same item, "694 ms / 12,000 calls",
-predated the command-line title and understated its own finding by a third. **Audit figures are a
-place to look, not a result to cite.** Reproduce before recording.
-
-## Deferred
-
-- ~~Find a supported install channel for watchexec on Windows. It is not currently available in
-  winget.~~ **The premise is false as of 2026-09-11:** `winget search watchexec` returns
-  `watchexec.watchexec` 2.7.0 from the `winget` source. The exact-id lookup only failed because
-  the id is `watchexec.watchexec`, not `watchexec`. This is no longer research; it is a
-  `catalog.json` entry whenever somebody wants the tool.
-- Add native Windows ARM64 support; the current builder and optional JDK/Ghidra path target x64 Windows.
-- Evaluate a tested Python constraints/lock strategy without preventing routine security updates.
+- `install-machine-scope.ps1`: the per-package scope override moved into `catalog.json` this round
+  as a top-level `machine_scope_overrides` block, keyed by winget id. It is keyed by id and not by a
+  `tools[]` field because 7 of the 10 `machine_scope_ids` have no `tools[]` entry at all - they are
+  stage-1 natives from `build-devtoolbox.ps1` - so a `tools[]`-only read would have been unreachable
+  code. If more per-package install knobs appear, they belong in the same block.
