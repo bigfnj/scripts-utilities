@@ -262,6 +262,100 @@ It 'a catalog with NO schema_version at all is REJECTED' {
     $rejected
 }
 
+Write-Host "`n== per-package scope overrides live in catalog.json, not in the script ==" -ForegroundColor Cyan
+
+# install-machine-scope.ps1 carried a hardcoded $NoScopeFlag array of winget ids while the ids
+# it applies to came from catalog.json's machine_scope_ids - two lists, one file apart, with
+# nothing able to notice them disagreeing. The override is now data. These checks assert the
+# WIRING and the DATA; the argv itself is verified by hand, because the script's `winget list`
+# probe runs BEFORE its -DryRun branch, so executing it from a test would put a winget source
+# query in the suite.
+#
+# No parse check on this file here: smoke-test.ps1 already parses every .ps1 in the repo under
+# 5.1 and names the file that fails, and a second copy could not be mutated to exactly one
+# failure - a broken parse takes the AST check below down with it.
+$msoPath = Join-Path $repoRoot 'scripts\install-machine-scope.ps1'
+$msoTok = $null; $msoErr = $null
+$msoAst = [System.Management.Automation.Language.Parser]::ParseFile($msoPath, [ref]$msoTok, [ref]$msoErr)
+
+It 'the shipped catalog declares a no_scope_flag override and it round-trips as a boolean' {
+    # A JSON "true" that deserialises to the STRING 'true' would still be truthy in the script
+    # and would still work - until someone wrote "false", which is also a truthy string. The
+    # type is the thing worth pinning, not just the presence.
+    $script:CatalogOverride = $null
+    $ov = (Get-Catalog).machine_scope_overrides
+    $wdk = $ov.'Microsoft.WindowsWDK.10.0.26100'
+    ($null -ne $ov) -and ($null -ne $wdk) -and ($wdk.no_scope_flag -is [bool]) -and ($wdk.no_scope_flag -eq $true)
+}
+It 'no no_scope_flag override names an id the machine-scope run never visits' {
+    # An override keyed to an id absent from machine_scope_ids does nothing at all, and looks
+    # exactly like one that works. Comment keys ($-prefixed) are not ids and are skipped here
+    # the same way the script skips them.
+    $script:CatalogOverride = $null
+    $cat = Get-Catalog
+    $ids = @($cat.machine_scope_ids)
+    $orphans = @()
+    foreach ($p in $cat.machine_scope_overrides.PSObject.Properties) {
+        if ($p.Name.StartsWith('$')) { continue }
+        if ($ids -notcontains $p.Name) { $orphans += $p.Name }
+    }
+    $orphans.Count -eq 0
+}
+It 'install-machine-scope.ps1 never assigns $NoScopeFlag a hardcoded package id' {
+    # THE CONDITION, not the presence of a catalog read: a script that reads the catalog AND
+    # kept the old array would sail through a "does it mention machine_scope_overrides" check
+    # while behaving exactly as before. So walk every assignment whose target is $NoScopeFlag
+    # and reject any that contains a string literal SHAPED LIKE a winget id (dotted, e.g.
+    # Microsoft.WindowsWDK.10.0.26100).
+    #
+    # Matched on the shape rather than on a fixed list of ids, so a hardcoded id nobody
+    # predicted still fails. Measured against the AST rather than the text because `@('x')`
+    # with one element is an ArrayExpressionAst, NOT an ArrayLiteralAst - a check written
+    # against array literals would have missed the single-entry list this replaced.
+    #
+    # `= @()` contributes no string constants, and `+= [string]$p.Name` contributes only the
+    # member name 'Name', which is not dotted. Restoring
+    # `$NoScopeFlag = @('Microsoft.WindowsWDK.10.0.26100')` fails.
+    $idShape = '^[A-Za-z0-9_-]+(\.[A-Za-z0-9_.-]+)+$'
+    $bad = @()
+    foreach ($a in $msoAst.FindAll({ param($n)
+                $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
+        if ("$($a.Left.Extent.Text)" -ne '$NoScopeFlag') { continue }
+        foreach ($c in $a.Right.FindAll({ param($n)
+                    $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true)) {
+            if ("$($c.Value)" -match $idShape) { $bad += "$($c.Value)" }
+        }
+    }
+    $bad.Count -eq 0
+}
+It 'the script never asks catalog.json for a key catalog.json does not have' {
+    # The remaining drift axis is a RENAME on either side, which does not throw: a missing
+    # property reads as $null under this file's own strict mode and the override silently stops
+    # applying - putting --scope machine back on a package that answers 0x8A150010.
+    #
+    # DERIVED, not a fixed list of key names, so it covers installer_type and machine_scope_ids
+    # too and keeps covering whatever is added next. Collected from the AST rather than the
+    # file text because comments are not in the AST, so prose naming an old key cannot create a
+    # false positive. Measured 2026-09-17: 4 references, 32 catalog keys, 0 unknown.
+    $script:CatalogOverride = $null
+    $shape = '^[a-z][a-z0-9]*(_[a-z0-9]+)+$'
+    $refs = @{}
+    foreach ($n in $msoAst.FindAll({ param($x)
+                $x -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true)) {
+        if ("$($n.Value)" -match $shape) { $refs["$($n.Value)"] = $true }
+    }
+    foreach ($n in $msoAst.FindAll({ param($x)
+                $x -is [System.Management.Automation.Language.MemberExpressionAst] }, $true)) {
+        $m = "$($n.Member.Extent.Text)".Trim("'", '"')
+        if ($m -match $shape) { $refs[$m] = $true }
+    }
+    # Every key at every depth of the shipped catalog, straight out of the JSON text.
+    $raw = [IO.File]::ReadAllText((Get-CatalogPath))
+    $keys = @([regex]::Matches($raw, '"([A-Za-z_][A-Za-z0-9_]*)"\s*:') | ForEach-Object { $_.Groups[1].Value })
+    # A positive control: this check is worthless if the script turns out to reference nothing.
+    $unknown = @($refs.Keys | Where-Object { $keys -notcontains $_ })
+    ($refs.Count -ge 2) -and ($keys -contains 'no_scope_flag') -and ($unknown.Count -eq 0)
+}
 Write-Host "`n== consent-facing descriptions must match what is installed ==" -ForegroundColor Cyan
 
 It 'cli-tools_desc names every tool in the cli-tools catalog group' {

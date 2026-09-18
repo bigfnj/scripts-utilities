@@ -189,6 +189,10 @@
     "Microsoft.WindowsWDK.10.0.26100",
     "Nvidia.CUDA"
   ],
+  "machine_scope_overrides": {
+    "$comment": "Per-package winget overrides for scripts/install-machine-scope.ps1, keyed by winget id. no_scope_flag=true means omit --scope entirely and let winget use the package's own default, which for these packages IS machine scope: the WDK returns 0x8A150010 when --scope machine is passed even though it installs to machine-scope paths. This lived as a hardcoded $NoScopeFlag array in the script, which could disagree with machine_scope_ids here without anything noticing. Keyed by id rather than set on a tools[] entry because 7 of the 10 machine_scope_ids - the WDK among them - have NO tools[] entry at all (they are stage-1 natives from scripts/build-devtoolbox.ps1), so a tools[] field would have been unreachable for the only id that needs it. machine_scope_ids itself stays a flat array of strings: install-machine-scope.ps1 and scripts/smoke-test.ps1 both index it that way. Keys beginning with $ are comments, not package ids.",
+    "Microsoft.WindowsWDK.10.0.26100": { "no_scope_flag": true }
+  },
   "llm": {
     "$comment": "Optional local-LLM stack, provisioned by scripts/install-llm.ps1 (opt-in, not a default group). Ollama is the only runtime implemented; llama.cpp is an opt-in alternative (see BACKLOG) and is NOT selectable from here. Model pulls are VRAM-tiered so an 8 GB box does not waste disk on models it cannot run. There is no embedding-fallback list: nothing implements one, and the two models it used to name were not in models_base, so it read as a capability that did not exist.",
     "endpoint": "http://127.0.0.1:11434/v1",
