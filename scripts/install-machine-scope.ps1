@@ -131,29 +131,49 @@ if (-not $winget) {
 }
 Log "winget: $winget"
 
-# Some packages fail with 0x8A150010 when --scope machine is passed even though
-# they install to machine-scope paths. Omit --scope for these IDs entirely and
-# let winget use its own default (which for these packages IS machine scope).
-$NoScopeFlag = @(
-    'Microsoft.WindowsWDK.10.0.26100'
-)
-
-# A manifest that ships several installers may default to the wrong one, so the catalog entry can pin it.
-# Read from catalog.json rather than hardcoded here, so the pin lives in one place with the tool it belongs
-# to. Microsoft.PowerShell is the only user today: winget 7.6.0+ defaults that id to the MSIX, which is
-# single-user and sandboxes $PSHOME, and only the wix (MSI) installer is machine-scope at all.
+# Per-package winget overrides, read from catalog.json rather than written down here so the
+# script and the catalog cannot drift. One Get-Catalog read, one warning, because both
+# overrides come from the same file and a partial answer is not useful for either.
+#
+# no_scope_flag - some packages fail with 0x8A150010 when --scope machine is passed even
+#   though they install to machine-scope paths, so --scope is omitted entirely and winget uses
+#   the package's own default (which for these packages IS machine scope). This was a
+#   hardcoded $NoScopeFlag array here, which could disagree with machine_scope_ids in
+#   catalog.json without anything noticing. It is keyed by winget id under
+#   machine_scope_overrides and NOT set on a tools[] entry: 7 of the 10 machine_scope_ids are
+#   stage-1 natives from build-devtoolbox.ps1 with no tools[] entry at all, and the WDK - the
+#   only id carrying the flag today - is one of them, so a tools[] field would have been
+#   unreachable for the one case that needs it.
+# installer_type - a manifest that ships several installers may default to the wrong one, so
+#   the catalog entry can pin it. Microsoft.PowerShell is the only user today: winget 7.6.0+
+#   defaults that id to the MSIX, which is single-user and sandboxes $PSHOME, and only the wix
+#   (MSI) installer is machine-scope at all.
+$NoScopeFlag    = @()
 $installerTypes = @{}
 try {
-    foreach ($t in (Get-Catalog).tools) {
+    $catalog = Get-Catalog
+    foreach ($t in $catalog.tools) {
         if ($t.PSObject.Properties['installer_type'] -and $t.installer_type) {
             $installerTypes[[string]$t.id] = [string]$t.installer_type
         }
     }
+    if ($catalog.PSObject.Properties['machine_scope_overrides']) {
+        foreach ($p in $catalog.machine_scope_overrides.PSObject.Properties) {
+            # Keys beginning with $ are the block's own comments, not package ids.
+            if ($p.Name.StartsWith('$')) { continue }
+            if ($p.Value.PSObject.Properties['no_scope_flag'] -and $p.Value.no_scope_flag) {
+                $NoScopeFlag += [string]$p.Name
+            }
+        }
+    }
 }
 catch {
-    Log "WARN could not read installer_type pins from catalog.json: $($_.Exception.Message)"
-    Log "WARN continuing WITHOUT installer pins - a pinned package may install the wrong installer type"
+    Log "WARN could not read per-package overrides from catalog.json: $($_.Exception.Message)"
+    Log "WARN continuing WITHOUT them - a pinned package may install the wrong installer type, and a package that rejects --scope machine will fail with 0x8A150010"
 }
+# Logged on EVERY run, not only when something is wrong: the whole point of moving this out of
+# the script is that the value now comes from a file, so the value it read has to be visible.
+Log "no --scope flag for (from catalog.json): $(if ($NoScopeFlag.Count) { $NoScopeFlag -join ', ' } else { '(none)' })"
 
 $failures = @()
 $alreadyCount = 0
