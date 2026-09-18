@@ -2865,6 +2865,71 @@ It 'Find-Executable refuses a non-executable that Get-Command finds on PATH' {
     ($null -eq $got.Readme) -and ($got.Real -eq (Join-Path $onPath 'zzreal.exe'))
 }
 
+It 'Find-Executable refuses its OWN shim directory, so a wrapper cannot target itself' {
+    # THE REGRESSION TEST FOR A LOOP THAT SHIPPED, and the one the neighbouring tests cannot catch.
+    #
+    # native\bin is on PATH by design. Once a wrapper exists there, Get-Command finds IT before the
+    # real binary, and New-CmdWrapper wraps whatever came back - so the shim's target becomes the
+    # shim. Measured on this box 2026-09-18: qpdf.cmd re-entered itself and `qpdf --version` forked
+    # cmd.exe until it was killed, while the real qpdf sat in "C:\Program Files\qpdf 12.3.2\bin".
+    #
+    # What makes it worth a test rather than a repair is that it is SELF-PERPETUATING and it
+    # reported success the whole time. Every build re-resolved the shim, re-wrote the same
+    # self-reference, and printed OK. scripts\smoke-test.ps1's stale-shim check also passed
+    # throughout, because it asks whether the target EXISTS and the target did exist - it was the
+    # shim. That check now has a self-reference arm beside it; this one stops the shim being
+    # written in the first place.
+    #
+    # The fixture puts the real binary under a VERSION-STAMPED ProgramFiles directory on purpose.
+    # That is the shape a $CommandSearchPatterns entry cannot pin without going stale at the next
+    # upgrade, which is why the fix is to skip our own shim and let the exhaustive fallback walk
+    # ProgramFiles, rather than to add a literal path for qpdf.
+    $defs = Get-BuilderFnScope -Name 'Find-Executable'
+    if (-not $defs) { Write-Host "       Find-Executable is gone" -ForegroundColor DarkYellow; return $false }
+
+    $fix = Join-Path $bdRoot ('selfshim-' + [guid]::NewGuid().ToString('N'))
+    $tb = Join-Path $fix 'toolbox'
+    $bin = Join-Path $tb 'native\bin'
+    New-Item -ItemType Directory -Path $bin -Force | Out-Null
+    # The shim that must NOT win, despite being on PATH with a runnable extension.
+    Set-Content -LiteralPath (Join-Path $bin 'zzqpdf.cmd') -Value 'fixture' -Encoding ASCII
+    $realDir = Join-Path $fix 'zzqpdf 9.9.9\bin'
+    New-Item -ItemType Directory -Path $realDir -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $realDir 'zzqpdf.exe') -Value 'fixture' -Encoding ASCII
+
+    $savedPath = $env:PATH; $savedPf = $env:ProgramFiles; $savedPf86 = ${env:ProgramFiles(x86)}
+    $savedLocal = $env:LOCALAPPDATA
+    try {
+        $got = & {
+            param($Defs, $Fix, $Tb, $Bin)
+            . $Defs
+            $Root = $Tb
+            $CommandSearchPatterns = @{}
+            $env:PATH = $Bin
+            $env:ProgramFiles = $Fix
+            ${env:ProgramFiles(x86)} = $Fix
+            $env:LOCALAPPDATA = $Fix
+            [pscustomobject]@{
+                ShimSeenByGetCommand = [bool](Get-Command 'zzqpdf' -ErrorAction SilentlyContinue)
+                Resolved             = (Find-Executable -Name 'zzqpdf' -WingetId '')
+            }
+        } $defs $fix $tb $bin
+    } finally {
+        $env:PATH = $savedPath; $env:ProgramFiles = $savedPf; ${env:ProgramFiles(x86)} = $savedPf86
+        $env:LOCALAPPDATA = $savedLocal
+    }
+
+    # A POSITIVE CONTROL ON THE PREMISE. If Get-Command stops resolving the fixture shim, the guard
+    # is never reached and this test would pass for ever while covering nothing.
+    if (-not $got.ShimSeenByGetCommand) {
+        Write-Host "       Get-Command no longer finds the fixture shim - this test now proves nothing" -ForegroundColor DarkYellow
+        return $false
+    }
+    $want = Join-Path $realDir 'zzqpdf.exe'
+    if ($got.Resolved -ne $want) { Write-Host ("       resolved to: {0}" -f $got.Resolved) -ForegroundColor DarkYellow }
+    $got.Resolved -eq $want
+}
+
 Remove-Item -LiteralPath $bdRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host "`n== the shim writers and the gates that notice when one stops running ==" -ForegroundColor Cyan

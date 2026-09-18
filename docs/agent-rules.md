@@ -112,6 +112,28 @@ entries set `machineScope = $true` and may prompt for UAC. Do not add an
 unconditional fallback from user scope to machine scope; verify the current
 official manifest and mark the individual package deliberately.
 
+**A machine-scope native also has to be FINDABLE, and that is the second half people miss.**
+`Find-Executable` walks `%LOCALAPPDATA%\Microsoft\WinGet\Packages` for the package it just
+installed, and a machine-scope install is never there - it lands under `%ProgramFiles%`. So each
+of those six needs one of:
+
+- a `$CommandSearchPatterns` entry in `scripts/build-devtoolbox.ps1` - `soffice`, `tesseract` and
+  `7z` have one; or
+- an installer that puts its own directory on PATH - ImageMagick and Node.js do this themselves.
+
+QPDF had **neither** until 2026-09-18, and the symptom was not a missing tool but a hanging one.
+`native\bin` is on PATH by design, so `Get-Command qpdf` found the wrapper, the builder wrapped
+the wrapper, and `qpdf` re-entered itself and forked `cmd.exe` until it was killed - while the
+real binary sat unused in `%ProgramFiles%\qpdf 12.3.2\bin`. It was self-perpetuating: every build
+re-resolved the shim and printed `OK`. `Find-Executable` now refuses its own shim directory and
+`scripts/smoke-test.ps1` fails on a self-referential shim, so neither can recur silently.
+
+Any entry you add there must be **version-free**. QPDF installs to `%ProgramFiles%\qpdf <version>`,
+so a literal path would go stale at the next upgrade and become the stale shim the smoke test
+exists to catch - which is why the fix was to let the exhaustive `%ProgramFiles%` walk find it
+rather than to pin a path. Check the install directory first: if it carries a version, do not add
+an entry.
+
 To collapse those per-package UAC prompts into a single elevation, run
 `scripts/install-machine-scope.ps1` once with an admin/SYSTEM token before the
 normal-user bootstrap. It installs exactly the machine-scope IDs (plus

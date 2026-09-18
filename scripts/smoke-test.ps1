@@ -290,6 +290,16 @@ if (Test-Path $tbRoot) {
     # than a missing wrapper, because the tool looks installed.
     if (Test-Path $nativeBin) {
         $stale = @()
+        # A SHIM THAT TARGETS ITSELF, which "the target exists" cannot catch - the target is the
+        # shim, so it always exists and the check above passed for four builds while the tool hung.
+        #
+        # Found 2026-09-18: qpdf.cmd's body was its own full path, so `qpdf --version` forked
+        # cmd.exe until it was killed. This is a DIFFERENT failure from a stale target and needs
+        # its own list, because the remedy differs - a stale target wants the path re-resolved,
+        # a self-reference means Find-Executable resolved to native\bin itself and the shim has to
+        # be rewritten from the real binary. See scripts\build-devtoolbox.ps1's Find-Executable
+        # for the guard that stops it being re-created.
+        $selfRef = @()
         foreach ($w in Get-ChildItem -LiteralPath $nativeBin -Filter '*.cmd' -File -ErrorAction SilentlyContinue) {
             # Get-ShimTarget (lib\ShimFormat.ps1) rather than a local copy of the regex. Already in
             # scope with no new dot-source: :15 loads lib\common.ps1, which loads ShimFormat.ps1 at
@@ -309,12 +319,27 @@ if (Test-Path $tbRoot) {
             # three-line Ghidra wrapper with set "JAVA_HOME=..." in the middle, so the wrong reader
             # loses Ghidra first and without a word.
             $target = Get-ShimTarget -Lines @(Get-Content -LiteralPath $w.FullName -ErrorAction SilentlyContinue)
-            if ($target -and -not (Test-Path -LiteralPath $target)) { $stale += "$($w.BaseName) -> $target" }
+            if (-not $target) { continue }
+            # Normalised both sides: the shim body is whatever Find-Executable returned, and
+            # Get-ChildItem hands back a full path, so a raw -ieq would miss a trailing-slash or
+            # short-name spelling of the same file.
+            $isSelf = $false
+            try {
+                $isSelf = ([IO.Path]::GetFullPath($target).TrimEnd('\') -ieq
+                           [IO.Path]::GetFullPath($w.FullName).TrimEnd('\'))
+            } catch { $isSelf = $false }
+            if ($isSelf) { $selfRef += "$($w.BaseName) -> itself" }
+            elseif (-not (Test-Path -LiteralPath $target)) { $stale += "$($w.BaseName) -> $target" }
         }
         if ($stale.Count -eq 0) { Test-Ok "all native\bin shims resolve to an existing target" }
         else {
             Test-Fail "$($stale.Count) stale shim(s) - target no longer exists (re-run .\scripts\consolidate-path.ps1):"
             $stale | Select-Object -First 8 | ForEach-Object { Write-Host "     $_" -ForegroundColor Red }
+        }
+        if ($selfRef.Count -eq 0) { Test-Ok "no native\bin shim points at itself" }
+        else {
+            Test-Fail "$($selfRef.Count) self-referential shim(s) - these fork cmd.exe forever when run (re-run .\scripts\build-devtoolbox.ps1):"
+            $selfRef | Select-Object -First 8 | ForEach-Object { Write-Host "     $_" -ForegroundColor Red }
         }
     }
     # The venv Scripts dir must NOT be on the persistent PATH - it holds python.exe,

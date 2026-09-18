@@ -661,8 +661,48 @@ function Find-Executable {
     # .ps1 stays handled below rather than being listed here: a PowerShell script is not
     # runnable as a bare native command, which is exactly why it is swapped for its .cmd shim.
     $runnable = '.exe', '.cmd', '.bat', '.com'
+
+    # AND IT MUST NOT BE THIS BUILD'S OWN SHIM. Same failure, second route.
+    #
+    # native\bin is on PATH by design, so once a wrapper exists there Get-Command finds IT rather
+    # than the real binary, and New-CmdWrapper then writes a shim whose target is itself. Measured
+    # on this box 2026-09-18: native\bin\qpdf.cmd's target line named qpdf.cmd itself, so running
+    # `qpdf --version` re-entered the same wrapper and forked cmd.exe until something killed it,
+    # while the real binary sat unused in "C:\Program Files\qpdf 12.3.2\bin".
+    # native_tooling_smoke_test.py had been recording it as a 30-second TimeoutExpired warning,
+    # which nobody read as a loop.
+    #
+    # (Described rather than quoted on purpose: tests\Invoke-InstallerTests.ps1 asserts the shim's
+    # target-line shape appears nowhere in this file outside New-CmdWrapper, and a comment that
+    # spells it out is still a second copy for a future edit to drift from. That test caught this
+    # comment's first draft.)
+    #
+    # It is SELF-PERPETUATING, which is what earns a guard rather than a one-off repair: every
+    # later build re-resolved the shim, re-wrote the same self-reference, and printed
+    # "OK qpdf -> ...\native\bin\qpdf.cmd" as though that confirmed something. Note also that
+    # scripts\smoke-test.ps1's stale-shim check PASSED throughout, because it asks whether the
+    # target exists and the target did exist - it was the shim.
+    #
+    # qpdf is the only package that hits this, and the reason is a half-applied pattern rather
+    # than bad luck. A machine-scope winget package is invisible to the package walk above (that
+    # reads %LOCALAPPDATA% only), so it needs either a $CommandSearchPatterns entry - soffice,
+    # tesseract and 7z have one - or an installer that puts itself on PATH, as ImageMagick and
+    # Node do. qpdf is the one machine-scope package with NEITHER.
+    #
+    # Deliberately NOT fixed by adding qpdf to $CommandSearchPatterns: its install directory
+    # carries the version ("qpdf 12.3.2"), winget already offers 12.4.1, and a version-stamped
+    # literal is precisely the stale shim the smoke check exists to catch. Every entry in that
+    # table is version-free for that reason. Skipping our own shim costs nothing instead, because
+    # the exhaustive fallback below walks $env:ProgramFiles and handles version-stamped
+    # directories fine - it is how magick resolves into ImageMagick-7.1.2-Q16-HDRI today.
+    $shimDir = [IO.Path]::GetFullPath((Join-Path $Root "native\bin")).TrimEnd('\')
     $cmd = Get-Command $Name -ErrorAction SilentlyContinue
-    if ($cmd -and $cmd.Source -and (Test-Path $cmd.Source)) {
+    $cmdIsOwnShim = $false
+    if ($cmd -and $cmd.Source) {
+        $srcDir = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($cmd.Source))
+        $cmdIsOwnShim = [bool]($srcDir -and ($srcDir.TrimEnd('\') -ieq $shimDir))
+    }
+    if ($cmd -and $cmd.Source -and -not $cmdIsOwnShim -and (Test-Path $cmd.Source)) {
         $ext = [IO.Path]::GetExtension($cmd.Source)
         if ($ext -ieq ".ps1") {
             $cmdShim = [IO.Path]::ChangeExtension($cmd.Source, ".cmd")
