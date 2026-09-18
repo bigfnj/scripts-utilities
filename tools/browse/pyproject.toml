@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "toolbox-browse"
-version = "0.2.0"
+version = "0.3.0"
 description = "Escalating web fetch for agent-driven research on the Windows dev toolbox"
 requires-python = ">=3.11"
 

@@ -125,6 +125,25 @@ CHALLENGE_MARKERS = (
     ("akamai", "reference #18."),
 )
 
+# r.jina.ai's own refusal codes, named from the STATUS rather than scanned from the body.
+#
+# Deliberately not diagnose(): running CHALLENGE_TEXT over Jina's markdown envelope is
+# exactly the false-positive class diagnose()'s own header documents, where an article
+# ABOUT bot detection was once reported as a DataDome challenge. These codes are
+# unambiguous, so there is nothing to guess at.
+#
+# THE `reader-` PREFIX IS LOAD-BEARING, and emit() branches on it. A refusal by the reader
+# SERVICE says nothing about the target site, so the standing advice - clear the challenge
+# once in the live browser - is wrong for these: no amount of clearing fixes someone
+# else's quota. Only 451 is the target itself refusing, and it still routes through the
+# reader- branch because Jina, not the site, is who told us.
+READER_REFUSAL = {
+    401: "reader-unauthorized",
+    402: "reader-quota-or-payment",
+    429: "reader-rate-limited",
+    451: "reader-target-refused",
+}
+
 # Below this many extracted characters a 2xx is THIN: possibly a JS shell or a
 # nav-only render rather than the page. Thin is a reason to try the next rung, and
 # explicitly NOT a failure - the first version of this file treated it as one, and
@@ -239,6 +258,22 @@ def journal_save(host: str, rung: str) -> None:
     except OSError as exc:
         # Losing the journal costs a re-discovery, not a fetch. Never fatal.
         print(f"browse: could not write journal ({exc})", file=sys.stderr)
+
+
+def journal_rung(attempts: list["Result"], fallback: str) -> str:
+    """Which rung should this host be REMEMBERED as, given everything that was tried?
+
+    The cheapest rung that actually returned the page, which is not the same question as
+    "which rung returned the most text". run() needs both answers and used to conflate
+    them into one variable: the most verbose result is right for what to PRINT, and wrong
+    for what to remember.
+
+    A function rather than an inline next() so the selftest can exercise it directly. The
+    alternative was a test that re-spelled the expression, which tests a copy.
+
+    attempts is in rung order (cheapest first), so the first usable entry is the answer.
+    """
+    return next((a.rung for a in attempts if a.usable), fallback)
 
 
 # -- extraction ----------------------------------------------------------------
@@ -602,6 +637,14 @@ def fetch_reader(url: str, timeout: float) -> Result:
                 # indistinguishable from a rung that was never tried. Jina refuses
                 # with 401/402/429/451 depending on quota and target.
                 res.notes.append(f"reader refused: HTTP {r.status_code} and no text returned")
+                # AND NAME IT IN .challenge, the machine-readable field. This was left
+                # empty, so `--json` reported challenge="" right beside a note saying the
+                # reader had refused: anything checking the field saw "no block detected"
+                # while the human-readable note said the opposite. A field that disagrees
+                # with the note next to it is worse than no field.
+                res.challenge = READER_REFUSAL.get(
+                    r.status_code, f"reader-http-{r.status_code}"
+                )
     except Exception as exc:  # noqa: BLE001
         res.notes.append(f"reader failed: {type(exc).__name__}: {exc}")
     return res
@@ -688,10 +731,12 @@ def fetch_chrome(url: str, cdp: str, timeout: float, settle: float = 25.0) -> Re
 def selftest(cdp: str, timeout: float) -> int:
     """Only the extraction checks are allowed to fail the run.
 
-    A: extraction, offline, against the embedded fixture - once per AVAILABLE
-       extractor, not once for whichever one extract() happens to choose.
-       Deterministic, no network, and it CAN fail: break either extractor and
-       this is the check that says so. This is the one the smoke test relies on.
+    A: OFFLINE LOGIC, against embedded fixtures. Extraction once per AVAILABLE
+       extractor, not once for whichever one extract() happens to choose; the
+       reader envelope parse; which rung the journal remembers; and the reader
+       refusal naming that emit() branches on. Deterministic, no network, and all
+       of it CAN fail: break any of them and this is the check that says so. This
+       is the group the smoke test relies on.
     B: network reachability through rung 1.
     C: whether a CDP browser is up.
 
@@ -750,6 +795,40 @@ def selftest(cdp: str, timeout: float) -> int:
             f"stale_noted={reader_stale}"
         )
         print(f"           got: {reader_text[:120]!r}")
+
+    # WHICH RUNG THE JOURNAL REMEMBERS, offline. Logic, not network, so it belongs with
+    # the checks that are allowed to fail.
+    #
+    # The fixture is the observed example.com shape - every rung thin, the later one more
+    # verbose - because that is the only shape that reaches this branch. `direct` served
+    # the page; `reader` merely added envelope characters while disclosing the URL to a
+    # third party. Remembering `reader` for that is the bug.
+    thin_cheap = Result(url="https://fixture.invalid/", rung="direct", status=200, text="a" * 100)
+    thin_verbose = Result(url="https://fixture.invalid/", rung="reader", status=200, text="a" * 300)
+    chose = journal_rung([thin_cheap, thin_verbose], thin_verbose.rung)
+    if chose == "direct":
+        print("  OK       journal rung: remembers the cheapest rung that worked, not the wordiest")
+    else:
+        failures += 1
+        print(f"  FAIL     journal rung: remembered {chose!r}, wanted 'direct'")
+        print(
+            f"           direct returned {len(thin_cheap.text)} chars, "
+            f"reader {len(thin_verbose.text)} - both thin, so the cheapest wins"
+        )
+
+    # EVERY reader refusal name must carry the `reader-` prefix, because emit() branches on
+    # that prefix to choose its advice. An entry added without it silently falls into the
+    # other branch and tells the human to open a browser and clear a challenge that does
+    # not exist, in order to fix somebody else's quota.
+    unprefixed = sorted(v for v in READER_REFUSAL.values() if not v.startswith("reader-"))
+    if READER_REFUSAL and not unprefixed:
+        print(
+            f"  OK       reader refusals: {len(READER_REFUSAL)} named, "
+            "all carrying the prefix emit() branches on"
+        )
+    else:
+        failures += 1
+        print(f"  FAIL     reader refusal names missing the 'reader-' prefix: {unprefixed}")
 
     # The install command is install-browse.ps1 -WithExtras, NOT "bootstrap -Only
     # extras": both catalog entries are default:false, so a group run skips them
@@ -838,14 +917,29 @@ def run(args: argparse.Namespace) -> int:
             if learn:
                 journal_save(host, rung)
             break
-        if last.status == 402:
+        # A reader 402 is Jina's quota, not the target selling access, so it must NOT stop
+        # the remaining rungs - the site may serve the page directly or to a browser.
+        if last.status == 402 and last.rung != "reader":
             break
 
     if best.usable:
         if best.thin:
             best.notes.append(f"thin result ({len(best.text)} chars) - no rung did better")
         if learn and not journal_load().get(host):
-            journal_save(host, best.rung)
+            # THE FIRST USABLE RUNG, not the one that returned the most text.
+            #
+            # This branch runs only when EVERY rung came back thin, so the loop above never
+            # broke and never journalled. `best` is the most VERBOSE rung, which is the
+            # right answer for what to PRINT and the wrong one for what to REMEMBER: for a
+            # page legitimately shorter than MIN_TEXT, the cheapest rung that returned it is
+            # the rung to start at next time. Two purposes were sharing one variable.
+            #
+            # Observed 2026-09-17: example.com (~180 chars, thin by definition) was pinned
+            # to `reader` because Jina's envelope adds characters, even though `direct` had
+            # served the page perfectly. Every later fetch of that host then began at a rung
+            # that discloses the URL to a third party, to win a few characters.
+            #
+            journal_save(host, journal_rung(attempts, best.rung))
         emit(best, verdict, args)
         return EX_OK
 
@@ -854,8 +948,16 @@ def run(args: argparse.Namespace) -> int:
     # challenge, then rung 3 found no browser running, and the output said only
     # "no browser" - which reads as a local setup problem rather than as the site
     # refusing us. Notes from every rung are carried so nothing is lost.
-    blocked = next((a for a in attempts if a.challenge), None)
-    payment = next((a for a in attempts if a.status == 402), None)
+    # A TARGET-level challenge outranks a reader-service one. "cloudflare" tells you
+    # something about the site; "reader-quota-or-payment" only tells you about Jina. Now
+    # that a reader refusal sets .challenge, a plain next() would let a reader rung that
+    # happened to run first mask a real Cloudflare block found by a later rung.
+    blocked = next(
+        (a for a in attempts if a.challenge and not a.challenge.startswith("reader-")), None
+    ) or next((a for a in attempts if a.challenge), None)
+    # Reader 402s excluded, for the same reason as the break above: EX_PAYMENT asserts the
+    # TARGET sells machine access, and Jina exhausting its quota is not that claim.
+    payment = next((a for a in attempts if a.status == 402 and a.rung != "reader"), None)
     report = blocked or payment or (attempts[-1] if attempts else Result(url=url))
     report.notes = [f"[{a.rung}] {n}" for a in attempts for n in a.notes]
 
@@ -900,11 +1002,25 @@ def emit(res: Result, robots: str, args: argparse.Namespace) -> None:
         print(f"# CHALLENGE: {res.challenge}")
         print("#")
         print("# This is a refusal, not a transient error. Do not retry in a loop.")
-        print("# Ask the human to open the page in the live browser and clear the")
-        print("# challenge once; the profile keeps it cleared for later fetches:")
-        print("#   scripts\\start-browse-chrome.ps1")
-        print(f"#   then: browse {res.url} --rung chrome")
-    if res.status == 402:
+        if res.challenge.startswith("reader-"):
+            # THE READER SERVICE REFUSED, NOT THE TARGET, so the browser advice below
+            # would be actively misleading: clearing a challenge in the local Chrome
+            # cannot fix r.jina.ai's quota, key or rate limit. Different refuser,
+            # different remedy.
+            print("# r.jina.ai refused this. That is a fact about the READER, not about")
+            print("# the target site, so there is no challenge here for you to clear.")
+            print("# Try a rung that does not involve it:")
+            print(f"#   browse {res.url} --rung direct")
+            print(f"#   browse {res.url} --rung chrome")
+        else:
+            print("# Ask the human to open the page in the live browser and clear the")
+            print("# challenge once; the profile keeps it cleared for later fetches:")
+            print("#   scripts\\start-browse-chrome.ps1")
+            print(f"#   then: browse {res.url} --rung chrome")
+    # NOT for a reader 402, which is Jina's quota rather than the target selling access.
+    # Printing "the site charges for machine access" there names the wrong party and sends
+    # the reader off to pay somebody who is not asking for money.
+    if res.status == 402 and res.rung != "reader":
         print("#")
         print("# 402: the site charges for machine access (Cloudflare pay-per-crawl")
         print("# or an x402 gateway). There is no bypass. Read it in a browser, find")
