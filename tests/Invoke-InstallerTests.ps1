@@ -31,6 +31,12 @@ param()
 # cmdlet. $PSScriptRoot rather than $repoRoot so this needs nothing computed first.
 . (Join-Path $PSScriptRoot 'SUTestGuard.ps1')
 
+# Immediately after the guard and before the four dot-sources below, so the libraries under test
+# are held to it too. Not a dot-source itself, so the "guard comes first" check in
+# lib\GateChecks.ps1 is undisturbed - but it is placed here rather than at the top of the file so
+# a reader sees the order is deliberate.
+Set-StrictMode -Version Latest
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $repoRoot 'lib\SysmonConfig.ps1')
 # common.ps1 and catalog.ps1 define functions only - no side effects on dot-source - so they
@@ -145,7 +151,14 @@ Write-Host "`n== validation must actually reject things ==" -ForegroundColor Cya
 
 It 'a correctly rendered config for an existing profile passes' {
     # The positive control. Without it, a validator that rejects everything looks perfect.
-    (Test-RenderedSysmonConfig -Text (New-Config) -ProfilePath 'C:\Users\Someone' -DirectoryExists $fakeFs).Count -eq 0
+    #
+    # @() because Test-RenderedSysmonConfig ends `return $problems.ToArray()` and PowerShell
+    # enumerates a function's output, so the CLEAN result - the only one this test is about -
+    # arrives as $null. Windows PowerShell answers $null.Count with 0, which is the whole reason
+    # this read green; under Set-StrictMode -Version Latest it is an error, and this was the
+    # suite's single strict-mode failure. The wrap changes the SHAPE, not the claim: zero problems
+    # is still exactly what is being asserted.
+    @(Test-RenderedSysmonConfig -Text (New-Config) -ProfilePath 'C:\Users\Someone' -DirectoryExists $fakeFs).Count -eq 0
 }
 It 'an UNRENDERED template is REJECTED - the failure that started all this' {
     # Deploying the raw template is the shape of the original bug: rules naming a path that is
@@ -174,8 +187,13 @@ It 'a config with NO include rules is REJECTED, not treated as quiet' {
 It 'every problem is reported, not just the first' {
     # Fixing one and rediscovering the next on the following run is how a short outage becomes
     # a long one.
-    $p = Test-RenderedSysmonConfig -Text (Get-Content $template -Raw) `
-             -ProfilePath 'C:\Users\Nobody' -DirectoryExists $fakeFs
+    # @() at the assignment for the same reason as the positive control above - this is the only
+    # other place in the section that reads .Count off the validator's return rather than off a
+    # Where-Object. It happens to hold two problems today, so strict mode did not catch it; if the
+    # validator were ever narrowed to report one, the bare read would throw here instead of
+    # failing with the count, and the reason would point at the wrong thing.
+    $p = @(Test-RenderedSysmonConfig -Text (Get-Content $template -Raw) `
+               -ProfilePath 'C:\Users\Nobody' -DirectoryExists $fakeFs)
     $p.Count -ge 2
 }
 
