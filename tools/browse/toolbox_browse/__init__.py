@@ -6,4 +6,4 @@ against this number to catch "edited the repo, never reinstalled" - and if the
 two copies disagree with each other, that check measures the wrong thing.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

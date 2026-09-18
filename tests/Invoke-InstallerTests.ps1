@@ -737,6 +737,43 @@ It 'bootstrap weighs tessdata by size and requires eng' {
         ($null -ne $gate.ElseClause)
 }
 
+It 'the activation helpers do NOT put the venv Scripts directory on PATH' {
+    # THE HELPERS SHIPPED A ONE-COMMAND WAY TO FAIL THE GATE. Write-ActivationHelpers wrote both
+    # Activate-CodexToolbox.ps1 and activate-toolbox.cmd with '$nativeBin;$venvScripts;' prepended
+    # to PATH, which puts the toolbox python.exe and pip.exe there - and
+    # scripts\smoke-test.ps1 treats that directory being on the PATH as a FAIL ("exposes
+    # python.exe (should be off PATH)"). The whole point of %TOOLBOX_PYTHON% is that a bare
+    # `python` stays the sanctioned system interpreter.
+    #
+    # ASSERTS THE CONDITION, NOT THE ABSENCE OF A WORD. A grep for 'venvScripts' would pass the
+    # moment somebody renamed the variable, and would fail on a comment that merely mentions it.
+    # This reads the two here-strings the function actually emits and checks what they assign to
+    # PATH, so the test tracks the emitted bytes rather than the source vocabulary.
+    $fn = Get-BuilderFn -Name 'Write-ActivationHelpers'
+    if (-not $fn) { Write-Host "       Write-ActivationHelpers is gone" -ForegroundColor DarkYellow; return $false }
+
+    $heredocs = @($fn.Body.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
+        $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] }, $true) |
+        Where-Object { $_.Extent.Text -match 'PATH' })
+    if ($heredocs.Count -lt 2) {
+        Write-Host ("       expected 2 PATH-assigning strings, found {0}" -f $heredocs.Count) -ForegroundColor DarkYellow
+        return $false
+    }
+
+    $bad = @()
+    foreach ($h in $heredocs) {
+        foreach ($line in ($h.Extent.Text -split "`r?`n")) {
+            # Only the lines that ASSIGN PATH. A line that merely prints the interpreter path is
+            # fine and is in fact the replacement.
+            if ($line -notmatch '(?i)(\$env:PATH\s*=|set\s+"PATH=)') { continue }
+            if ($line -match '(?i)\.venv\\+Scripts') { $bad += $line.Trim() }
+        }
+    }
+    foreach ($b in $bad) { Write-Host ("       PATH assignment still exposes the venv: {0}" -f $b) -ForegroundColor DarkYellow }
+    $bad.Count -eq 0
+}
+
 # =============================================================================================
 # lib\ShimPlan.ps1 + lib\path-registry.ps1 - shim recovery and PATH editing
 #
