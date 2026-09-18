@@ -390,6 +390,13 @@ It 'markdown with no runner supplied reports absent rather than clean' {
 It 'markdown refuses to lint with tool defaults when the config is missing' {
     # Falling back to markdownlint's defaults would fire MD013 on every long line in the repo,
     # so the honest answer is a finding rather than a flood or a silent pass.
+    #
+    # THIS TEST MUST NOT CARE WHETHER MARKDOWNLINT IS INSTALLED, and it once did. The config
+    # check originally ran AFTER the tool lookup, so on a runner without markdownlint the result
+    # was 'absent' and this test failed in CI while passing on a workstation - the same
+    # machine-dependent class as the two other CI-only failures fixed on 2026-09-17. The config
+    # verdict is a fact about the REPOSITORY, so it is now decided before the environment is
+    # consulted, and this test pins that order.
     $root = New-GCFixtureRepo
     Remove-Item -LiteralPath (Join-Path $root '.markdownlint.json') -Force
     $r = Get-GCMarkdownResult -RepoRoot $root -MarkdownRunner { param($e, $a) [pscustomobject]@{ ExitCode = 0; Output = ''; Version = '' } }
@@ -426,14 +433,22 @@ It 'a check that THROWS becomes a finding and does not stop the others' {
     # The per-check independence gate.yml wanted from six separate steps and did not get: a
     # failing STEP aborts the job, which is how six checks stopped running for six days behind
     # one unrelated failure.
-    # The markdown runner throws; everything else is pointed at a healthy fixture. A bogus
-    # -RepoRoot would also work but fills the transcript with drive-not-found noise, and a test
-    # whose output is unreadable is a test nobody checks.
-    $res = @(Get-GateCheckResults -RepoRoot (New-GCFixtureRepo) -HostMajor 5 `
-                -MarkdownRunner { param($e, $a) throw 'boom' })
+    # A TABLE WITH A DELIBERATELY THROWING CHECK, because every environment-independent way to
+    # make a REAL check throw turned out not to exist. The first version threw from the markdown
+    # runner, which only reaches the runner when markdownlint is installed - so it passed on a
+    # workstation and failed on a runner, which is the very class of defect this repo spent the
+    # day removing. A bogus -RepoRoot was the second attempt and filled the transcript with
+    # drive-not-found noise. -Table makes the wrapper deterministic everywhere.
+    $table = @(
+        [pscustomobject]@{ Name = 'first';  Run = { param($Ctx) New-GCResult -Check 'first' -Examined 1 -Evidence 'ok' } }
+        [pscustomobject]@{ Name = 'boom';   Run = { param($Ctx) throw 'deliberate' } }
+        [pscustomobject]@{ Name = 'after';  Run = { param($Ctx) New-GCResult -Check 'after' -Examined 1 -Evidence 'ok' } }
+    )
+    $res = @(Get-GateCheckResults -RepoRoot (New-GCFixtureRepo) -HostMajor 5 -Table $table)
     $threw = @($res | Where-Object { @($_.Findings | Where-Object { $_.Rule -eq 'threw' }).Count -gt 0 })
-    $others = @($res | Where-Object { $_.Check -ne 'markdown' -and @($_.Findings).Count -eq 0 })
-    ($res.Count -eq 6) -and ($threw.Count -eq 1) -and ($threw[0].Check -eq 'markdown') -and ($others.Count -eq 5)
+    # The check AFTER the throwing one must still have run: that is the property, not the finding.
+    $after = @($res | Where-Object { $_.Check -eq 'after' -and @($_.Findings).Count -eq 0 })
+    ($res.Count -eq 3) -and ($threw.Count -eq 1) -and ($threw[0].Check -eq 'boom') -and ($after.Count -eq 1)
 }
 
 It 'every finding from every check carries all five fields' {

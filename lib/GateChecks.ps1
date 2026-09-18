@@ -568,18 +568,23 @@ function Get-GCMarkdownResult {
         return ConvertFrom-GCMarkdownlintOutput -Examined 0 -RepoRoot $RepoRoot
     }
 
-    $exe = Resolve-GCMarkdownlint
-    if (-not $exe) {
-        return New-GCResult -Check 'markdown' -Examined $files.Count -Evidence 'markdownlint not on PATH' -Findings @(
-            New-GCFinding -Check 'markdown' -Rule 'absent' -Message (
-                'markdownlint is not on PATH - install it with: npm install -g markdownlint-cli'))
-    }
-
+    # THE CONFIG CHECK COMES BEFORE THE TOOL LOOKUP, deliberately. A missing config is a defect in
+    # the REPOSITORY and is true whether or not markdownlint happens to be installed on the box
+    # asking; a missing tool is a defect in the ENVIRONMENT. Ordering them the other way round
+    # made the config verdict depend on the environment, which is exactly the class of
+    # machine-dependent test that cost this repo three CI-only failures on 2026-09-17.
     $cfg = Join-Path $RepoRoot $Config
     if (-not (Test-Path -LiteralPath $cfg)) {
         return New-GCResult -Check 'markdown' -Examined $files.Count -Evidence 'no config' -Findings @(
             New-GCFinding -Check 'markdown' -File $Config -Rule 'config' -Message (
                 'the markdownlint config is missing; refusing to lint with tool defaults, which would fire MD013 repo-wide'))
+    }
+
+    $exe = Resolve-GCMarkdownlint
+    if (-not $exe) {
+        return New-GCResult -Check 'markdown' -Examined $files.Count -Evidence 'markdownlint not on PATH' -Findings @(
+            New-GCFinding -Check 'markdown' -Rule 'absent' -Message (
+                'markdownlint is not on PATH - install it with: npm install -g markdownlint-cli'))
     }
 
     $mdArgs = @('-c', $cfg) + @($files | ForEach-Object { $_.FullName })
@@ -617,14 +622,23 @@ function Get-GateCheckResults {
         five with it. That is the per-check independence gate.yml wanted from six separate steps
         and did not get: a failing STEP aborts the job, which is how six checks stopped running
         for six days behind one unrelated failure.
+
+        -Table EXISTS SO THE WRAPPER ITSELF IS TESTABLE, and it has to be a parameter rather than
+        a clever fixture. Making the wrapper fire by breaking a real check means finding an input
+        that reliably throws on every machine, and every candidate turned out to be
+        environment-dependent - which is the exact class of test that produced three CI-only
+        failures here on 2026-09-17, one of them in the suite covering this file. A table
+        containing a deliberately throwing check is deterministic everywhere.
     #>
     param(
         [Parameter(Mandatory)][string]$RepoRoot,
         [string[]]$Name,
         [int]$HostMajor = $PSVersionTable.PSVersion.Major,
         [scriptblock]$MarkdownRunner,
-        [string[]]$Require = @()
+        [string[]]$Require = @(),
+        [object[]]$Table
     )
+    if (-not $Table) { $Table = Get-GateCheckTable }
     $ctx = [pscustomobject]@{
         RepoRoot       = $RepoRoot
         HostMajor      = $HostMajor
@@ -632,7 +646,7 @@ function Get-GateCheckResults {
         Require        = @($Require)
     }
     $results = @()
-    foreach ($check in Get-GateCheckTable) {
+    foreach ($check in $Table) {
         if ($Name -and ($Name -notcontains $check.Name)) { continue }
         try {
             $results += (& $check.Run $ctx)
