@@ -163,12 +163,46 @@ function Get-HFFile {
         if (Test-Path -LiteralPath $tokenFile) { $tok = (Get-Content -Raw -LiteralPath $tokenFile).Trim() }
     }
     $curlArgs = @("-4", "-L", "--fail", "--retry", "3", "--connect-timeout", "20", "-o", $OutFile, $Url)
-    if ($tok) { $curlArgs = @("-H", "Authorization: Bearer $tok") + $curlArgs }
-    # Same split as Get-Download: curl's exit code first, then the size check, so a 401 from a
-    # gated repo or a dead route is not reported as a short file. NOTHING here echoes $curlArgs -
-    # it may carry the HF bearer token, and the comment in install-ghidra.ps1's Get-Json records
-    # what a logged token costs on this box. curl writes its own errors to stderr already.
-    $r = Invoke-Native -FilePath "curl.exe" -Arguments $curlArgs
+
+    # THE TOKEN GOES IN A CONFIG FILE, NEVER ON THE COMMAND LINE, and "we do not echo it" was not
+    # enough.
+    #
+    # This used to prepend @("-H", "Authorization: Bearer $tok") to $curlArgs. The old comment
+    # correctly said nothing here echoes those args - but the argument vector IS the exposure, not
+    # the logging. A Windows process command line is readable by any other process on the box
+    # through Get-CimInstance Win32_Process for the whole life of the transfer, and this machine
+    # runs Sysmon, whose ProcessCreate events record command lines to an event log that is kept.
+    # So a gated-repo download published the bearer token twice over, to a log and to anything
+    # watching, while the code reassured the reader it was careful.
+    #
+    # curl -K reads options from a file, so the header never appears in any argv. The file is
+    # written under %TEMP% with ASCII encoding (curl parses it as bytes; a BOM breaks the first
+    # directive) and removed in a finally, so it does not survive a throw. That is a much smaller
+    # window than a command line, and it is not world-readable through a WMI query.
+    #
+    # Rejected: Invoke-WebRequest with a header hashtable, which has no command line at all. It is
+    # Schannel-backed, and docs\agent-rules.md records that Schannel cannot acquire a client
+    # credential inside the agent sandboxes this repo is used from, failing with
+    # SEC_E_NO_CREDENTIALS before a socket is opened.
+    $curlConfig = $null
+    try {
+        if ($tok) {
+            $curlConfig = Join-Path ([IO.Path]::GetTempPath()) ("hf-" + [guid]::NewGuid().ToString('N') + ".conf")
+            # curl's config syntax, one directive per line. The value is quoted because it contains
+            # a space.
+            [IO.File]::WriteAllText($curlConfig, ('header = "Authorization: Bearer {0}"' -f $tok), [Text.Encoding]::ASCII)
+            $curlArgs = @("-K", $curlConfig) + $curlArgs
+        }
+        # Same split as Get-Download: curl's exit code first, then the size check, so a 401 from a
+        # gated repo or a dead route is not reported as a short file. curl writes its own errors to
+        # stderr already.
+        $r = Invoke-Native -FilePath "curl.exe" -Arguments $curlArgs
+    } finally {
+        # BEFORE the throw below, so a failed transfer does not leave the token on disk.
+        if ($curlConfig -and (Test-Path -LiteralPath $curlConfig)) {
+            Remove-Item -LiteralPath $curlConfig -Force -ErrorAction SilentlyContinue
+        }
+    }
     if ($r.ExitCode -ne 0) {
         foreach ($line in @($r.Output | Select-Object -Last 15)) { Write-Host "    $line" -ForegroundColor DarkGray }
         throw "curl exited $($r.ExitCode) so the download never completed - that is curl's own verdict on the transfer, NOT a size verdict on the file: $Url"

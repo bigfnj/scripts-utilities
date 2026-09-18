@@ -538,6 +538,64 @@ if (-not (Test-Path -LiteralPath $tbRoot)) {
     }
 }
 
+# -- logs/ retention ----------------------------------------------------------
+# REPORTS, DELIBERATELY DOES NOT PRUNE. Four patterns under logs\ are written with no retention
+# policy, audited and measured 2026-09-18:
+#
+#   logs\fresh-workstation\setup-*.log   5 files, 141 KB   1 per run, 7-103 KB (Start-Transcript)
+#   logs\path-backup-*.json              5 files,  20 KB   1 per PATH-writing run
+#   logs\machine-path-intended-*.txt     0 files            1 per elevation-requiring run
+#   logs\gate-phases.log                 15 lines, 1.5 KB  1 line per -Phase run
+#
+# Under 200 KB is at stake in total, and this box has lost ~123,605 files to a script that deleted
+# things it should not have, so a third, fourth and fifth deleter aimed at the user's own logs is a
+# bad trade for that prize. The counts are surfaced instead: visibility was what the backlog item
+# actually asked for, and a number on screen carries no blast radius.
+#
+# TWO OF THESE ARE INPUTS, NOT OUTPUT, which is the other reason not to automate a delete:
+# path-backup-*.json is what consolidate-path.ps1 -Restore reads, and its 2026-09-09 file is the
+# only surviving record of the pre-outage PATH order.
+#
+# The thresholds below are reachable rather than decorative - at one file per run, 25 files is about
+# twenty more runs - so this can actually fire, which is the only kind of check worth having.
+Test-Hdr "logs retention"
+$lgDir = Join-Path $REPO_ROOT 'logs'
+if (-not (Test-Path -LiteralPath $lgDir)) {
+    Test-Warn "no logs\ directory yet - nothing has written a transcript or a PATH backup here"
+} else {
+    $lgPatterns = @(
+        @{ What = 'fresh-workstation transcripts'; Path = (Join-Path $lgDir 'fresh-workstation'); Filter = 'setup-*.log' }
+        @{ What = 'PATH backups (INPUT: -Restore reads these)'; Path = $lgDir; Filter = 'path-backup-*.json' }
+        @{ What = 'pre-elevation PATH records'; Path = $lgDir; Filter = 'machine-path-intended-*.txt' }
+    )
+    foreach ($lgP in $lgPatterns) {
+        if (-not (Test-Path -LiteralPath $lgP.Path)) {
+            Test-Ok ("{0}: none yet" -f $lgP.What)
+            continue
+        }
+        $lgFiles = @(Get-ChildItem -LiteralPath $lgP.Path -Filter $lgP.Filter -File -ErrorAction SilentlyContinue)
+        $lgKb = 0
+        foreach ($lgF in $lgFiles) { $lgKb += $lgF.Length }
+        $lgKb = [math]::Round($lgKb / 1KB, 1)
+        if ($lgFiles.Count -ge 25 -or $lgKb -ge 10240) {
+            Test-Warn ("{0}: {1} file(s), {2} KB - worth pruning by hand (nothing prunes these automatically)" -f `
+                $lgP.What, $lgFiles.Count, $lgKb)
+        } else {
+            Test-Ok ("{0}: {1} file(s), {2} KB, no retention policy" -f $lgP.What, $lgFiles.Count, $lgKb)
+        }
+    }
+    # The ledger is a single append-only file and its value IS the history, so it is reported by
+    # line count and has a far higher bar. 100 bytes a line puts 5,000 lines at half a megabyte.
+    $lgLedger = Join-Path $lgDir 'gate-phases.log'
+    if (-not (Test-Path -LiteralPath $lgLedger)) {
+        Test-Warn "no gate-phases.log - the phase ledger has no baseline, so drift detection starts from nothing"
+    } else {
+        $lgLines = @(Get-Content -LiteralPath $lgLedger -ErrorAction SilentlyContinue).Count
+        if ($lgLines -ge 5000) { Test-Warn "phase ledger: $lgLines lines - consider archiving the older half" }
+        else { Test-Ok "phase ledger: $lgLines lines (append-only by design; the history is the point)" }
+    }
+}
+
 Test-Hdr "browse (web read)"
 $brShim = Join-Path $tbRoot (Join-Path 'native\bin' 'browse.cmd')
 if (-not (Test-Path -LiteralPath $brShim)) {

@@ -116,9 +116,9 @@
     },
     {
       "name": "markdownlint-cli", "group": "extras", "channel": "npm-global",
-      "id": "markdownlint-cli", "binary": "markdownlint", "detect": "markdownlint --version",
+      "id": "markdownlint-cli@0.48.0", "binary": "markdownlint", "detect": "markdownlint --version",
       "default": true,
-      "notes": "markdown linter; run 'markdownlint **/*.md' to lint docs"
+      "notes": "markdown linter, and the markdown half of lib/GateChecks.ps1's six repo checks. PINNED to 0.48.0, and the pin is the point: .github/workflows/gate.yml installs that exact version, so an unpinned local install lets a minor release add a rule and make the LOCAL gate stricter than CI on unchanged documentation - a failure nobody can reproduce from the repo. Measured 2026-09-17 against 0.48.0: findings go to STDERR with an EMPTY stdout (a stdout-only capture reports clean while exiting 1), the tool exits 0 and prints its usage banner when its arguments match no file (which is why the check carries a floor), and a bad config path exits 4. Those three behaviours are what scripts/run-gate-checks.ps1 and ConvertFrom-GCMarkdownlintOutput are written against; re-measure them before moving the pin. Note that Install-NpmGlobal short-circuits on the BINARY being present, not on its version, so changing this pin does not upgrade an existing install - uninstall first, or run npm install -g explicitly. The runner prints the version it used on every gate run, so a skew is visible in the log rather than mysterious."
     },
     {
       "name": "jupyterlab", "group": "extras", "channel": "pip-toolbox",
