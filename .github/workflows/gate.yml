@@ -47,7 +47,7 @@ jobs:
   suites:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Confirm the host really is 5.1
         shell: powershell
@@ -148,7 +148,7 @@ jobs:
   checks:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Confirm the host really is 5.1
         shell: powershell
