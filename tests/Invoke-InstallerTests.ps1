@@ -2930,6 +2930,168 @@ It 'Find-Executable refuses its OWN shim directory, so a wrapper cannot target i
     $got.Resolved -eq $want
 }
 
+It 'Find-Executable picks the NEWEST match in a root, not the first the enumeration reaches' {
+    # `winget upgrade --id QPDF.QPDF -e --scope machine` installed 12.4.1 and LEFT 12.3.2 in place,
+    # measured 2026-09-18. ProgramFiles then held two qpdf.exe, enumeration returned 12.3.2 first,
+    # and -First 1 pinned the toolbox to the OLD binary after a successful upgrade. Undetectable by
+    # every check we have: the shim's target existed, ran, and reported 12.3.2 quite happily.
+    #
+    # THE FIXTURE IS NAMED SO THE OLDER FILE SORTS FIRST, which is what makes this test able to
+    # fail. Revert to -First 1 and it picks 'aaa-tool 1.0.0'. A fixture where the newest also sorted
+    # first would pass either way and prove nothing.
+    $defs = Get-BuilderFnScope -Name 'Find-Executable'
+    if (-not $defs) { Write-Host "       Find-Executable is gone" -ForegroundColor DarkYellow; return $false }
+
+    $fix = Join-Path $bdRoot ('versions-' + [guid]::NewGuid().ToString('N'))
+    $oldBin = Join-Path $fix 'aaa-tool 1.0.0\bin'
+    $newBin = Join-Path $fix 'zzz-tool 2.0.0\bin'
+    New-Item -ItemType Directory -Path $oldBin -Force | Out-Null
+    New-Item -ItemType Directory -Path $newBin -Force | Out-Null
+    $oldExe = Join-Path $oldBin 'zzver.exe'
+    $newExe = Join-Path $newBin 'zzver.exe'
+    Set-Content -LiteralPath $oldExe -Value 'old' -Encoding ASCII
+    Set-Content -LiteralPath $newExe -Value 'new' -Encoding ASCII
+    # Set the times explicitly rather than relying on the order they were written in.
+    (Get-Item -LiteralPath $oldExe).LastWriteTime = (Get-Date).AddDays(-30)
+    (Get-Item -LiteralPath $newExe).LastWriteTime = (Get-Date)
+
+    # A POSITIVE CONTROL ON THE PREMISE: if enumeration ever stops returning the older file first,
+    # this test would pass for the wrong reason and go on passing while covering nothing.
+    $enumFirst = @(Get-ChildItem -Path $fix -Recurse -File -Filter 'zzver.exe' -ErrorAction SilentlyContinue)[0]
+    if (-not $enumFirst -or $enumFirst.FullName -ne $oldExe) {
+        Write-Host "       enumeration no longer returns the older file first - this test now proves nothing" -ForegroundColor DarkYellow
+        return $false
+    }
+
+    $savedPath = $env:PATH; $savedPf = $env:ProgramFiles; $savedPf86 = ${env:ProgramFiles(x86)}
+    $savedLocal = $env:LOCALAPPDATA
+    try {
+        $got = & {
+            param($Defs, $Fix)
+            . $Defs
+            $Root = Join-Path $Fix 'toolbox'
+            $CommandSearchPatterns = @{}
+            # Empty, so the Get-Command branch cannot answer and the exhaustive walk is what runs.
+            $env:PATH = ''
+            $env:ProgramFiles = $Fix
+            ${env:ProgramFiles(x86)} = $Fix
+            $env:LOCALAPPDATA = $Fix
+            Find-Executable -Name 'zzver' -WingetId ''
+        } $defs $fix
+    } finally {
+        $env:PATH = $savedPath; $env:ProgramFiles = $savedPf; ${env:ProgramFiles(x86)} = $savedPf86
+        $env:LOCALAPPDATA = $savedLocal
+    }
+
+    if ($got -ne $newExe) { Write-Host ("       resolved to: {0}" -f $got) -ForegroundColor DarkYellow }
+    $got -eq $newExe
+}
+
+Write-Host "`n== a failed build must not leave a manifest claiming it succeeded ==" -ForegroundColor Cyan
+
+It 'Invoke-Checked -Soft records the failure in the ledger instead of throwing' {
+    # Write-Manifest ran at the `manifest` step and Run-Smoke at the `smoke` step after it, so a
+    # throw out of a smoke probe left a manifest on disk asserting `degraded: []` for a build that
+    # never finished. Measured twice on this box 2026-09-18: pip check failed, the build died, and
+    # the manifest it had already written claimed a clean build with a fresh created_at. The
+    # builder's own header notes bootstrap.ps1 gates readiness on the manifest merely EXISTING.
+    #
+    # TWO assertions, because -Soft has to be opt-in. If it ever became the default, every install
+    # step would continue past its own failure and build on top of it - so the test pins that the
+    # SAME call without the switch still throws.
+    $defs = Get-BuilderFnScope -Name 'Invoke-Checked', 'Add-BuildDegraded', 'Write-Info', 'Write-Warn'
+    if (-not $defs) { Write-Host "       one of the builder helpers is gone" -ForegroundColor DarkYellow; return $false }
+
+    $got = & {
+        param($Defs)
+        . $Defs
+        $DryRun = $false
+        $script:BuildDegraded = New-Object 'System.Collections.Generic.List[string]'
+        $threwSoft = $false
+        $threwHard = $false
+        # Exits non-zero and writes nothing, so it cannot pollute this block's output.
+        $failing = { & cmd.exe /c exit 3 }
+        try { Invoke-Checked 'probe SOFT' $failing -Soft } catch { $threwSoft = $true }
+        try { Invoke-Checked 'probe HARD' $failing } catch { $threwHard = $true }
+        [pscustomobject]@{
+            ThrewSoft = $threwSoft
+            ThrewHard = $threwHard
+            Ledger    = @($script:BuildDegraded.ToArray())
+        }
+    } $defs
+
+    if ($got.ThrewSoft) { Write-Host "       -Soft threw instead of recording" -ForegroundColor DarkYellow }
+    if (-not $got.ThrewHard) { Write-Host "       WITHOUT -Soft it no longer throws - the switch has become the default" -ForegroundColor DarkYellow }
+    if ($got.Ledger.Count -ne 1) { Write-Host ("       ledger holds {0} entry(ies): {1}" -f $got.Ledger.Count, ($got.Ledger -join ' | ')) -ForegroundColor DarkYellow }
+
+    # The 'smoke: ' prefix is what the main flow greps to decide the exit code, so it is part of
+    # the contract rather than cosmetics: an installer's soft failure must stay non-fatal.
+    (-not $got.ThrewSoft) -and $got.ThrewHard -and
+        ($got.Ledger.Count -eq 1) -and ($got.Ledger[0] -like 'smoke: probe SOFT*')
+}
+
+It 'every smoke probe passes -Soft, so one failure cannot hide the other five' {
+    # pip check is the FIRST probe and it threw, so the other five never ran. On this box that hid
+    # five clean results behind one orphaned package, and they had to be run by hand to find out.
+    $fn = Get-BuilderFn -Name 'Run-Smoke'
+    if (-not $fn) { Write-Host "       Run-Smoke is gone" -ForegroundColor DarkYellow; return $false }
+    $calls = @($fn.Body.FindAll({
+        param($n)
+        ($n -is [System.Management.Automation.Language.CommandAst]) -and
+        ($n.GetCommandName() -eq 'Invoke-Checked')
+    }, $true))
+    # A FLOOR, so a renamed helper cannot make this pass by examining nothing.
+    if ($calls.Count -lt 5) {
+        Write-Host ("       only {0} Invoke-Checked call(s) found in Run-Smoke - expected at least 5" -f $calls.Count) -ForegroundColor DarkYellow
+        return $false
+    }
+    $missing = @()
+    foreach ($call in $calls) {
+        $hasSoft = @($call.CommandElements | Where-Object {
+            ($_ -is [System.Management.Automation.Language.CommandParameterAst]) -and ($_.ParameterName -ieq 'Soft')
+        }).Count -gt 0
+        if (-not $hasSoft) { $missing += $call.Extent.StartLineNumber }
+    }
+    if ($missing.Count) {
+        Write-Host ("       probe(s) without -Soft at line(s): {0}" -f ($missing -join ', ')) -ForegroundColor DarkYellow
+    }
+    $missing.Count -eq 0
+}
+
+It 'the manifest is written BOTH before and after the smoke step' {
+    # ORDER, not existence - the whole defect was an ordering one, and a test that merely found a
+    # Write-Manifest call would have passed against the broken build.
+    #
+    # Both directions are asserted on purpose. The late write is what makes the manifest honest
+    # about a failed smoke. The early one is the floor: writing it ONLY at the end would leave a
+    # failed build with no manifest at all, and since bootstrap.ps1 gates readiness on the file
+    # existing, it would report "not ready" for a toolbox that is fine apart from one probe.
+    $writes = @($builderAst.FindAll({
+        param($n)
+        ($n -is [System.Management.Automation.Language.CommandAst]) -and
+        ($n.GetCommandName() -eq 'Write-Manifest')
+    }, $true))
+    $runs = @($builderAst.FindAll({
+        param($n)
+        ($n -is [System.Management.Automation.Language.CommandAst]) -and
+        ($n.GetCommandName() -eq 'Run-Smoke')
+    }, $true))
+    if ($runs.Count -ne 1) {
+        Write-Host ("       expected exactly 1 Run-Smoke call site, found {0}" -f $runs.Count) -ForegroundColor DarkYellow
+        return $false
+    }
+    if ($writes.Count -lt 2) {
+        Write-Host ("       only {0} Write-Manifest call site(s) - the post-smoke write is gone" -f $writes.Count) -ForegroundColor DarkYellow
+        return $false
+    }
+    $smokeLine = $runs[0].Extent.StartLineNumber
+    $before = @($writes | Where-Object { $_.Extent.StartLineNumber -lt $smokeLine })
+    $after = @($writes | Where-Object { $_.Extent.StartLineNumber -gt $smokeLine })
+    if (-not $before.Count) { Write-Host "       no Write-Manifest BEFORE Run-Smoke - a failed smoke would leave no manifest" -ForegroundColor DarkYellow }
+    if (-not $after.Count) { Write-Host "       no Write-Manifest AFTER Run-Smoke - a failed build can still leave a clean manifest" -ForegroundColor DarkYellow }
+    ($before.Count -ge 1) -and ($after.Count -ge 1)
+}
+
 Remove-Item -LiteralPath $bdRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host "`n== the shim writers and the gates that notice when one stops running ==" -ForegroundColor Cyan

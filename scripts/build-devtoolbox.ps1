@@ -138,12 +138,39 @@ PowerShell window, and confirm 'winget --version' works before continuing.
 function Invoke-Checked {
     param(
         [string]$Description,
-        [scriptblock]$Action
+        [scriptblock]$Action,
+        # RECORD THE FAILURE INSTEAD OF THROWING IT. Used only by Run-Smoke, and the reason is the
+        # manifest rather than tolerance.
+        #
+        # Write-Manifest runs at the `manifest` step and Run-Smoke at the `smoke` step after it, so
+        # a throw in here left a manifest on disk asserting `degraded: []` for a build that did not
+        # finish. Measured twice on this box 2026-09-18: `pip check` failed, the build died, and the
+        # manifest it had already written claimed a clean build with a fresh created_at. The
+        # builder's own header notes that bootstrap.ps1 gates readiness on the manifest merely
+        # EXISTING, so that combination hands bootstrap a readiness token the build never earned.
+        #
+        # With -Soft the probe records into the same ledger the three best-effort installers use,
+        # the main flow re-writes the manifest AFTER the smoke step, and then still exits non-zero.
+        # The build fails exactly as loudly as before; the difference is that the artefact left
+        # behind now says why.
+        #
+        # NOT the default, and it must not become one: every other caller here is an install step
+        # where continuing past a failure means building on top of it.
+        [switch]$Soft
     )
     Write-Info $Description
     if ($DryRun) { return }
     & $Action
     if ($LASTEXITCODE -ne 0) {
+        if ($Soft) {
+            # 'smoke' prefix is load-bearing: the main flow decides the exit code by looking for
+            # it, which keeps an installer's soft failure (tessdata, Ghostscript) non-fatal while a
+            # failed smoke probe still fails the build. Add-BuildDegraded's own docblock is what
+            # sets the "<component>: <detail>" shape this relies on.
+            Add-BuildDegraded -Component 'smoke' -Detail "$Description failed (exit $LASTEXITCODE)"
+            Write-Warn "$Description failed (exit $LASTEXITCODE) - recorded in the manifest's degraded list"
+            return
+        }
         throw "Command failed: $Description (exit $LASTEXITCODE)"
     }
 }
@@ -743,7 +770,31 @@ function Find-Executable {
     ) | Where-Object { $_ -and (Test-Path $_) }
 
     foreach ($searchRoot in $roots) {
+        # NEWEST WITHIN THE ROOT, not whichever the enumeration reaches first.
+        #
+        # Measured 2026-09-18 and not hypothetical: `winget upgrade --id QPDF.QPDF -e --scope
+        # machine` installed 12.4.1 and LEFT 12.3.2 in place, so ProgramFiles held both
+        # "qpdf 12.3.2\bin\qpdf.exe" and "qpdf 12.4.1\bin\qpdf.exe", and the enumeration returns
+        # them in that order. -First 1 therefore pinned the toolbox to the OLDER binary after a
+        # successful upgrade - and nothing could notice, because the shim's target existed and ran:
+        # the stale-shim check passed and `qpdf --version` answered 12.3.2 quite happily.
+        #
+        # LastWriteTime rather than a version parsed out of the path, because the directory naming
+        # here is not one convention: "qpdf 12.4.1", "ImageMagick-7.1.2-Q16-HDRI", "gs10.07.1". A
+        # string sort is worse than useless on the first of those, since "12.4.1" sorts ABOVE
+        # "12.10.0", and a parser covering all three shapes is a guess per vendor.
+        #
+        # Root order above is unchanged and still decides first, and an explicit
+        # $CommandSearchPatterns entry still runs before any of this - so a deliberate preference
+        # stays deliberate. This replaces one arbitrary tie-break with a defensible one.
+        #
+        # COST, stated honestly: a hit can no longer short-circuit the walk, because the newest
+        # match cannot be known until the enumeration finishes. The MISS path already pays the full
+        # walk - BACKLOG measures it at 4,048 ms - so the worst case is unchanged and only the
+        # lucky-hit case gets slower. Correctness beats luck at a callsite whose output is baked
+        # into a shim that then looks fine for months.
         $found = Get-ChildItem -Path $searchRoot -Recurse -File -Filter $exe -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
             Select-Object -First 1
         if ($found) { return $found.FullName }
     }
@@ -1390,19 +1441,23 @@ function Run-Smoke {
     $env:CODEX_TOOLBOX = $Root
     $env:TESSDATA_PREFIX = Join-Path $Root "native\tesseract\tessdata"
     Sync-EnvPath
-    Invoke-Checked "run pip dependency check" { & $Python -m pip check }
-    Invoke-Checked "run Python toolbox smoke" { & $Python (Join-Path $Root "scripts\python_tooling_smoke_test.py") }
-    Invoke-Checked "run native toolbox smoke" { & $Python (Join-Path $Root "scripts\native_tooling_smoke_test.py") }
+    # -Soft ON EVERY PROBE, so one failure no longer hides the rest. Before this, `pip check`
+    # failing meant the other five never ran at all - on this box that hid five clean results
+    # behind one orphaned package, and they had to be run by hand to find that out. The build still
+    # exits non-zero; see the smoke-failure check in the main flow.
+    Invoke-Checked "run pip dependency check" { & $Python -m pip check } -Soft
+    Invoke-Checked "run Python toolbox smoke" { & $Python (Join-Path $Root "scripts\python_tooling_smoke_test.py") } -Soft
+    Invoke-Checked "run native toolbox smoke" { & $Python (Join-Path $Root "scripts\native_tooling_smoke_test.py") } -Soft
     if (Test-Path (Join-Path $Root "sysinternals\sigcheck64.exe")) {
-        Invoke-Checked "run Sysinternals readiness smoke" { & $Python (Join-Path $Root "scripts\sysinternals_readiness_test.py") }
+        Invoke-Checked "run Sysinternals readiness smoke" { & $Python (Join-Path $Root "scripts\sysinternals_readiness_test.py") } -Soft
     } else {
         Write-Warn "Sysinternals not present - skipping readiness smoke (rerun to fetch it)"
     }
     if (-not $SkipPlaywrightBrowsers) {
-        Invoke-Checked "run Playwright browser smoke" { & $Python (Join-Path $Root "scripts\playwright_all_browsers_probe.py") }
+        Invoke-Checked "run Playwright browser smoke" { & $Python (Join-Path $Root "scripts\playwright_all_browsers_probe.py") } -Soft
     }
     if (-not $SkipHeavy) {
-        Invoke-Checked "run heavy toolbox smoke" { & $Python (Join-Path $Root "scripts\heavy_tooling_smoke_test.py") }
+        Invoke-Checked "run heavy toolbox smoke" { & $Python (Join-Path $Root "scripts\heavy_tooling_smoke_test.py") } -Soft
     }
 }
 
@@ -1448,5 +1503,26 @@ Write-Manifest -Python $python
 Write-Step "smoke"
 Run-Smoke -Python $python
 
+# THE SECOND WRITE, and why there are two rather than one moved to the end.
+#
+# Writing the manifest only here is the obvious fix and it is worse: a build that fails in
+# Run-Smoke would then leave NO manifest at all, and a box with a working toolbox and no manifest
+# is a worse starting state than the reverse - bootstrap.ps1 gates readiness on the file existing,
+# so it would report "not ready" for a toolbox that is fine apart from one probe. The early write
+# stays as the floor; this one folds in what the smoke step learned. The cost is one extra
+# Set-Content of a ~20 KB file, which is nothing next to the build that precedes it.
+Write-Step "manifest (final, with the smoke result)"
+Write-Manifest -Python $python
+
 Write-Step "done"
+# A FAILED SMOKE PROBE STILL FAILS THE BUILD. -Soft changed where a failure is recorded, not
+# whether it counts. The ledger's 'smoke:' prefix is what separates a probe failure, which is
+# fatal, from an installer's best-effort soft failure - tessdata, Ghostscript, an OCR language -
+# which by explicit design must not fail a whole toolbox build.
+$smokeFailures = @($script:BuildDegraded.ToArray() | Where-Object { $_ -like 'smoke: *' })
+if ($smokeFailures.Count) {
+    foreach ($smokeFailure in $smokeFailures) { Write-Err $smokeFailure }
+    throw ("{0} smoke probe(s) failed - the manifest at {1} now records them in its degraded list" -f
+        $smokeFailures.Count, (Join-Path $Root "toolbox-manifest.json"))
+}
 Write-Ok "DevToolbox ready: $Root"
