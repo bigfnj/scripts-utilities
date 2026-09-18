@@ -1174,6 +1174,71 @@ It 'every forwarded value is QUOTED, and an array survives the hop as one comma-
         ($map.Count -eq 2) -and ($map['ffprobe'] -eq 'Gyan')
 }
 
+It 'the file the elevation gate leaves behind does not claim an outcome it cannot know' {
+    # It was logs\machine-path-pending.txt, WRITTEN BEFORE ELEVATION IS ATTEMPTED. Seconds later
+    # the elevated child can apply the very change it describes and this script exits 0 having
+    # said so, leaving a file whose name insists a PATH change is still outstanding. Nothing in
+    # the repo reads it - grepped 2026-09-17, the writer and one warning message were the only
+    # references - so the name IS the entire interface, and after a successful run it told an
+    # operator reading logs\ the opposite of the truth.
+    #
+    # THE ORDER IS THE PREMISE, so it is asserted rather than assumed: this only matters because
+    # the write happens before Invoke-SelfElevate, and a future rearrangement that moved the write
+    # after the child returned would make an outcome word legitimate. Both halves, or the check is
+    # pinning a name for its own sake.
+    #
+    # Rejected: delete-the-file-on-success. The delete can itself fail - a file open in an editor
+    # is enough - which puts you back at a file that lies, on the path where you have the least
+    # reason to look.
+    $bad = @()
+    $strings = @($cpAst.FindAll({ param($n)
+        ($n -is [System.Management.Automation.Language.StringConstantExpressionAst]) -or
+        ($n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) }, $true))
+    foreach ($s in $strings) {
+        if ($s.Extent.Text -match 'machine-path-[A-Za-z]*pending') {
+            $bad += ("consolidate-path.ps1:{0} names the file '{1}' - 'pending' stops being true the moment the elevated child succeeds" -f
+                     $s.Extent.StartLineNumber, $s.Extent.Text.Trim('"', "'"))
+        }
+    }
+    # THE WRITE, not the name sitting in a string literal. Asserting only that 'intended' appears
+    # somewhere would pass a version that computed the path and never wrote the file - measured:
+    # deleting the Set-Content and its message SURVIVED the first draft of this test, so the
+    # branch recorded nothing at all and the error message below claimed otherwise. Follow the
+    # variable from its assignment into a real writer call.
+    $assign = @($cpAst.FindAll({ param($n)
+        ($n -is [System.Management.Automation.Language.AssignmentStatementAst]) -and
+        ($n.Right.Extent.Text -match 'machine-path-intended') }, $true))
+    if ($assign.Count -ne 1) {
+        $bad += ("expected exactly one assignment of a machine-path-intended-* path, found {0}" -f $assign.Count)
+    }
+    $writes = @()
+    if ($assign.Count -eq 1) {
+        $varName = $assign[0].Left.VariablePath.UserPath
+        $writes = @($cpAst.FindAll({ param($n)
+            ($n -is [System.Management.Automation.Language.CommandAst]) -and
+            ($n.GetCommandName() -eq 'Set-Content') }, $true) | Where-Object {
+                @($_.CommandElements | Where-Object {
+                    ($_ -is [System.Management.Automation.Language.VariableExpressionAst]) -and
+                    ($_.VariablePath.UserPath -eq $varName) }).Count -gt 0 })
+        if ($writes.Count -eq 0) {
+            $bad += ("`$$varName is computed but never written - the elevation gate records nothing")
+        }
+    }
+    $elevate = @($cpAst.FindAll({ param($n)
+        ($n -is [System.Management.Automation.Language.CommandAst]) -and
+        ($n.GetCommandName() -eq 'Invoke-SelfElevate') }, $true))
+    if ($elevate.Count -eq 0) { $bad += 'no Invoke-SelfElevate call - this check assumes the write precedes elevation' }
+    if ($writes.Count -and $elevate.Count) {
+        $iOff = ($writes | ForEach-Object { $_.Extent.StartOffset } | Measure-Object -Minimum).Minimum
+        $eOff = ($elevate | ForEach-Object { $_.Extent.StartOffset } | Measure-Object -Minimum).Minimum
+        if ($iOff -ge $eOff) {
+            $bad += 'the record is written AFTER elevation is attempted - re-read this test, an outcome word may now be honest'
+        }
+    }
+    foreach ($b in $bad) { Write-Host "     $b" -ForegroundColor Red }
+    $bad.Count -eq 0
+}
+
 Write-Host "`n== PATH hygiene re-measures every precondition ==" -ForegroundColor Cyan
 
 # A filesystem the suite describes. 'P:\shadow' provides exactly what 'P:\jdk\bin' already

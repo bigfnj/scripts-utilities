@@ -532,10 +532,27 @@ if ($needsRegistry -and -not (Test-PathAdmin)) {
     if ($plan) { Write-Info2 "would write $(@($plan.Write).Count) shim(s) into $NativeBin" }
     if ($mode -eq 'consolidate') { Write-Info2 "would drop $($drop.Count) winget package entries" }
 
+    # THE FILENAME MUST STAY TRUE WHATEVER HAPPENS NEXT. This was machine-path-pending.txt, and
+    # it is written HERE - before elevation is even attempted. Seconds later the elevated child
+    # can apply the very change it describes and this script exits 0 having said so, leaving a
+    # file on disk whose name asserts a PATH change is still outstanding. An operator reading
+    # logs\ after a successful run is told the opposite of the truth by the one artefact the run
+    # left behind. 'intended' is true at the moment of writing and stays true afterwards on every
+    # branch: applied, declined, refused, or crashed.
+    #
+    # RENAMED RATHER THAN DELETED ON SUCCESS. Removing it after $childCode -eq 0 was the obvious
+    # fix and it is the weaker one: the delete can itself fail - a file open in an editor is
+    # enough - which puts you straight back to a file that lies, on the path where you have the
+    # least reason to look. A name with no outcome in it cannot go stale.
+    #
+    # TIMESTAMPED, like path-backup-<timestamp>.json written a few lines below by
+    # Backup-PathRegistry. The single fixed name was overwritten by every attempt, so a second
+    # run destroyed the record of what the first one meant to write - which is exactly what you
+    # want to read when a PATH repair has gone sideways twice.
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-    $pending = Join-Path $LogDir 'machine-path-pending.txt'
-    Set-Content -Path $pending -Value $newMachine -Encoding UTF8 -NoNewline
-    Write-Info2 "intended machine PATH saved for review: $pending"
+    $intended = Join-Path $LogDir "machine-path-intended-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
+    Set-Content -Path $intended -Value $newMachine -Encoding UTF8 -NoNewline
+    Write-Info2 "intended machine PATH saved for review: $intended"
 
     if ($NoElevate) {
         Write-Warn2 '-NoElevate: no UAC prompt was raised and no PATH was written. Your PATH is unchanged.'
@@ -546,7 +563,7 @@ if ($needsRegistry -and -not (Test-PathAdmin)) {
     $childCode = Invoke-SelfElevate -Bound $PSBoundParameters
     if ($null -eq $childCode) {
         Write-Warn2 'Elevation was declined or unavailable, so NOTHING was written. Your PATH is exactly as it was.'
-        Write-Warn2 'Re-run from an elevated shell, or apply the pending machine PATH by hand.'
+        Write-Warn2 "Re-run from an elevated shell, or apply $intended by hand."
         exit 2
     }
     if ($childCode -ne 0) {
