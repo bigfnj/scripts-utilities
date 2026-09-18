@@ -185,6 +185,10 @@ function Remove-StaleAgentBlocks {
         $backup = "$file.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
         Copy-Item -LiteralPath $file -Destination $backup -Force
         Set-Content -LiteralPath $file -Value $cleaned.Trim() -Encoding UTF8
+        # The third of the three sites that wrote this name and never deleted one. The helper is
+        # in lib\common.ps1, dot-sourced at :27, so all three prune identically - a private copy
+        # here is how the next reader finds two answers to "how many backups do we keep".
+        Remove-StaleBackups -FilePath $file | Out-Null
         Write-Ok "removed stale agent block(s): $file"
     }
 }

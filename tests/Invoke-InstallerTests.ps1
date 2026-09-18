@@ -1268,6 +1268,71 @@ It 'every forwarded value is QUOTED, and an array survives the hop as one comma-
         ($map.Count -eq 2) -and ($map['ffprobe'] -eq 'Gyan')
 }
 
+It 'the file the elevation gate leaves behind does not claim an outcome it cannot know' {
+    # It was logs\machine-path-pending.txt, WRITTEN BEFORE ELEVATION IS ATTEMPTED. Seconds later
+    # the elevated child can apply the very change it describes and this script exits 0 having
+    # said so, leaving a file whose name insists a PATH change is still outstanding. Nothing in
+    # the repo reads it - grepped 2026-09-17, the writer and one warning message were the only
+    # references - so the name IS the entire interface, and after a successful run it told an
+    # operator reading logs\ the opposite of the truth.
+    #
+    # THE ORDER IS THE PREMISE, so it is asserted rather than assumed: this only matters because
+    # the write happens before Invoke-SelfElevate, and a future rearrangement that moved the write
+    # after the child returned would make an outcome word legitimate. Both halves, or the check is
+    # pinning a name for its own sake.
+    #
+    # Rejected: delete-the-file-on-success. The delete can itself fail - a file open in an editor
+    # is enough - which puts you back at a file that lies, on the path where you have the least
+    # reason to look.
+    $bad = @()
+    $strings = @($cpAst.FindAll({ param($n)
+        ($n -is [System.Management.Automation.Language.StringConstantExpressionAst]) -or
+        ($n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) }, $true))
+    foreach ($s in $strings) {
+        if ($s.Extent.Text -match 'machine-path-[A-Za-z]*pending') {
+            $bad += ("consolidate-path.ps1:{0} names the file '{1}' - 'pending' stops being true the moment the elevated child succeeds" -f
+                     $s.Extent.StartLineNumber, $s.Extent.Text.Trim('"', "'"))
+        }
+    }
+    # THE WRITE, not the name sitting in a string literal. Asserting only that 'intended' appears
+    # somewhere would pass a version that computed the path and never wrote the file - measured:
+    # deleting the Set-Content and its message SURVIVED the first draft of this test, so the
+    # branch recorded nothing at all and the error message below claimed otherwise. Follow the
+    # variable from its assignment into a real writer call.
+    $assign = @($cpAst.FindAll({ param($n)
+        ($n -is [System.Management.Automation.Language.AssignmentStatementAst]) -and
+        ($n.Right.Extent.Text -match 'machine-path-intended') }, $true))
+    if ($assign.Count -ne 1) {
+        $bad += ("expected exactly one assignment of a machine-path-intended-* path, found {0}" -f $assign.Count)
+    }
+    $writes = @()
+    if ($assign.Count -eq 1) {
+        $varName = $assign[0].Left.VariablePath.UserPath
+        $writes = @($cpAst.FindAll({ param($n)
+            ($n -is [System.Management.Automation.Language.CommandAst]) -and
+            ($n.GetCommandName() -eq 'Set-Content') }, $true) | Where-Object {
+                @($_.CommandElements | Where-Object {
+                    ($_ -is [System.Management.Automation.Language.VariableExpressionAst]) -and
+                    ($_.VariablePath.UserPath -eq $varName) }).Count -gt 0 })
+        if ($writes.Count -eq 0) {
+            $bad += ("`$$varName is computed but never written - the elevation gate records nothing")
+        }
+    }
+    $elevate = @($cpAst.FindAll({ param($n)
+        ($n -is [System.Management.Automation.Language.CommandAst]) -and
+        ($n.GetCommandName() -eq 'Invoke-SelfElevate') }, $true))
+    if ($elevate.Count -eq 0) { $bad += 'no Invoke-SelfElevate call - this check assumes the write precedes elevation' }
+    if ($writes.Count -and $elevate.Count) {
+        $iOff = ($writes | ForEach-Object { $_.Extent.StartOffset } | Measure-Object -Minimum).Minimum
+        $eOff = ($elevate | ForEach-Object { $_.Extent.StartOffset } | Measure-Object -Minimum).Minimum
+        if ($iOff -ge $eOff) {
+            $bad += 'the record is written AFTER elevation is attempted - re-read this test, an outcome word may now be honest'
+        }
+    }
+    foreach ($b in $bad) { Write-Host "     $b" -ForegroundColor Red }
+    $bad.Count -eq 0
+}
+
 Write-Host "`n== PATH hygiene re-measures every precondition ==" -ForegroundColor Cyan
 
 # A filesystem the suite describes. 'P:\shadow' provides exactly what 'P:\jdk\bin' already
@@ -1709,6 +1774,96 @@ It 'a START marker with no matching END is refused, not guessed at' {
     $threw -and ($after -eq $before)
 }
 
+# A TEMP FIXTURE, NEVER THE REAL TARGETS, and that is not tidiness. Remove-StaleBackups DELETES
+# files, and the files the three production callers point it at live in %USERPROFILE%,
+# %USERPROFILE%\.claude and %USERPROFILE%\.codex. A negative test that handed a real deleter a
+# real profile path is precisely the 2026-09-10 shape SUTestGuard.ps1 exists for: its shadow
+# throws on any deletion outside TEMP, so a test drifting onto a profile path fails loudly rather
+# than pruning the user's CLAUDE.md history. $abRoot is under TEMP; nothing below leaves it.
+function New-SUBackupFixture {
+    # Returns the target path. LastWriteTime runs OPPOSITE to the name order, and this axis is
+    # non-degenerate on purpose - the first version of this fixture set the two in the SAME order,
+    # and a mutation that sorted by LastWriteTime then SURVIVED the whole suite.
+    #
+    # Why mtime is the wrong field at all: Copy-Item preserves the SOURCE's LastWriteTime, so on
+    # this box every real backup carries the PREVIOUS write's timestamp - measured 2026-09-17,
+    # CLAUDE.md.bak-20260917-150230 has mtime 20260911-131028, six days out. The name is the only
+    # field the writer actually stamped, so the newest name must win however the mtimes fall.
+    param([string[]]$Stamps, [string]$Leaf = 'FIXTURE.md')
+    $dir = Join-Path $abRoot ("prune-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $target = Join-Path $dir $Leaf
+    Set-Content -LiteralPath $target -Value 'live content' -Encoding UTF8
+    $age = 0
+    foreach ($s in $Stamps) {
+        $b = "$target.bak-$s"
+        Set-Content -LiteralPath $b -Value "backup $s" -Encoding UTF8
+        # Descending: the FIRST stamp (oldest name) gets the NEWEST mtime.
+        [IO.File]::SetLastWriteTime($b, (Get-Date).AddDays(-1 - $age))
+        $age += 7
+    }
+    return $target
+}
+
+It 'Remove-StaleBackups keeps the newest N by the TIMESTAMP IN THE NAME and deletes the rest' {
+    # 34 files / 356 KB of .bak-<timestamp> had accumulated across the four agent files before
+    # this existed, because all three writers copied and none ever deleted. The survivors must be
+    # the newest, and "newest" must come off the name: see New-SUBackupFixture above for why
+    # mtime is the wrong field, and note the fixture's mtimes run the other way on purpose.
+    $stamps = @('20260901-010101', '20260902-010101', '20260903-010101',
+                '20260904-010101', '20260905-010101', '20260906-010101')
+    $target = New-SUBackupFixture -Stamps $stamps
+    $removed = @(Remove-StaleBackups -FilePath $target -Keep 3)
+    $left = @(Get-ChildItem -LiteralPath (Split-Path $target -Parent) -File | ForEach-Object { $_.Name } | Sort-Object)
+    $want = @('FIXTURE.md', 'FIXTURE.md.bak-20260904-010101',
+              'FIXTURE.md.bak-20260905-010101', 'FIXTURE.md.bak-20260906-010101')
+    if (($left -join ',') -ne ($want -join ',')) {
+        Write-Host "     wanted: $($want -join ', ')" -ForegroundColor Red
+        Write-Host "     got   : $($left -join ', ')" -ForegroundColor Red
+    }
+    (($left -join ',') -eq ($want -join ',')) -and ($removed.Count -eq 3) -and
+        # the live file is never a candidate, however many backups there are
+        (Test-Path -LiteralPath $target)
+}
+
+It 'Remove-StaleBackups leaves a hand-made .bak- and another file entirely alone' {
+    # This box holds .bak-preSSEtune-20260724 and .bak-preWSfix-20260723 next to the files these
+    # callers touch - backups a human made on purpose. A "<name>.bak-*" glob is entitled to delete
+    # them, so only the writers' own yyyyMMdd-HHmmss shape counts. And the prune is scoped to ONE
+    # target: a sweep of the directory would take the sibling agent files' history with it.
+    $target = New-SUBackupFixture -Stamps @('20260901-010101', '20260902-010101',
+                                            '20260903-010101', '20260904-010101')
+    $dir = Split-Path $target -Parent
+    $hand = "$target.bak-preRelease-20260724"
+    Set-Content -LiteralPath $hand -Value 'human' -Encoding UTF8
+    $other = Join-Path $dir 'OTHER.md'
+    Set-Content -LiteralPath $other -Value 'other' -Encoding UTF8
+    Set-Content -LiteralPath "$other.bak-20260101-010101" -Value 'other old' -Encoding UTF8
+    $removed = @(Remove-StaleBackups -FilePath $target -Keep 2)
+    (($removed.Count -eq 2)) -and (Test-Path -LiteralPath $hand) -and
+        (Test-Path -LiteralPath "$other.bak-20260101-010101") -and
+        (-not (Test-Path -LiteralPath "$target.bak-20260901-010101")) -and
+        (Test-Path -LiteralPath "$target.bak-20260904-010101")
+}
+
+It 'Remove-StaleBackups deletes NOTHING under -DryRun' {
+    # A run that promised to change nothing must not delete either, and a prune is the one place
+    # where "nothing to undo afterwards" is the whole point. Mirrors the guard Remove-AgentBlocks
+    # uses three lines from its own .bak- write.
+    $target = New-SUBackupFixture -Stamps @('20260901-010101', '20260902-010101', '20260903-010101')
+    $before = @(Get-ChildItem -LiteralPath (Split-Path $target -Parent) -File).Count
+    $prev = $script:DryRun
+    try {
+        $script:DryRun = $true
+        $removed = @(Remove-StaleBackups -FilePath $target -Keep 1)
+    } finally { $script:DryRun = $prev }
+    $after = @(Get-ChildItem -LiteralPath (Split-Path $target -Parent) -File).Count
+    # And the positive control in the same test: with the flag restored it really does prune, so
+    # a function that had simply stopped working could not pass this.
+    $live = @(Remove-StaleBackups -FilePath $target -Keep 1)
+    ($removed.Count -eq 0) -and ($after -eq $before) -and ($before -eq 4) -and ($live.Count -eq 2)
+}
+
 # The fixture root goes with the section that made it. Invoke-SmokeLintTests.ps1 cleans its own in
 # a finally and $scratch is cleaned at the top of this file; this one was introduced on 2026-09-11
 # with neither, and run-gate.ps1 -Phase runs each suite TWICE (once via smoke-test, once directly),
@@ -1872,6 +2027,189 @@ It 'Add-UserPathEntry asks the machine hive BEFORE it writes, and returns on yes
     }
     foreach ($b in $bad) { Write-Host "     $b" -ForegroundColor Red }
     $bad.Count -eq 0
+}
+
+It 'Add-UserPathEntry cannot reach its registry write under -DryRun' {
+    # SOURCE-LEVEL for the same reason as everything else in this section: gate.yml's "No test
+    # reaches a writer that cannot be redirected" step forbids this suite from CALLING
+    # Add-UserPathEntry, which writes the real user hive and takes no path to redirect. The
+    # runtime proof was taken out of band with Get-RawPath/Set-RawPath stubbed, 2026-09-17: one
+    # user-hive write under -DryRun before this guard, zero after, and Install-CatalogItem on a
+    # winget-machine item with an existing path_fallback reproduced it end to end - because
+    # Install-WingetTool returns $true under -DryRun without installing anything.
+    #
+    # CONDITION AND ORDER, never presence. A $script:DryRun mention anywhere in the function
+    # satisfies "there is a guard" while deciding nothing: after the write it is dead, and without
+    # a return it is a comment with a CPU cost. So the if must TEST $script:DryRun, RETURN, and
+    # sit before the Set-RawPath - which is exactly the shape Remove-UserPathEntry has had all
+    # along, three lines away.
+    $fn = Get-SUFunctionAst -Ast $pathEditorAsts['lib\common.ps1'] -Name 'Add-UserPathEntry'
+    $bad = @()
+    if (-not $fn) { $bad += 'lib\common.ps1 is missing Add-UserPathEntry' }
+    else {
+        $write = @($fn.Body.FindAll({ param($n)
+            ($n -is [System.Management.Automation.Language.CommandAst]) -and
+            ($n.GetCommandName() -eq 'Set-RawPath') }, $true))
+        if ($write.Count -eq 0) { $bad += 'Add-UserPathEntry no longer writes at all' }
+        $guards = @($fn.Body.FindAll({ param($n)
+            ($n -is [System.Management.Automation.Language.IfStatementAst]) -and
+            ($n.Clauses[0].Item1.Extent.Text -match '\$script:DryRun') -and
+            (@($n.FindAll({ param($m)
+                $m -is [System.Management.Automation.Language.ReturnStatementAst] }, $true)).Count -gt 0) }, $true))
+        if ($guards.Count -eq 0) {
+            $bad += 'no if-statement tests $script:DryRun and returns, so a dry run still reaches the write'
+        } elseif ($write.Count) {
+            $gOff = ($guards | ForEach-Object { $_.Extent.StartOffset } | Measure-Object -Minimum).Minimum
+            $wOff = ($write | ForEach-Object { $_.Extent.StartOffset } | Measure-Object -Minimum).Minimum
+            if ($gOff -ge $wOff) { $bad += 'the -DryRun guard sits at or after the registry write' }
+        }
+        # The sibling is the reference, so it has to still hold the shape this test asserts. If
+        # Remove-UserPathEntry ever loses its own guard, "mirror the sibling" stops meaning
+        # anything and this test would be pinning a pattern nothing else follows.
+        $sib = Get-SUFunctionAst -Ast $pathEditorAsts['lib\common.ps1'] -Name 'Remove-UserPathEntry'
+        if (-not $sib) { $bad += 'lib\common.ps1 is missing Remove-UserPathEntry' }
+        elseif (@($sib.Body.FindAll({ param($n)
+            ($n -is [System.Management.Automation.Language.IfStatementAst]) -and
+            ($n.Clauses[0].Item1.Extent.Text -match '\$script:DryRun') }, $true)).Count -eq 0) {
+            $bad += 'Remove-UserPathEntry lost the -DryRun guard this test mirrors'
+        }
+    }
+    foreach ($b in $bad) { Write-Host "     $b" -ForegroundColor Red }
+    $bad.Count -eq 0
+}
+
+# STUBBED REGISTRY HELPERS, in a & { } so they cannot leak into the sections either side.
+# PowerShell resolves function names up the CALL scope chain, so Remove-MachinePathEntry - defined
+# in this file's scope by the dot-source - finds the Get-RawPath/Set-RawPath/Test-PathAdmin
+# defined in here. That is the same seam the Install-CatalogItem stubs higher up use, and it is
+# what makes this the one PATH editor testable at RUNTIME rather than by inspection.
+#
+# Test-PathAdmin is stubbed to $true deliberately: unelevated the real one returns $false and the
+# function returns 'NeedsElevation' before it ever reaches a write, so the interesting half would
+# never run. Which means the stubs MUST be proven live before any call - hence Assert-SUStubbed,
+# called first in every body below. If the shadow had not taken, this would be handing the real
+# machine hive to a real writer, and the margin is one scope wide.
+& {
+    $script:SUFakeMachine = $null
+    $script:SUFakeWrites = New-Object 'System.Collections.Generic.List[string]'
+    function Get-RawPath    { param($Scope) return $script:SUFakeMachine }
+    function Set-RawPath    { param($Scope, $Value) $script:SUFakeWrites.Add("$Scope=$Value") }
+    function Sync-EnvPath   { }
+    function Test-PathAdmin { return $true }
+
+    function Assert-SUStubbed {
+        # REFUSING rather than failing, same shape as the $script:MANIFEST refusal at the top of
+        # this file: if the shadow did not take, Get-RawPath is the real registry reader and the
+        # next line would put the real machine PATH in front of a real Set-RawPath.
+        param([string]$Raw)
+        $script:SUFakeMachine = $Raw
+        $script:SUFakeWrites.Clear()
+        if ((Get-RawPath -Scope Machine) -ne $Raw) {
+            Write-Host "     REFUSING: the Get-RawPath stub did not take - this would read the REAL machine hive" -ForegroundColor Red
+            return $false
+        }
+        if (Test-PathAdmin) { return $true }
+        Write-Host "     REFUSING: the Test-PathAdmin stub did not take" -ForegroundColor Red
+        return $false
+    }
+
+    $suVarEntry = '%LOCALAPPDATA%\DevToolbox\native\bin'
+    $suVarExpanded = [Environment]::ExpandEnvironmentVariables($suVarEntry)
+
+    It 'Remove-MachinePathEntry EXPANDS to compare, so a hand-written %VAR% entry is found' {
+        # It used to hand $Path straight to Remove-PathEntryFromString and compare raw to raw, so
+        # an absolute literal never matched a %VAR% entry naming the same directory and the
+        # function answered 'NotPresent' - having written nothing and warned about nothing. The
+        # silent-subset shape: uninstall-toolbox.ps1 would report a clean reversal over an entry
+        # still sitting in HKLM. Measured before the fix, 2026-09-17: NotPresent, 0 writes.
+        if (-not (Assert-SUStubbed "$suVarEntry;C:\Windows\system32")) { return $false }
+        $status = Remove-MachinePathEntry -Path $suVarExpanded
+        ($status -eq 'Removed') -and (@($script:SUFakeWrites).Count -eq 1) -and
+            ($script:SUFakeWrites[0] -eq 'Machine=C:\Windows\system32')
+    }
+
+    It 'Remove-MachinePathEntry still matches the RAW literal, which is how both callers spell it' {
+        # The positive control on the form that already worked. A "fix" that traded one spelling
+        # for the other would break the only two call sites there are.
+        if (-not (Assert-SUStubbed "$suVarEntry;C:\Windows\system32")) { return $false }
+        $status = Remove-MachinePathEntry -Path $suVarEntry
+        ($status -eq 'Removed') -and (@($script:SUFakeWrites).Count -eq 1)
+    }
+
+    It 'Remove-MachinePathEntry says NotPresent for an absent entry and writes nothing' {
+        # The negative control. Expansion makes the comparison see MORE, and a matcher that had
+        # started saying yes too readily would remove entries nobody named - on the machine hive,
+        # which is the one this repo took down on 2026-09-09.
+        if (-not (Assert-SUStubbed 'C:\Windows\system32;%SystemRoot%\System32\Wbem')) { return $false }
+        $status = Remove-MachinePathEntry -Path 'C:\nowhere\at\all'
+        ($status -eq 'NotPresent') -and (@($script:SUFakeWrites).Count -eq 0)
+    }
+
+    It 'the %VAR% entries Remove-MachinePathEntry KEEPS are re-emitted raw, never expanded' {
+        # The expansion must stop at the comparison. Re-emitting it is the REG_SZ bug by another
+        # route: the value written back would be today's literal expansion of %SystemRoot%, and a
+        # REG_SZ PATH never expands a %VAR% again. This is why the fix lives in this function and
+        # not in Remove-PathEntryFromString, which deliberately does not expand at all.
+        if (-not (Assert-SUStubbed "%SystemRoot%\system32;$suVarEntry;%SystemRoot%\System32\Wbem")) { return $false }
+        $status = Remove-MachinePathEntry -Path $suVarExpanded
+        ($status -eq 'Removed') -and (@($script:SUFakeWrites).Count -eq 1) -and
+            ($script:SUFakeWrites[0] -eq 'Machine=%SystemRoot%\system32;%SystemRoot%\System32\Wbem') -and
+            ($script:SUFakeWrites[0] -notmatch [regex]::Escape($env:SystemRoot))
+    }
+
+    It 'Remove-MachinePathEntry writes nothing under -DryRun, even with a match' {
+        if (-not (Assert-SUStubbed "$suVarEntry;C:\Windows\system32")) { return $false }
+        $prev = $script:DryRun
+        try {
+            $script:DryRun = $true
+            $status = Remove-MachinePathEntry -Path $suVarExpanded
+        } finally { $script:DryRun = $prev }
+        ($status -eq 'DryRun') -and (@($script:SUFakeWrites).Count -eq 0)
+    }
+}
+
+It 'all three .bak- writers prune, so no fourth one can be added without noticing' {
+    # THE ALLOW-LIST INVERTED. Three sites built "<file>.bak-<yyyyMMdd-HHmmss>" and not one of
+    # them ever deleted a backup: 34 files / 356 KB had piled up across the four agent files,
+    # growing by up to 8 per non-dry-run bootstrap run. The fix is one helper and three calls, and
+    # the way it silently un-fixes itself is a fourth writer that copies the line and not the
+    # prune - so this test derives the writer set from the SOURCE and requires each one to call
+    # the helper, rather than checking the three it knows about.
+    $bad = @()
+    $writers = @()
+    foreach ($rel in $pathEditorFiles) {
+        foreach ($fn in $pathEditorAsts[$rel].FindAll({ param($n)
+                $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+            # An ExpandableStringExpressionAst is the only way to spell this, since the name
+            # interpolates Get-Date - so the text of the whole function body is the wrong place to
+            # look and the string node is the right one.
+            #
+            # '.bak-' IMMEDIATELY FOLLOWED BY AN INTERPOLATION is what distinguishes a WRITER from
+            # a READER, and the distinction is load-bearing rather than cosmetic: the first run of
+            # this test flagged Remove-StaleBackups itself, whose "$leaf.bak-*" GLOB also contains
+            # the substring. A writer stamps something in; the pruner matches a wildcard.
+            $stamped = @($fn.Body.FindAll({ param($n)
+                ($n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) -and
+                ($n.Extent.Text -match '\.bak-\$') }, $true))
+            if ($stamped.Count -eq 0) { continue }
+            $writers += "$rel/$($fn.Name)"
+            $calls = @($fn.Body.FindAll({ param($n)
+                $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
+                ForEach-Object { $_.GetCommandName() })
+            if ($calls -notcontains 'Remove-StaleBackups') {
+                $bad += ("{0}:{1} {2} writes a .bak- and never prunes" -f
+                         $rel, $stamped[0].Extent.StartLineNumber, $fn.Name)
+            }
+        }
+    }
+    # A FLOOR, because a predicate that matched nothing would report every writer compliant. The
+    # three are Remove-AgentBlocks and Write-AgentBlock in lib\common.ps1, and
+    # Remove-StaleAgentBlocks in bootstrap.ps1.
+    if ($writers.Count -lt 3) {
+        Write-Host "     found only $($writers.Count) .bak- writer(s) ($($writers -join ', ')) - the sweep is not reaching them" -ForegroundColor Red
+    }
+    foreach ($b in $bad) { Write-Host "     $b" -ForegroundColor Red }
+    ($bad.Count -eq 0) -and ($writers.Count -ge 3)
 }
 
 It 'Remove-StalePathEntries refuses the machine hive unelevated rather than throwing at it' {

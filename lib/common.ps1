@@ -67,26 +67,6 @@ function Sync-EnvPath {
     $env:PATH = ($paths | Where-Object { $_ } | Select-Object -Unique) -join ';'
 }
 
-# Append an entry to the persistent user PATH. Returns $true unless the directory is missing.
-#
-# THROUGH Get-RawPath / Set-RawPath, never [Environment]::Get/SetEnvironmentVariable - the same
-# prohibition Remove-MachinePathEntry states below, applied to the hive where it had been ignored.
-# Both halves of that API are wrong for an edit and the second is permanent: Get EXPANDS %VAR% on
-# read, Set writes the value back as REG_SZ, and a REG_SZ PATH never expands a %VAR% again.
-#
-# The user hive looks like it has nothing to lose - measured 2026-09-11, 3 entries, none of them
-# %VAR%-based - but its value KIND is RegistryValueKind::ExpandString, exactly like the machine
-# hive's. One write through the framework API demotes it, and the damage is then silent and
-# deferred: the next %VAR% entry anyone adds by hand simply never expands, in a hive that looks
-# fine and whose kind nobody thinks to check.
-#
-# NO -DryRun BRANCH, and that is the shape this function already had rather than a decision taken
-# here. bootstrap.ps1's Register-ToolboxUserPath guards its own call site (:335), but
-# lib\catalog.ps1:94 and :104 do not - under -DryRun Install-WingetTool returns $true WITHOUT
-# installing, so a path_fallback tool whose binary is absent reaches this function and writes the
-# user PATH during a run that promised to change nothing. Deliberately left open: this change is
-# confined to the registry MECHANISM, and closing that gap is a behaviour change belonging either
-# to the catalog call sites or to a guard here. Recorded so the next reader need not rediscover it.
 function Invoke-Native {
     <#
         Run a native command with its output captured and its stderr survivable, returning the
@@ -127,6 +107,36 @@ function Invoke-Native {
     } finally { $ErrorActionPreference = $prev }
 }
 
+# Append an entry to the persistent user PATH. Returns $true unless the directory is missing.
+#
+# THIS COMMENT SITS ABOVE THE FUNCTION IT DESCRIBES AGAIN. It was stranded above Invoke-Native
+# when that function was inserted between the two, so its "this function" and its "NO -DryRun
+# BRANCH" paragraph read as claims about a wrapper that has neither a PATH nor a registry write.
+#
+# THROUGH Get-RawPath / Set-RawPath, never [Environment]::Get/SetEnvironmentVariable - the same
+# prohibition Remove-MachinePathEntry states below, applied to the hive where it had been ignored.
+# Both halves of that API are wrong for an edit and the second is permanent: Get EXPANDS %VAR% on
+# read, Set writes the value back as REG_SZ, and a REG_SZ PATH never expands a %VAR% again.
+#
+# The user hive looks like it has nothing to lose - measured 2026-09-11, 3 entries, none of them
+# %VAR%-based - but its value KIND is RegistryValueKind::ExpandString, exactly like the machine
+# hive's. One write through the framework API demotes it, and the damage is then silent and
+# deferred: the next %VAR% entry anyone adds by hand simply never expands, in a hive that looks
+# fine and whose kind nobody thinks to check.
+#
+# THE -DryRun GUARD BELOW IS THE ONE THIS FUNCTION SPENT A MIGRATION WITHOUT, and the gap was
+# reachable, not theoretical. bootstrap.ps1's Register-ToolboxUserPath guards its own call site
+# (:407), but lib\catalog.ps1:94 and :104 did not - under -DryRun Install-WingetTool returns
+# $true WITHOUT installing, so a path_fallback tool whose binary is absent arrived here and the
+# registry was written by a run that promised to change nothing. Measured 2026-09-17 with the
+# registry helpers stubbed: Install-CatalogItem on a winget-machine item with an existing
+# path_fallback directory produced ONE user-hive write under -DryRun, and printed "added user
+# PATH entry" while doing it. Four of catalog.json's tools declare a path_fallback and all four
+# of those directories exist on this box.
+#
+# The guard is Remove-UserPathEntry's idiom, deliberately: report and leave. It returns $true
+# rather than the sibling's bare return because a dry run that reported an install FAILURE it
+# had not had would be a different lie in the same place.
 function Add-UserPathEntry {
     param([string]$Path)
     if (-not (Test-Path $Path)) {
@@ -170,6 +180,10 @@ function Add-UserPathEntry {
         ([System.Environment]::ExpandEnvironmentVariables($_)).TrimEnd('\') -ieq $resolved.TrimEnd('\')
     } | Select-Object -First 1
     if (-not $exists) {
+        if ($script:DryRun) {
+            Write-Info "[DRY-RUN] would add user PATH entry: $resolved"
+            return $true
+        }
         Set-RawPath -Scope User -Value ((@($entries) + $resolved) -join ';')
         Write-Ok "added user PATH entry: $resolved"
     }
@@ -228,7 +242,27 @@ function Remove-UserPathEntry {
 function Remove-MachinePathEntry {
     param([Parameter(Mandatory)][string]$Path)
     $raw = Get-RawPath -Scope Machine
-    $res = Remove-PathEntryFromString -Value $raw -Remove @($Path)
+    # EXPANDED TO COMPARE, RAW TO REMOVE - the same split Remove-UserPathEntry above makes, and
+    # for the same reason. This function used to hand $Path straight to Remove-PathEntryFromString
+    # and compare raw text to raw text, which cannot see that '%LOCALAPPDATA%\DevToolbox\native\bin'
+    # and the expanded literal name one directory. Both callers derive their argument from an env
+    # var as an absolute literal, so nothing misfires today; the failure it leaves open is a
+    # hand-edited %VAR% machine entry the uninstaller reports as 'NotPresent' and walks away from,
+    # having written nothing and warned about nothing - the silent-subset shape this file keeps
+    # closing. Measured 2026-09-17 against a stubbed hive holding
+    # '%LOCALAPPDATA%\DevToolbox\native\bin': the expanded argument returned NotPresent with 0
+    # writes, while Remove-UserPathEntry handed the identical argument removed it.
+    #
+    # THE EXPANSION STOPS AT THE COMPARISON. $drop carries the untouched registry literals, so
+    # Remove-PathEntryFromString still matches and re-emits verbatim - it deliberately does not
+    # expand, and two tests assert that, because a value rebuilt from expansions is the REG_SZ
+    # bug by another route. The fix belongs here, not in the string helper.
+    $target = ([System.Environment]::ExpandEnvironmentVariables($Path)).TrimEnd('\')
+    $drop = @(Split-PathList $raw | Where-Object {
+        ([System.Environment]::ExpandEnvironmentVariables($_)).TrimEnd('\') -ieq $target
+    })
+    if ($drop.Count -eq 0) { return 'NotPresent' }
+    $res = Remove-PathEntryFromString -Value $raw -Remove $drop
     if (@($res.Removed).Count -eq 0) { return 'NotPresent' }
     if ($script:DryRun) {
         Write-Info "[DRY-RUN] would remove machine PATH entry: $Path"
@@ -245,6 +279,80 @@ function Remove-MachinePathEntry {
     Write-Ok "removed machine PATH entry: $Path"
     Sync-EnvPath
     return 'Removed'
+}
+
+# -- Timestamped backups -------------------------------------------------------
+function Remove-StaleBackups {
+    <#
+        Keep the $Keep most recent "<FilePath>.bak-<yyyyMMdd-HHmmss>" siblings and delete the
+        rest. Returns the paths it removed, so a caller can report instead of assume.
+
+        ONE HELPER, THREE CALLERS. Three sites wrote that exact name and none of them ever
+        deleted one: Remove-AgentBlocks and Write-AgentBlock below, and bootstrap.ps1's
+        Remove-StaleAgentBlocks. Measured on this box 2026-09-17, before this function existed:
+        32 files / 291 KB across %USERPROFILE%, %USERPROFILE%\.claude and %USERPROFILE%\.codex -
+        10, 9 and 13 respectively - growing by up to 8 per non-dry-run bootstrap run. The agent
+        files are ~7 KB each and the block is rewritten on every run whether or not it changed,
+        so the growth is unbounded and almost entirely duplicates.
+
+        KEEP = 3, AND THE REASON IS WHAT MAKES IT DEFENSIBLE. Each backup is the target file as
+        it stood immediately before one idempotent rewrite of one fenced block. One copy is
+        enough to undo the newest write; the second and third exist because a bad block can be
+        deployed and only noticed a run or two later, which is exactly how the `$$><script.txt`
+        corruption survived. Beyond that they are indistinguishable duplicates. Three per target
+        bounds the four agent files at 12 files / ~84 KB instead of the 32 measured above.
+
+        SORTED BY THE TIMESTAMP IN THE NAME, NEVER BY LastWriteTime, and that is measured rather
+        than preferred. Copy-Item PRESERVES the source's LastWriteTime, so every backup here
+        carries the mtime of the PREVIOUS write's content - probed 2026-09-17,
+        CLAUDE.md.bak-20260917-150230 has mtime 20260911-131028, six days off. The name is the
+        only field the writer actually stamped.
+
+        THE TIMESTAMP SHAPE IS REQUIRED, not just the ".bak-" prefix. This box also holds
+        hand-made backups named .bak-preSSEtune-20260724 and .bak-preWSfix-20260723 that a
+        human made on purpose; a "<name>.bak-*" glob would be entitled to delete them the day
+        one of these callers is pointed at that file. Anything not matching the writers' own
+        format is left alone.
+
+        NO-OP UNDER -DryRun, mirroring the guard Remove-AgentBlocks uses a few lines below: a
+        run that promised to change nothing must not delete anything either.
+
+        DEGRADED LOUDLY, never silently. A locked or vanished backup warns and the prune moves
+        on - failing a bootstrap over a housekeeping delete would be the worse trade - but the
+        warning is emitted, because a prune that quietly does nothing is indistinguishable from
+        one that is not wired up.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [ValidateRange(1, 100)][int]$Keep = 3
+    )
+    $dir = Split-Path -Path $FilePath -Parent
+    $leaf = Split-Path -Path $FilePath -Leaf
+    if (-not $dir -or -not (Test-Path -LiteralPath $dir)) { return @() }
+
+    # -Filter is the provider's own wildcard, so a leaf containing [ ] does not have to be
+    # escaped the way -Include would demand; the regex below is what actually decides.
+    $candidates = @(Get-ChildItem -LiteralPath $dir -Filter "$leaf.bak-*" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '\.bak-\d{8}-\d{6}$' } |
+        Sort-Object -Property Name -Descending)
+    if ($candidates.Count -le $Keep) { return @() }
+
+    $doomed = @($candidates | Select-Object -Skip $Keep)
+    if ($script:DryRun) {
+        Write-Info "[DRY-RUN] would prune $($doomed.Count) old backup(s) of $leaf, keeping the newest $Keep"
+        return @()
+    }
+    $removed = @()
+    foreach ($old in $doomed) {
+        try {
+            Remove-Item -LiteralPath $old.FullName -Force
+            $removed += $old.FullName
+        } catch {
+            Write-Warn "could not prune old backup $($old.Name) ($($_.Exception.Message)); it will be retried next run"
+        }
+    }
+    if ($removed.Count) { Write-Info "pruned $($removed.Count) old backup(s) of $leaf, kept the newest $Keep" }
+    return $removed
 }
 
 # Strip fenced agent-discovery blocks (WIN_DEVTOOLS and/or legacy CODEX_TOOLBOX)
@@ -277,6 +385,9 @@ function Remove-AgentBlocks {
         $backup = "$file.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
         Copy-Item -LiteralPath $file -Destination $backup -Force
         Set-Content -LiteralPath $file -Value $cleaned.Trim() -Encoding UTF8
+        # AFTER the copy, never before: pruning first would keep $Keep - 1 old copies plus the
+        # one about to be written, so the guaranteed depth would silently be one short.
+        Remove-StaleBackups -FilePath $file | Out-Null
         Write-Ok "removed agent block(s): $file"
     }
 }
@@ -690,6 +801,14 @@ function Write-AgentBlock {
     $backup = "$FilePath.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
     if (Test-Path $FilePath) { Copy-Item $FilePath $backup -Force }
     Set-Content $FilePath $content -Encoding UTF8
+    # THE PRUNE LIVES HERE, not in Write-AgentDiscovery, and that is a hard constraint rather
+    # than a preference. lib\AgentDiscovery.ps1 extracts Write-AgentDiscovery's body by
+    # EVALUATING its assignment statements, and refuses any that call a command outside
+    # $script:ADAllowedCommands = @('Join-Path'). A prune call added up there would make the
+    # extractor refuse, and smoke-test.ps1's deployed-vs-generated check - the one that caught
+    # the $$><script.txt corruption - would report "could not reach the generator" instead.
+    # Here it is invisible to the extractor and still covers all four agent files.
+    Remove-StaleBackups -FilePath $FilePath | Out-Null
     Write-Ok "agent block [$Marker] -> $FilePath"
 }
 
