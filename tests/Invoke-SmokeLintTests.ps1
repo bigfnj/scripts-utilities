@@ -32,6 +32,12 @@ param()
 # cmdlet. $PSScriptRoot rather than $repoRoot so this needs nothing computed first.
 . (Join-Path $PSScriptRoot 'SUTestGuard.ps1')
 
+# Immediately after the guard and before every other dot-source, so the rules under test and this
+# file's own helpers are both held to it. Not a dot-source itself, so the "guard comes first" check
+# in lib\GateChecks.ps1 is undisturbed - but it is placed here rather than at the top of the file
+# so a reader sees the order is deliberate.
+Set-StrictMode -Version Latest
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $repoRoot 'lib\SmokeLint.ps1')
 
@@ -56,8 +62,18 @@ function New-Fixture {
     $p
 }
 function Get-Rules {
+    # ALWAYS AN ARRAY, and the unary comma is the only part of that which works. @() bounds the
+    # pipeline, but a function's output is ENUMERATED on the way out, so the empty case left this
+    # scope as $null and the one-finding case as a bare string. Every `(Get-Rules $f).Count -eq 0`
+    # below was therefore reading .Count off $null. Windows PowerShell answers that with 0, so the
+    # nine silence tests did still discriminate - one finding is a string whose .Count is 1 - but
+    # they discriminated through a property PowerShell invents for $null, and under
+    # Set-StrictMode -Version Latest that property is an error instead. All nine failed the moment
+    # strict mode went on, every one with "The property 'Count' cannot be found on this object".
+    # `,$r` emits the array as a single object, so what the caller measures is the array itself.
     param([string]$Path)
-    @(Get-SmokeLintFindings -Path $Path | ForEach-Object { '{0}@{1}' -f $_.Rule, $_.Line })
+    $r = @(Get-SmokeLintFindings -Path $Path | ForEach-Object { '{0}@{1}' -f $_.Rule, $_.Line })
+    ,$r
 }
 function Get-FixtureLine {
     # The expected line number is READ BACK OUT OF THE FIXTURE, never written down here. The
