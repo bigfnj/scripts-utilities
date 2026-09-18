@@ -18,6 +18,21 @@ name: gate
 # fail for environmental reasons, or - worse - be softened until it passed, which is how a gate
 # becomes decorative. Only the suites that depend on nothing outside the repository run here.
 # The machine-dependent checks stay in run-gate.ps1, where they are true.
+#
+# TWO JOBS, NOT ONE, AND `if: ${{ !cancelled() }}` ON EVERY STEP. Both are the fix for a measured
+# six-day outage rather than tidiness.
+#
+# On 2026-09-11 a closure-scope bug turned the installer suite red. A failing step aborts the job
+# and the installer suite was step 3 of 11, so the parse sweep, the suite-wiring check, the
+# deletion-guard order check, the banned-writer scan and the control-character scan all stopped
+# running - for six days, while the job reported exactly one problem and every later push looked
+# like the same single failure. The local gate could not tell anyone either, because those five
+# checks existed ONLY as inline PowerShell in this file.
+#
+# So: the checks moved into lib\GateChecks.ps1 with run-gate.ps1 as a second caller, they run in
+# a SEPARATE job that a red suite cannot abort, and every step carries `!cancelled()` so one
+# failure inside a job still reports the rest. `!cancelled()` rather than `always()`, or a
+# cancelled run would keep launching steps.
 
 on:
   push:
@@ -45,8 +60,10 @@ jobs:
           }
 
       # Each suite runs separately so a failure names itself in the job log rather than
-      # arriving as one opaque non-zero exit.
+      # arriving as one opaque non-zero exit. Every step is `!cancelled()` so one red suite
+      # reports the others instead of hiding them.
       - name: Core suite
+        if: ${{ !cancelled() }}
         shell: powershell
         run: |
           .\tests\Invoke-CoreTests.ps1
@@ -59,37 +76,28 @@ jobs:
           if ($code -ne 0) { exit $code }
 
       - name: Installer suite
+        if: ${{ !cancelled() }}
         shell: powershell
         run: |
           .\tests\Invoke-InstallerTests.ps1
-          # $LASTEXITCODE is UNDEFINED at the start of a step, so `-ne 0` is TRUE and
-          # `exit $null` yields exit code 0 - the old guard here took its FAILURE branch and
-          # exited GREEN. Measured 2026-09-11. It was harmless only by accident, because every
-          # suite ends in an explicit `exit`. Bind the value first so the check is real.
           $code = $LASTEXITCODE
           if ($null -eq $code) { Write-Host 'FAIL suite set no exit code'; exit 1 }
           if ($code -ne 0) { exit $code }
 
       - name: Triage suite
+        if: ${{ !cancelled() }}
         shell: powershell
         run: |
           .\tests\Invoke-TriageTests.ps1
-          # $LASTEXITCODE is UNDEFINED at the start of a step, so `-ne 0` is TRUE and
-          # `exit $null` yields exit code 0 - the old guard here took its FAILURE branch and
-          # exited GREEN. Measured 2026-09-11. It was harmless only by accident, because every
-          # suite ends in an explicit `exit`. Bind the value first so the check is real.
           $code = $LASTEXITCODE
           if ($null -eq $code) { Write-Host 'FAIL suite set no exit code'; exit 1 }
           if ($code -ne 0) { exit $code }
 
       - name: Render suite
+        if: ${{ !cancelled() }}
         shell: powershell
         run: |
           .\tests\Invoke-RenderTests.ps1
-          # $LASTEXITCODE is UNDEFINED at the start of a step, so `-ne 0` is TRUE and
-          # `exit $null` yields exit code 0 - the old guard here took its FAILURE branch and
-          # exited GREEN. Measured 2026-09-11. It was harmless only by accident, because every
-          # suite ends in an explicit `exit`. Bind the value first so the check is real.
           $code = $LASTEXITCODE
           if ($null -eq $code) { Write-Host 'FAIL suite set no exit code'; exit 1 }
           if ($code -ne 0) { exit $code }
@@ -98,186 +106,66 @@ jobs:
       # failing. The script itself is deliberately not run here (see the header); its RULES depend
       # on nothing outside the repository, so they are checked here like everything else.
       - name: SmokeLint suite
+        if: ${{ !cancelled() }}
         shell: powershell
         run: |
           .\tests\Invoke-SmokeLintTests.ps1
-          # $LASTEXITCODE is UNDEFINED at the start of a step, so `-ne 0` is TRUE and
-          # `exit $null` yields exit code 0 - the old guard here took its FAILURE branch and
-          # exited GREEN. Measured 2026-09-11. It was harmless only by accident, because every
-          # suite ends in an explicit `exit`. Bind the value first so the check is real.
           $code = $LASTEXITCODE
           if ($null -eq $code) { Write-Host 'FAIL suite set no exit code'; exit 1 }
           if ($code -ne 0) { exit $code }
 
-      - name: Every script parses under 5.1
+      # The tests FOR the six hygiene checks. They break each check against a synthetic
+      # repository under TEMP and assert exactly one finding naming the right file, so the checks
+      # in the other job are known to be capable of failing.
+      - name: GateChecks suite
+        if: ${{ !cancelled() }}
         shell: powershell
         run: |
-          $bad = 0
-          $seen = 0
-          Get-ChildItem -Recurse -Filter *.ps1 | ForEach-Object {
-            $seen++
-            $e = $null
-            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$e)
-            if ($e -and $e.Count) {
-              $bad++
-              Write-Host ("FAIL {0}: {1}" -f $_.Name, $e[0].Message)
-            }
-          }
-          if ($bad) { exit 1 }
-          # A FLOOR. An enumeration that matches nothing printed "all .ps1 parse" and passed -
-          # so a renamed directory turned this step green. The local gate already refuses that
-          # ("the parse gate swept nothing"); the merge gate did not.
-          if ($seen -eq 0) { Write-Host 'FAIL swept 0 .ps1 files - the parse gate examined nothing'; exit 1 }
-          "all $seen .ps1 parse under $($PSVersionTable.PSVersion)"
+          .\tests\Invoke-GateChecksTests.ps1
+          $code = $LASTEXITCODE
+          if ($null -eq $code) { Write-Host 'FAIL suite set no exit code'; exit 1 }
+          if ($code -ne 0) { exit $code }
 
-      # The suite list above is hand-maintained, and a suite added to tests\ but not to this
-      # file would be silently uncovered on CI while looking covered. Same failure the local
-      # gate treats as fatal.
-      - name: No test suite is missing from this workflow
+  # A SEPARATE JOB, not a step. Six checks lived in this file as inline PowerShell and stopped
+  # running the day an unrelated suite went red. A second job cannot be aborted by the first
+  # one's failure, so "the suites are broken" and "the repository is malformed" are now two
+  # answers instead of one. lib\GateChecks.ps1 holds the definitions and run-gate.ps1 calls the
+  # same runner, so neither gate can drift from the other.
+  checks:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Confirm the host really is 5.1
         shell: powershell
         run: |
-          # THE run: SCALARS, NOT THE WHOLE FILE. Matching the raw YAML also matches COMMENTS,
-          # so deleting the "Render suite" step passed as long as the filename survived anywhere
-          # in prose - and this file's own next comment forbids exactly that shape. Parse the
-          # workflow's run: blocks and look only at what CI actually executes.
-          $onDisk = @(Get-ChildItem .\tests -Filter 'Invoke-*Tests.ps1' | ForEach-Object { $_.Name })
-          if ($onDisk.Count -eq 0) { Write-Host 'FAIL found 0 suites in tests\ - this check examined nothing'; exit 1 }
-          $yaml = (Get-Content .\.github\workflows\gate.yml -Raw) -split "`n"
-          $runLines = @()
-          $inRun = $false
-          foreach ($line in $yaml) {
-            if ($line -match '^\s*run:\s*\|') { $inRun = $true; continue }
-            if ($inRun) {
-              if ($line -match '^\s*-\s' -or $line -match '^\s{0,6}\S' ) { $inRun = $false; continue }
-              # STRIP POWERSHELL COMMENTS TOO. A run: block is executable, but a # line inside it
-              # is not - and a filename surviving in one is exactly the shape this check exists to
-              # reject. Caught by its own control on 2026-09-11: sabotaging the Render step by
-              # replacing its invocation with '# was Invoke-RenderTests.ps1 here' was NOT detected
-              # until this line was added. A control that passes tells you nothing; this one failed
-              # and was right to.
-              $runLines += ($line -replace '#.*$', '')
-            }
-          }
-          $wired = ($runLines -join "`n")
-          $missing = @($onDisk | Where-Object { $wired -notmatch [regex]::Escape($_) })
-          if ($missing.Count) {
-            Write-Host ("FAIL test suite(s) not run by CI: {0}" -f ($missing -join ', '))
+          $v = $PSVersionTable.PSVersion
+          "host: $v ($($PSVersionTable.PSEdition))"
+          if ($v.Major -ne 5) {
+            Write-Error "expected Windows PowerShell 5.x, got $v - this job is checking the wrong host"
             exit 1
           }
-          "all $($onDisk.Count) suite(s) are wired into CI"
 
-      # ORDER, NOT PRESENCE - and the difference is the whole check.
-      #
-      # tests\SUTestGuard.ps1 defines a Remove-Item shadow, and a function shadows the cmdlet only
-      # for code that runs AFTER the definition. Dot-source it BELOW lib\common.ps1 and
-      # common.ps1's own load has already bound the real cmdlet; in Invoke-InstallerTests.ps1 that
-      # is the one-line margin SUTestGuard.ps1:19-24 describes, where three Remove-Item calls
-      # reach the repository's own manifest\tools.json. The guard would still be in the file, the
-      # arm-time control would still print "ARMED", and the exposure would be back.
-      #
-      # `(Get-Content $f) -match 'SUTestGuard'` passes with the dot-source sitting anywhere,
-      # including last - so it asserts the STATEMENT EXISTS rather than the CONDITION holding,
-      # which is the lazy shape this repository's standing rule forbids. Taking the FIRST
-      # dot-source out of the AST and checking what it loads asserts the order instead.
-      #
-      # The invocation OPERATOR is what identifies a dot-source, not the command name:
-      # `. (Join-Path $PSScriptRoot 'SUTestGuard.ps1')` has no command name at all - its first
-      # element is a parenthesised expression - so GetCommandName() returns nothing here.
-      - name: The deletion guard is the first dot-source in every suite
+      # PINNED. markdownlint-cli can add a rule in a minor release and turn this job red on
+      # unchanged documentation. 0.48.0 is what catalog.json's npm-global entry put on the
+      # maintainer's workstation (measured 2026-09-17), so CI and the local gate judge the same
+      # markdown by the same rules. The runner prints the version it used on every run, so a skew
+      # is visible in the log rather than mysterious.
+      - name: Install markdownlint-cli
+        if: ${{ !cancelled() }}
+        shell: powershell
+        run: npm install -g markdownlint-cli@0.48.0 --no-fund --no-audit
+
+      # ONE STEP FOR ALL SIX CHECKS, and that is not a regression from six steps: the runner
+      # reports every check before it exits, so a failure in the parse check no longer hides the
+      # markdown check the way a failing STEP hid everything below it.
+      - name: Repo checks - parse, gate wiring, guard order, test writers, control bytes, markdown
+        if: ${{ !cancelled() }}
         shell: powershell
         run: |
-          $bad = 0
-          foreach ($f in Get-ChildItem .\tests -Filter 'Invoke-*Tests.ps1') {
-            $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
-            $dots = @($ast.FindAll({ param($n)
-              $n -is [System.Management.Automation.Language.CommandAst] -and
-              $n.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Dot }, $true) |
-              Sort-Object { $_.Extent.StartOffset })
-            if ($dots.Count -eq 0) {
-              Write-Host ("FAIL {0}: no dot-source at all, so tests\SUTestGuard.ps1 is never loaded" -f $f.Name)
-              $bad++
-              continue
-            }
-            $first = $dots[0]
-            $text = $first.Extent.Text.Trim()
-            if ($text -notmatch 'SUTestGuard\.ps1[''"]?\s*\)?\s*$') {
-              Write-Host ("FAIL {0}:{1}: the first dot-source loads {2} - tests\SUTestGuard.ps1 must come before it" -f `
-                $f.Name, $first.Extent.StartLineNumber, $text)
-              $bad++
-            } else {
-              Write-Host ("ok   {0}:{1} loads the guard first" -f $f.Name, $first.Extent.StartLineNumber)
-            }
-          }
-          if ($bad) { exit 1 }
-          "the deletion guard is the first dot-source in every suite"
-
-      # The deletion tripwire shadows Remove-Item, and nothing can shadow Set-Content safely (its
-      # positional Path AND positional Value, plus a pipeline-bound -Value, make a naive proxy
-      # truncate a multi-item write to its last line). So the writers that reach REAL user state
-      # with no path parameter to redirect are prohibited from tests by inspection instead.
-      #
-      # Write-AgentBlock is deliberately NOT on this list: it takes an explicit -FilePath, so a
-      # test can point it at TEMP, and one does. The four below cannot be redirected at all -
-      # Write-AgentDiscovery and Remove-AgentBlocks default to four files in the user's profile
-      # including the global CLAUDE.md, and the two PATH helpers rewrite the persistent user PATH.
-      # A test calling any of them is a negative test aimed at real machine state, which is the
-      # exact shape of the 2026-09-10 incident.
-      #
-      # SUTestGuard.ps1's header claimed this check existed before it did. Written 2026-09-11.
-      - name: No test reaches a writer that cannot be redirected
-        shell: powershell
-        run: |
-          $banned = @('Write-AgentDiscovery', 'Remove-AgentBlocks', 'Remove-UserPathEntry', 'Add-UserPathEntry')
-          $bad = 0
-          foreach ($f in Get-ChildItem .\tests -Filter '*.ps1') {
-            $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
-            foreach ($c in $ast.FindAll({ param($n)
-                $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
-              $name = $c.GetCommandName()
-              if ($name -and ($banned -contains $name)) {
-                Write-Host ("FAIL {0}:{1} calls {2} - it writes real user state and takes no path to redirect" -f `
-                  $f.Name, $c.Extent.StartLineNumber, $name)
-                $bad++
-              }
-            }
-          }
-          if ($bad) { exit 1 }
-          ("no test calls any of: " + ($banned -join ', '))
-
-      # Stray control characters are the signature of a patch script whose string escapes were
-      # interpreted: a Windows path written as "scripts\build" in a tool that processes \b yields
-      # a literal BACKSPACE, "P:\tb\native" yields TAB and newline. Two such files reached main on
-      # 2026-09-11 - one in a comment, one inside a single-quoted PowerShell string in a test that
-      # PASSED, because a single-quoted string may legally span lines and the mangled argument was
-      # never read on the path under test.
-      #
-      # That is why this is a byte check and not a review item: the damage is invisible in every
-      # editor and in every `Read`, survives parsing, and survives a green suite. Only `cat -A` or
-      # a byte scan shows it. TAB, CR and LF are the only control characters a source file in this
-      # repo has any business containing.
-      - name: No stray control characters in tracked files
-        shell: powershell
-        run: |
-          # ONE COMPILED REGEX, not a per-byte PowerShell loop. Measured 2026-09-11 over a
-          # 48-file / 961 KB tree: the loop was 2,559 ms, this is 39 ms (66x), identical findings.
-          # Recorded because the obvious alternative LOSES: [Array]::FindIndex with a
-          # [Predicate[byte]] measured 3,642 ms - SLOWER than the loop - because the predicate is
-          # a scriptblock invoked once per byte. Same trap class as -Include under -LiteralPath.
-          $rx = [regex]::new('[\x00-\x08\x0B\x0C\x0E-\x1F]')
-          $bad = 0
-          $seen = 0
-          $exts = '.ps1', '.psm1', '.json', '.yml', '.md', '.xml', '.cmd'
-          foreach ($f in (Get-ChildItem -Recurse -File | Where-Object { $exts -contains $_.Extension })) {
-            $seen++
-            $text = [IO.File]::ReadAllText($f.FullName)
-            $m = $rx.Match($text)
-            if ($m.Success) {
-              $rel = $f.FullName.Substring((Get-Location).Path.Length + 1)
-              $line = ($text.Substring(0, $m.Index) -split "`n").Count
-              Write-Host ("FAIL {0}:{1} contains control byte 0x{2:X2} - an interpreted string escape, almost certainly a backslash sequence from a patch script" -f $rel, $line, [int][char]$m.Value[0])
-              $bad++
-            }
-          }
-          if ($bad) { exit 1 }
-          if ($seen -eq 0) { Write-Host 'FAIL scanned 0 files - this check examined nothing'; exit 1 }
-          "no stray control characters in any of $seen tracked source files"
+          .\scripts\run-gate-checks.ps1
+          # $LASTEXITCODE is UNDEFINED at the start of a step, so `-ne 0` is TRUE and
+          # `exit $null` yields exit code 0. Bind the value first so the check is real.
+          $code = $LASTEXITCODE
+          if ($null -eq $code) { Write-Host 'FAIL the checks runner set no exit code'; exit 1 }
+          if ($code -ne 0) { exit $code }

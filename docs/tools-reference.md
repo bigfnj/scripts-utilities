@@ -213,6 +213,7 @@ tshark -r capture.pcap -q -z "follow,tcp,ascii,0"
 # Statistics
 tshark -r capture.pcap -q -z conv,tcp
 ```
+
 Live capture (`tshark -i`) requires the Npcap driver. The **silent winget Wireshark install
 does NOT include Npcap**, so `tshark -i` reports "Unable to load Npcap (wpcap.dll)" until Npcap
 is installed separately. Reading pcap/pcapng files works without Npcap.
@@ -362,7 +363,7 @@ Measured cost of adding them: **zero occurrences in 40,000 sampled events**. Ver
 end - an `rm -rf` from the agent shell now records both the files and the command that removed
 them:
 
-```
+```text
 image   : C:\Anthropic\.Git\usr\bin\rm.exe
 cmdline : rm.exe -rf /c/Users/Admin/.rmproof
 parent  : C:\Anthropic\.Git\usr\bin\bash.exe
@@ -515,6 +516,7 @@ cdb -version
 ```
 
 `cdb` vs `WinDbgX`:
+
 | | cdb/kd | WinDbgX |
 |---|---|---|
 | Output capture | `-c ".logopen out.txt; q"` | `.logopen` inside GUI |

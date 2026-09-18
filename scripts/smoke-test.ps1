@@ -698,9 +698,14 @@ if (-not (Test-Path -LiteralPath $smokeLintLib)) {
 # the from-disk list simply stops finding it and the floor had no name to miss. The suite it
 # covers is the one holding smoke-test.ps1's own checks capable of failing, so its silent removal
 # is the single most expensive deletion available in this repository.
+#
+# Invoke-GateChecksTests.ps1 is on the floor from the day it was written, for the reason the
+# paragraph above gives one level up: it covers lib\GateChecks.ps1, whose six checks stopped
+# running in CI for six days in September 2026 without anyone noticing. A suite whose subject has
+# already gone silently missing once is the last one that should be deletable in silence.
 $suiteRequired = @('Invoke-CoreTests.ps1', 'Invoke-InstallerTests.ps1',
                    'Invoke-TriageTests.ps1', 'Invoke-RenderTests.ps1',
-                   'Invoke-SmokeLintTests.ps1')
+                   'Invoke-SmokeLintTests.ps1', 'Invoke-GateChecksTests.ps1')
 $suiteFiles = @(Get-ChildItem -LiteralPath (Join-Path $REPO_ROOT 'tests') -Filter 'Invoke-*Tests.ps1' `
                     -File -ErrorAction SilentlyContinue | Sort-Object Name)
 foreach ($suiteReq in $suiteRequired) {

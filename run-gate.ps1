@@ -51,7 +51,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('smoke')]
+    [ValidateSet('checks', 'smoke')]
     [string]$Only,
 
     # The label goes into a whitespace-delimited log line, so it may not contain whitespace.
@@ -66,6 +66,22 @@ $ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.ex
 if (-not (Test-Path -LiteralPath $ps51)) { Write-Host "FATAL: Windows PowerShell 5.1 not found at $ps51" -ForegroundColor Red; exit 2 }
 
 $suites = @(
+    # FIRST, because it is cheap, deterministic and depends on nothing outside the repository - a
+    # malformed repo should be named before a multi-minute toolbox sweep.
+    #
+    # These six checks existed ONLY as inline PowerShell inside .github\workflows\gate.yml, so
+    # this gate could not run them. When an unrelated suite went red on 2026-09-11 the failing
+    # step aborted the job and CI stopped running them too, for six days, while reporting exactly
+    # one problem. lib\GateChecks.ps1 is now the one definition and the workflow calls this same
+    # runner, in a separate job a red suite cannot abort.
+    #
+    # A CHILD powershell.exe, like every other suite here, and this is the sharpest case for that
+    # rule: the parse check calls [Parser] IN-PROCESS and [Parser] uses the grammar of the host it
+    # runs in. Dot-sourcing the library into THIS process would check 7's grammar whenever the
+    # gate is launched from pwsh - the defect scripts\smoke-test.ps1 already records, one layer out.
+    @{ Name = 'checks'
+       Path = 'scripts\run-gate-checks.ps1'
+       What = 'parse under 5.1, gate wiring, guard order, test writers, control bytes, markdown' }
     @{ Name = 'smoke'
        Path = 'scripts\smoke-test.ps1'
        What = 'toolbox, PATH, agent blocks, forensics sensors + every suite in tests\' }
@@ -215,7 +231,9 @@ foreach ($s in $suites) {
     # have silently stopped being surfaced here. "tripwire ARMED" is surfaced for the same
     # reason: on a green run nothing else prints it, and it is the only evidence that the suites
     # ran with the deletion guard live.
-    foreach ($line in ($out -split "`r?`n" | Where-Object { $_ -match 'suite: \d+ passed|tripwire ARMED' })) {
+    # The per-check verdicts are surfaced for the same reason: the checks runner prints one line
+    # per check, and a silent drop from six checks to one would otherwise still read as green.
+    foreach ($line in ($out -split "`r?`n" | Where-Object { $_ -match 'suite: \d+ passed|tripwire ARMED|^\s*(ok|FAIL)\s+check ' })) {
         Write-Host ("         {0}" -f $line.Trim()) -ForegroundColor DarkGray
     }
 
@@ -243,7 +261,16 @@ foreach ($s in $suites) {
 #
 # So the property is not "the suites pass", it is "the suites pass THE SAME WAY in both modes".
 # Cost is one extra child per suite, which is cheaper than six days.
+# Only when smoke actually ran, because smoke is what produced the -File counts to compare
+# against. `-Only checks` is meant to be a ~2 s inner loop; running five extra suites to compare
+# them with nothing would make it the slowest path in the file.
+$parityWanted = (-not $Only) -or ($Only -eq 'smoke')
+
 Write-Host ''
+if (-not $parityWanted) {
+    Write-Host ("skipped  parity      -Only {0} ran no suites to compare against" -f $Only) -ForegroundColor DarkGray
+}
+if ($parityWanted) {
 Write-Host 'running  parity      every suite again IN-SESSION, the way CI invokes it' -ForegroundColor DarkGray
 
 $suiteFiles = @(Get-ChildItem -LiteralPath (Join-Path $repoRoot 'tests') -Filter 'Invoke-*Tests.ps1' -File -ErrorAction SilentlyContinue |
@@ -291,6 +318,7 @@ foreach ($f in $suiteFiles) {
         Write-Host ("         ok   parity {0}: {1} passed in both modes" -f $short, $pt.Passed) -ForegroundColor DarkGray
     }
 }
+}
 
 # --- phase ledger -------------------------------------------------------------
 if ($PSBoundParameters.ContainsKey('Phase')) {
@@ -298,6 +326,17 @@ if ($PSBoundParameters.ContainsKey('Phase')) {
     Write-Host ("--- phase '{0}' ---" -f $Phase) -ForegroundColor Cyan
 
     $phaseCounts = [ordered]@{}
+
+    # The checks column comes first because the runner runs first, and it buys a second,
+    # independent tripwire on the check registry for free: DELETE a check and the count drops
+    # from 6 to 5, which the decrease rule below treats as fatal DRIFT.
+    #
+    # Deliberate consequence, stated because it looks like a bug: a check that FAILS also lowers
+    # the count, so it is reported twice - once as FAILED, once as DRIFT. That is the semantics
+    # this ledger already has for every test suite, so it is consistent rather than clever.
+    $ck = @($results | Where-Object { $_.Suite -eq 'checks' })[0]
+    $phaseCounts['checks'] = if (-not $ck) { 'skipped' } else { Format-GateCount $ck.Passed }
+
     $sm = @($results | Where-Object { $_.Suite -eq 'smoke' })[0]
     $phaseCounts['smoke'] =
         if (-not $sm) { 'skipped' }
