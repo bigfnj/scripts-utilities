@@ -27,7 +27,19 @@ Repo is on `main`, pushed, CI **green on both jobs** (`suites` and `checks`). Ga
 triage=31`, and parity green on all seven suites under CI's invocation *and* CI's error preference.
 
 The previous 29 open items are closed: fixed, refuted, or recorded as decisions in
-`docs/engineering-record.md`. What follows is what this round surfaced.
+`docs/engineering-record.md`. What follows is what this round surfaced, minus what was then fixed
+the same day:
+
+- **The HF bearer token is off curl's command line.** `Get-HFFile` now passes the header through
+  `curl -K <tempfile>`, removed in a `finally`. Proved by reading the spawned process's own command
+  line back through CIM: token present before, absent after, and `curl -sv` confirms the header is
+  still sent.
+- **`markdownlint-cli` is pinned to 0.48.0** in `catalog.json`, matching what CI installs, so a
+  local `npm update -g` can no longer make the local gate stricter than CI.
+- **`logs/` growth is reported** by a new smoke group rather than pruned.
+- **The gate passes from a worktree.** The agent-block comparison is re-based onto the main
+  checkout, derived from the `.git` file with no git invocation, and it announces the re-base on
+  every run. Verified from a probe worktree: four failures became four OK.
 
 **The single most useful thing learned, worth applying before anything below.** A test that passes
 locally and fails in CI is an **environment divergence**, and there were three, all of which had
@@ -42,33 +54,6 @@ been invisible:
 
 `run-gate.ps1` now re-runs every suite in-session under `Stop` and compares tallies, so all three
 fail locally. If you add a test, ask what on this box it is quietly reading.
-
----
-
-## Security - HIGH
-
-### `Get-HFFile` puts the HuggingFace bearer token on curl's command line
-
-`scripts/install-whisper.ps1`, `Get-HFFile`: the token is read from
-`%USERPROFILE%\.cache\huggingface\token` and then passed as a process argument,
-`@("-H", "Authorization: Bearer $tok")`, to `curl.exe`.
-
-A Windows process command line is readable by any other process on the box through
-`Get-CimInstance Win32_Process`, so the token is exposed for the lifetime of the download - and this
-machine runs Sysmon with `ProcessCreate` capture, which records command lines to an event log.
-
-The function already knows: its own comment says nothing may echo `$curlArgs` and cites
-`install-ghidra.ps1`'s `Get-Json` on what a logged token costs here. Not echoing it does not help,
-because the argument vector *is* the exposure.
-
-**Fix sketch, in preference order.** `curl -K <configfile>` reads options from a file, so
-`header = "Authorization: Bearer ..."` in a short-lived file under `%TEMP%` keeps it off every
-command line; delete the file in a `finally`. `--netrc-file` is the other supported route.
-`Invoke-WebRequest` with a header hashtable avoids a command line entirely but is Schannel-backed,
-which `docs/agent-rules.md` records as failing inside agent sandboxes.
-
-Mitigating, and the reason this is HIGH rather than urgent: `install-whisper.ps1` is manual-only -
-nothing in the repo invokes it - and the token is a read scope.
 
 ---
 
@@ -132,11 +117,18 @@ Notes that change what to do about each:
 - **(4) is a non-issue by design.** 15 lines across the repo's whole history; the ledger's value is
   the history.
 
-**Recommendation: report the counts, do not add pruners.** See the rule at the top of this file. A
-one-line count per pattern in the smoke test costs nothing and carries no blast radius, and the total
-at stake across all four is under 200 KB. If a pruner is ever wanted, the blast radius of each is
-narrow and fixed (a literal prefix plus a timestamp suffix, one directory, no other files match), and
-that should be stated in the proposal rather than discovered afterwards.
+**DONE, as reporting rather than pruning**, 2026-09-18. `scripts/smoke-test.ps1` has a
+`logs retention` group that counts and sizes all four patterns on every run, warning at 25 files or
+10 MB per pattern - thresholds chosen to be reachable (about twenty more runs at one file per run)
+rather than decorative, and mutation-tested by dropping the bar to 2 and watching two OK lines become
+WARNs.
+
+Deliberately no pruner, and the trade is the reason: under 200 KB is at stake in total, this box has
+lost ~123,605 files to a script that deleted what it should not have, and two of the four patterns
+are **inputs** rather than output. The remaining decision, if anyone ever wants automatic pruning, is
+recorded here: the blast radius of each is narrow and fixed (a literal prefix plus a timestamp
+suffix, one directory, nothing else matches), and that should be stated in the proposal rather than
+discovered afterwards.
 
 ### The `%TEMP%` fixture sweep's 30-minute window is an assumption, not a measurement
 
@@ -152,24 +144,28 @@ number - but it is a number, and nothing asserts the suite finishes inside it. I
 grows a long-running test, the gate becomes wrong in the dangerous direction. Currently 0 orphans on
 this box, so the sweep is working.
 
-### The gate cannot print `gate passed` from inside a worktree
+### The Sysmon config check fails on any FRESH checkout, because of line endings
 
-`scripts/smoke-test.ps1`, the agent-discovery group. The generated block embeds `$RepoRoot`, and the
-group compares it against the four deployed copies in `%USERPROFILE%`, which name the main checkout.
-Run from `.claude/worktrees/agent-*`, four checks fail with `Managed by:` pointing at the worktree.
+`scripts/smoke-test.ps1` compares the deployed `C:\ProgramData\Sysmon\filedelete-forensics.xml`
+against `config/sysmon-filedelete.xml` rendered for the current profile, by hash.
 
-Measured by two agents independently this round: baseline `73 passed / 3 warnings / 5 failed` from a
-worktree before either changed anything, with an identical failure set afterwards. The check even
-annotates the case correctly on the next line ("names a live checkout of this repo, not the one
-running this gate") and still counts it as a failure.
+`core.autocrlf=true` and there is no `.gitattributes`, so the bytes of that template are a property
+of the **checkout**, not of the repo. Measured 2026-09-18: the main working copy carries **LF**
+(15,912 bytes, byte-identical to `git show HEAD:`) while a fresh worktree checkout of the same
+commit carries **CRLF** (16,163 bytes), differing at char 5 of line 1. The rendered hash therefore
+differs and the check reports the deployed config as stale.
 
-Consequence worth naming: an agent working in a worktree cannot get a clean gate, so "gate passed"
-stops being usable as its done-criterion and has to be replaced with "the failure set is unchanged
-from baseline". Repairing it the obvious way is actively harmful - it would deploy a `CLAUDE.md`
-into the user's profile pointing at a temporary worktree.
+This is not a worktree quirk. **Any fresh clone fails this check**, which makes it the first thing a
+new workstation sees. Same class `lib/ShimFormat.ps1`'s header already records about here-strings:
+"the bytes have to be a property of THIS CODE, not of the machine or of the checkout".
 
-Candidate fix: when the running checkout is a worktree (`git rev-parse --git-common-dir` differs from
-`--git-dir`), report the four as SKIPPED-with-reason rather than FAILED, and say so on every run.
+**Not fixed, and the reason is the freeze**: `config/sysmon-filedelete.xml`,
+`lib/SysmonConfig.ps1` and `scripts/install-deletion-forensics.ps1` are the deliberately frozen
+forensics subsystem. The two candidate fixes are a `.gitattributes` pinning that file (or the tree)
+to LF, which has repo-wide renormalisation blast radius and is exactly the condition
+`ShimFormat.ps1` is written to work around; or normalising line endings inside
+`Get-RenderedSysmonConfig` before hashing, which is a one-line change in a frozen file. Neither
+should be done without the owner deciding which.
 
 ### A null environment read cannot be linted here, and there are 30 of them
 
