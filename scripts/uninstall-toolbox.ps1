@@ -236,7 +236,7 @@ if ($se.PSObject.Properties.Name -contains 'path_entries_machine_relative') {
     }
 }
 foreach ($var in @($se.env_vars)) {
-    $val = [System.Environment]::GetEnvironmentVariable($var, "User")
+    $val = [string][System.Environment]::GetEnvironmentVariable($var, "User")
     if (-not $val) { continue }
     if ($DryRun) { Write-Info "[DRY-RUN] would clear User env var: $var"; continue }
     [System.Environment]::SetEnvironmentVariable($var, $null, "User")

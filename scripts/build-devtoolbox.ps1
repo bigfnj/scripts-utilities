@@ -207,8 +207,8 @@ function Sync-EnvPath {
     # one place that trade came out the other way, and it did because the format had exactly one
     # correct answer - a PATH root legitimately has two. So: keep both, and keep them behaviourally
     # identical. If you change one, change the other.
-    $machine = [System.Environment]::GetEnvironmentVariable("PATH", "Machine")
-    $user = [System.Environment]::GetEnvironmentVariable("PATH", "User")
+    $machine = [string][System.Environment]::GetEnvironmentVariable("PATH", "Machine")
+    $user = [string][System.Environment]::GetEnvironmentVariable("PATH", "User")
     $paths = @()
     # Test-Path, because on the first build native\bin and the venv do not exist yet. Adding a
     # directory that is not there is not free: it is a dead entry that every later call preserves,
@@ -1214,7 +1214,7 @@ raise SystemExit(1 if failures else 0)
 '@ | Set-Content -Path (Join-Path $scriptsDir "python_tooling_smoke_test.py") -Encoding ASCII
 
 @'
-import json, os, subprocess
+import json, os, subprocess, tempfile
 from pathlib import Path
 
 root = Path(os.environ.get("CODEX_TOOLBOX", Path.home() / "AppData/Local/DevToolbox"))
@@ -1236,14 +1236,40 @@ commands = {
 }
 results, failures, warnings = {}, [], []
 # Cold-start-heavy GUI apps (LibreOffice, ImageMagick) need a longer budget than CLI tools.
+# These are real upper bounds now rather than padding for the bug described below.
 slow = {"soffice": 120, "magick": 120}
+# THE TIMEOUT ONLY BOUNDS THIS CALL IF stdout IS NOT A PIPE. This is not a style choice.
+#
+# CPython's subprocess.run does the following on Windows when the timeout fires:
+#
+#     process.kill()
+#     exc.stdout, exc.stderr = process.communicate()   # <- no timeout on this one
+#
+# That second read waits for EOF on the pipe. soffice.exe launches soffice.bin and
+# returns, and the grandchild INHERITS the pipe's write end, so killing the direct child
+# never closes it and the call blocks for as long as the grandchild lives - whatever
+# timeout was asked for. Measured 2026-09-18, a 2s timeout against a grandchild holding
+# stdout for 20s:
+#
+#     stdout=PIPE        asked 2.0s, elapsed 20.2s, TimeoutExpired
+#     stdout=temp file   asked 2.0s, elapsed  0.1s, COMPLETED
+#
+# The file version does not merely bound the call, it removes a FALSE timeout: the direct
+# child had been exiting immediately all along, and the pipe was the only thing making it
+# look slow. This is what stalled a real build on soffice for about four minutes, which the
+# old code then recorded as a harmless 30-second version-check warning.
 for name, cmd in commands.items():
     wrapper = bin_dir / f"{cmd[0]}.cmd"
     if wrapper.exists():
         cmd = [str(wrapper), *cmd[1:]]
     try:
-        completed = subprocess.run(cmd, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=slow.get(name, 30))
-        results[name] = {"returncode": completed.returncode, "output": completed.stdout[:1000]}
+        with tempfile.TemporaryFile() as sink:
+            completed = subprocess.run(cmd, env=env, stdout=sink, stderr=subprocess.STDOUT, timeout=slow.get(name, 30))
+            sink.seek(0)
+            # Bytes, because text=True does not apply to a file handle we opened. errors=
+            # replace because several of these tools emit non-UTF-8 banner characters.
+            output = sink.read().decode("utf-8", "replace")
+        results[name] = {"returncode": completed.returncode, "output": output[:1000]}
         if completed.returncode not in (0, 1):
             failures.append({"name": name, "returncode": completed.returncode})
     except subprocess.TimeoutExpired as exc:
@@ -1293,7 +1319,7 @@ raise SystemExit(1 if failures else 0)
 '@ | Set-Content -Path (Join-Path $scriptsDir "heavy_tooling_smoke_test.py") -Encoding ASCII
 
 @'
-import json, os, subprocess
+import json, os, subprocess, tempfile
 from pathlib import Path
 
 root = Path(os.environ.get("CODEX_TOOLBOX", Path.home() / "AppData/Local/DevToolbox"))
@@ -1314,8 +1340,16 @@ for name in ["sigcheck64.exe", "handle64.exe", "streams64.exe", "du64.exe"]:
         results[name] = {"exists": True, "note": "existence-checked (enumeration tool, not run)"}
         continue
     try:
-        completed = subprocess.run([str(exe), *probe[name]], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
-        results[name] = {"returncode": completed.returncode, "output": completed.stdout[:500]}
+        # A temp file rather than a PIPE, for the reason spelled out in the native tooling
+        # probe above: with stdout=PIPE, subprocess.run's timeout does not bound the call
+        # when the process leaves a grandchild holding the write end. None of these
+        # Sysinternals tools is known to do that, but the same 20s promise is made here and
+        # it should mean the same thing in both files.
+        with tempfile.TemporaryFile() as sink:
+            completed = subprocess.run([str(exe), *probe[name]], stdout=sink, stderr=subprocess.STDOUT, timeout=20)
+            sink.seek(0)
+            output = sink.read().decode("utf-8", "replace")
+        results[name] = {"returncode": completed.returncode, "output": output[:500]}
     except subprocess.TimeoutExpired as exc:
         warnings.append({"name": name, "error": repr(exc)})
     except Exception as exc:

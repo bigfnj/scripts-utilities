@@ -48,6 +48,76 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 
 $script:DryRun = $false
 
+# FIXTURE OWNERSHIP, which is what the sweep below decides on instead of age.
+#
+# The age gate it replaces was a GUESS - 30 minutes, chosen because it was three orders of
+# magnitude past any observed run - and nothing asserted the suite finished inside it. Grow one
+# long-running test and the guess becomes wrong in the dangerous direction: the sweep starts
+# deleting the live fixtures of a run still in progress, which is the corruption it was added to
+# prevent (two concurrent runs scored 106/2 before the gate existed).
+#
+# Ownership has no such window. A root is abandoned when the process that made it is gone, which
+# is a fact rather than an estimate, and it cannot be true of a run that is still going.
+#
+# PID REUSE is handled, because a bare PID is not enough: Windows recycles them, so a stranded
+# fixture's number can belong to something unrelated later. The marker records the owner's process
+# START TIME alongside it, and both must match for the owner to count as alive.
+#
+# EVERY UNCERTAINTY RESOLVES TO "ALIVE", i.e. to not deleting: an unreadable start time, a
+# protected process, our own PID. On this box that bias is the only defensible one - the deleter
+# that took 123,605 files did so by being confident.
+$script:SUOwnerMarker = '.su-fixture-owner'
+
+function New-SUFixtureRoot {
+    <#
+        Create a fixture root under TEMP and stamp it with this process's identity. One
+        definition for all three roots, so a new fixture cannot forget the marker and then be
+        treated as abandoned by a concurrent run.
+    #>
+    param([Parameter(Mandatory)][string]$Prefix)
+    $path = Join-Path ([IO.Path]::GetTempPath()) ($Prefix + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $path -Force | Out-Null
+    $stamp = "$PID|unknown"
+    try { $stamp = "$PID|" + (Get-Process -Id $PID).StartTime.Ticks } catch { }
+    Set-Content -LiteralPath (Join-Path $path $script:SUOwnerMarker) -Value $stamp -Encoding ASCII
+    return $path
+}
+
+function Test-SUFixtureAbandoned {
+    <#
+        Is this fixture root's owning process gone? Returns $false whenever that cannot be
+        established, because the caller deletes on $true.
+    #>
+    param([Parameter(Mandatory)][string]$Root)
+
+    $marker = Join-Path $Root $script:SUOwnerMarker
+    if (-not (Test-Path -LiteralPath $marker)) {
+        # No marker: a root from before this mechanism, or one whose creation was interrupted
+        # between mkdir and stamp. Fall back to the old age window so those are still collected
+        # rather than accumulating for ever - this is the only path that still uses a clock.
+        try { return ((Get-Item -LiteralPath $Root -ErrorAction Stop).LastWriteTime -lt (Get-Date).AddMinutes(-30)) }
+        catch { return $false }
+    }
+
+    $raw = ''
+    try { $raw = [string](@(Get-Content -LiteralPath $marker -ErrorAction Stop))[0] } catch { return $false }
+    $parts = $raw.Split('|')
+    if ($parts.Count -ne 2) { return $false }
+
+    $ownerPid = 0
+    if (-not [int]::TryParse($parts[0], [ref]$ownerPid)) { return $false }
+    # Our own fixture. Cannot be abandoned, and Get-Process would say it is alive anyway.
+    if ($ownerPid -eq $PID) { return $false }
+
+    $proc = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+    if (-not $proc) { return $true }
+
+    $ownerTicks = 0L
+    if (-not [long]::TryParse($parts[1], [ref]$ownerTicks)) { return $false }
+    # Same PID, different process: recycled, so the original owner is gone.
+    try { return ($proc.StartTime.Ticks -ne $ownerTicks) } catch { return $false }
+}
+
 # SELF-HEALING SWEEP, run before anything creates a fixture.
 #
 # This suite builds three module-scope fixture roots (installer-tests-, agentblock-, builder-
@@ -65,27 +135,28 @@ $script:DryRun = $false
 #
 # Deleting only inside TEMP, which is also the one place tests\SUTestGuard.ps1's shadow permits.
 #
-# AGE-GATED, and the age is what makes this suite safe to run twice at once.
+# OWNERSHIP-GATED, and that is what makes this suite safe to run twice at once.
 #
-# Without the filter this sweep deletes EVERY installer-tests-*, agentblock-* and builder-tests-*
+# Without a filter this sweep deletes EVERY installer-tests-*, agentblock-* and builder-tests-*
 # directory in TEMP, including the live fixtures of a run already in progress. $scratch below
 # holds $script:MANIFEST, so a second run starting mid-flight pulls the manifest out from under
 # the first one and the failures land on whatever test happens to touch it next - a corruption
 # that reads exactly like a code bug. This box runs concurrent agent sessions by design, and the
 # repo's own rule about a shared checkout says so; worktrees isolate FILES and share TEMP.
 #
-# 30 minutes is longer than any observed run of this suite (seconds) by three orders of magnitude,
-# so a stranded directory is still collected on the next run and the self-healing property the
-# block above describes is unchanged. Nothing asserts the sweep, so the suite count does not move.
-$suSweepCutoff = (Get-Date).AddMinutes(-30)
+# Test-SUFixtureAbandoned asks whether the OWNING PROCESS is gone, which cannot be true of a run
+# still in progress, so this no longer rests on the suite finishing inside a guessed window. The
+# 30-minute age gate it replaces was never asserted anywhere: grow one long-running test and it
+# would have become wrong in the dangerous direction. See that function's header for the PID-reuse
+# handling and for why every uncertainty resolves to "do not delete". Nothing asserts the sweep
+# itself, so the suite count does not move.
 foreach ($stalePrefix in 'installer-tests-', 'agentblock-', 'builder-tests-') {
     Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Directory -Filter "$stalePrefix*" -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -lt $suSweepCutoff } |
+        Where-Object { Test-SUFixtureAbandoned -Root $_.FullName } |
         ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
-$scratch = Join-Path ([IO.Path]::GetTempPath()) ("installer-tests-" + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Path $scratch -Force | Out-Null
+$scratch = New-SUFixtureRoot -Prefix 'installer-tests-'
 $script:MANIFEST = Join-Path $scratch 'tools.json'
 
 # REFUSING TO RUN rather than reporting a failed test: if the redirect above did not take, the
@@ -1831,8 +1902,7 @@ Write-Host "`n== the agent-block writer must not reinterpret the body it is give
 # That is how it first failed: the placeholder file was never written, Write-AgentBlock took its
 # APPEND path instead of the REPLACE path, and the assertion that the surrounding file survived
 # was reported as a writer bug. Self-contained, inside TEMP so the deletion tripwire permits it.
-$abRoot = Join-Path ([IO.Path]::GetTempPath()) ("agentblock-" + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Path $abRoot -Force | Out-Null
+$abRoot = New-SUFixtureRoot -Prefix 'agentblock-'
 
 It 'a body containing $-sequences round-trips through Write-AgentBlock byte for byte' {
     # Write-AgentBlock used `$content -replace $pattern, $replacement`, and the replacement side
@@ -2466,8 +2536,7 @@ It 'New-VenvCliWrappers writes exactly the ShimFormat bytes, and still skips the
 # what gives the Test-Path assertions something to be about.
 #
 # Fixture root of its own, not $scratch - line 330 already removed that one.
-$bdRoot = Join-Path ([IO.Path]::GetTempPath()) ("builder-tests-" + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Path $bdRoot -Force | Out-Null
+$bdRoot = New-SUFixtureRoot -Prefix 'builder-tests-'
 
 function Get-BuilderFnScope {
     # One or more builder functions, alone, as a dot-sourceable scriptblock. Extent text rather
@@ -2529,8 +2598,8 @@ It 'and it still produces a REAL PATH - every Machine and User entry, each exact
     # property of the FUNCTION rather than of this box's PATH happening to contain no repeats.
     $defs = Get-BuilderFnScope -Name 'Sync-EnvPath'
     if (-not $defs) { Write-Host "       Sync-EnvPath is gone" -ForegroundColor DarkYellow; return $false }
-    $machine = @([System.Environment]::GetEnvironmentVariable('PATH', 'Machine') -split ';' | Where-Object { $_ })
-    $user    = @([System.Environment]::GetEnvironmentVariable('PATH', 'User')    -split ';' | Where-Object { $_ })
+    $machine = @([string][System.Environment]::GetEnvironmentVariable('PATH', 'Machine') -split ';' | Where-Object { $_ })
+    $user    = @([string][System.Environment]::GetEnvironmentVariable('PATH', 'User')    -split ';' | Where-Object { $_ })
     $saved = $env:PATH
     try {
         $got = & {
@@ -3092,7 +3161,120 @@ It 'the manifest is written BOTH before and after the smoke step' {
     ($before.Count -ge 1) -and ($after.Count -ge 1)
 }
 
+It 'the generated probes capture stdout to a FILE, so their timeouts actually bound them' {
+    # subprocess.run's timeout does NOT bound the call when stdout is a pipe and the process
+    # leaves a grandchild holding the write end. CPython kills the direct child and then calls
+    # communicate() a second time with no timeout, which waits for an EOF that never arrives.
+    #
+    # Measured 2026-09-18, a 2s timeout against a grandchild holding stdout for 20s:
+    #     pipe       elapsed 20.2s, TimeoutExpired
+    #     temp file  elapsed  0.1s, COMPLETED
+    #
+    # soffice.exe launches soffice.bin and returns, which is precisely that shape. It stalled a
+    # real build for about four minutes while the probe recorded a harmless 30-second warning,
+    # so the tool looked slow and the budget looked respected.
+    #
+    # Checked as source text because these probe bodies are Python inside here-strings, and it
+    # asserts the CONDITION (no pipe capture anywhere, one sink per call) rather than the
+    # presence of a line.
+    $src = Get-Content -LiteralPath $builderPs1 -Raw
+    # A FLOOR, so a rename cannot let this pass by matching nothing at all.
+    $runs = ([regex]::Matches($src, 'subprocess\.run\(')).Count
+    if ($runs -lt 2) {
+        Write-Host ("       found {0} subprocess.run( call(s) in the builder - expected at least 2" -f $runs) -ForegroundColor DarkYellow
+        return $false
+    }
+    $pipes = ([regex]::Matches($src, 'stdout=subprocess\.PIPE')).Count
+    $sinks = ([regex]::Matches($src, 'tempfile\.TemporaryFile\(\)')).Count
+    if ($pipes) { Write-Host ("       {0} pipe-capturing call(s) remain" -f $pipes) -ForegroundColor DarkYellow }
+    if ($sinks -lt $runs) { Write-Host ("       {0} temp-file sink(s) for {1} subprocess.run call(s)" -f $sinks, $runs) -ForegroundColor DarkYellow }
+    ($pipes -eq 0) -and ($sinks -ge $runs)
+}
+
 Remove-Item -LiteralPath $bdRoot -Recurse -Force -ErrorAction SilentlyContinue
+
+Write-Host "`n== the fixture sweep deletes by OWNERSHIP, not by a guessed age ==" -ForegroundColor Cyan
+
+# A prefix the real sweep does NOT match, so these fixtures cannot be collected by the very
+# mechanism under test while the test is running.
+$ownRoot = Join-Path ([IO.Path]::GetTempPath()) ("suownership-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $ownRoot -Force | Out-Null
+
+function New-OwnerCase {
+    param([Parameter(Mandatory)][string]$Label, [string]$MarkerContent, [switch]$NoMarker)
+    $dir = Join-Path $ownRoot ($Label + '-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    if (-not $NoMarker) {
+        Set-Content -LiteralPath (Join-Path $dir $script:SUOwnerMarker) -Value $MarkerContent -Encoding ASCII
+    }
+    return $dir
+}
+
+It 'a fixture owned by a LIVE process is never swept' {
+    # THE DIRECTION THAT ACTUALLY CORRUPTED SOMETHING. Two concurrent runs scored 106/2 because
+    # the sweep deleted a live $scratch holding $script:MANIFEST out from under the other run.
+    # Stamped by New-SUFixtureRoot itself, so this also proves the marker is written.
+    $dir = New-SUFixtureRoot -Prefix 'suownership-live-'
+    try {
+        if (-not (Test-Path -LiteralPath (Join-Path $dir $script:SUOwnerMarker))) {
+            Write-Host "       New-SUFixtureRoot wrote no owner marker" -ForegroundColor DarkYellow
+            return $false
+        }
+        -not (Test-SUFixtureAbandoned -Root $dir)
+    } finally {
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+It 'a fixture whose owner has EXITED is swept' {
+    # A GENUINELY dead PID rather than a number assumed to be free: spawn a process, wait for it
+    # to exit, then use its PID. The control below refuses to assert anything if the OS has not
+    # actually released it.
+    $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', 'exit' -PassThru -WindowStyle Hidden
+    $proc.WaitForExit()
+    $deadPid = $proc.Id
+    if (Get-Process -Id $deadPid -ErrorAction SilentlyContinue) {
+        Write-Host "       pid $deadPid is somehow still live - the dead-owner path was not exercised" -ForegroundColor DarkYellow
+        return $false
+    }
+    $dir = New-OwnerCase -Label 'dead' -MarkerContent ("{0}|123456" -f $deadPid)
+    Test-SUFixtureAbandoned -Root $dir
+}
+
+It 'a RECYCLED pid does not protect an abandoned fixture' {
+    # A bare PID is not an identity - Windows reuses the numbers - so the marker records the
+    # owner's process START TIME beside it. Here the number is live but the start time cannot
+    # match, which is exactly the recycled case, and the fixture must still be collected.
+    #
+    # The helper exits on its own in ~15s and is deliberately not killed.
+    $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', 'ping', '-n', '15', '127.0.0.1' -PassThru -WindowStyle Hidden
+    $livePid = $proc.Id
+    if (-not (Get-Process -Id $livePid -ErrorAction SilentlyContinue)) {
+        Write-Host "       helper exited before the assertion - the recycled path was not exercised" -ForegroundColor DarkYellow
+        return $false
+    }
+    # Ticks of 1 cannot be any real process's start time.
+    $dir = New-OwnerCase -Label 'recycled' -MarkerContent ("{0}|1" -f $livePid)
+    Test-SUFixtureAbandoned -Root $dir
+}
+
+It 'a fixture with NO marker falls back to age, and a fresh one is KEPT' {
+    # Roots created before this mechanism, or interrupted between mkdir and stamp. The age
+    # fallback is the only remaining clock in the decision, and a just-created directory is
+    # nowhere near it.
+    $dir = New-OwnerCase -Label 'nomarker' -NoMarker
+    -not (Test-SUFixtureAbandoned -Root $dir)
+}
+
+It 'an UNREADABLE marker is treated as LIVE, because a deleter must not guess' {
+    # Every uncertainty resolves to "do not delete". This box lost 123,605 files to a deleter
+    # that was confident, so the bias is the whole design and it needs a test that fails if
+    # somebody inverts it for tidiness.
+    $dir = New-OwnerCase -Label 'garbage' -MarkerContent 'not-a-pid-at-all'
+    -not (Test-SUFixtureAbandoned -Root $dir)
+}
+
+Remove-Item -LiteralPath $ownRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host "`n== the shim writers and the gates that notice when one stops running ==" -ForegroundColor Cyan
 

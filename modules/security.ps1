@@ -258,7 +258,7 @@ function security_configure_symbols {
         else { New-Item -ItemType Directory -Path $cache -Force | Out-Null }
     }
     $symPath = "srv*$cache*https://msdl.microsoft.com/download/symbols"
-    $current = [System.Environment]::GetEnvironmentVariable("_NT_SYMBOL_PATH", "User")
+    $current = [string][System.Environment]::GetEnvironmentVariable("_NT_SYMBOL_PATH", "User")
     if ($current -eq $symPath) {
         Write-Skip "_NT_SYMBOL_PATH already configured"
     } elseif ($script:DryRun) {
@@ -281,7 +281,7 @@ function security_install_ghidra {
 
         # Pin GHIDRA_INSTALL_DIR (Ghidra's own convention - analyzeHeadless and scripts
         # read it) so it's stable for the user and future detection is instant.
-        if ([System.Environment]::GetEnvironmentVariable("GHIDRA_INSTALL_DIR", "User") -ne $existing.FullName) {
+        if ([string][System.Environment]::GetEnvironmentVariable("GHIDRA_INSTALL_DIR", "User") -ne $existing.FullName) {
             if (-not $script:DryRun) {
                 [System.Environment]::SetEnvironmentVariable("GHIDRA_INSTALL_DIR", $existing.FullName, "User")
             }
@@ -363,7 +363,7 @@ function Find-GhidraInstall {
     # roots. Validates by ghidraRun.bat and handles the common double-nested extraction
     # (ghidra_x\ghidra_x\ghidraRun.bat). Prefers the highest version name.
     foreach ($ov in @($env:GHIDRA_INSTALL_DIR,
-                       [System.Environment]::GetEnvironmentVariable("GHIDRA_INSTALL_DIR", "User"))) {
+                       [string][System.Environment]::GetEnvironmentVariable("GHIDRA_INSTALL_DIR", "User"))) {
         if ($ov -and (Test-Path (Join-Path $ov "ghidraRun.bat"))) { return (Get-Item -LiteralPath $ov) }
     }
 
@@ -457,7 +457,7 @@ function Find-DebuggersInstall {
     # then the two standard Windows Kits roots.
     $arch = if ([System.Environment]::Is64BitOperatingSystem) { "x64" } else { "x86" }
     foreach ($ov in @($env:WINDBG_DEBUGGERS_PATH,
-                       [System.Environment]::GetEnvironmentVariable("WINDBG_DEBUGGERS_PATH", "User"))) {
+                       [string][System.Environment]::GetEnvironmentVariable("WINDBG_DEBUGGERS_PATH", "User"))) {
         if ($ov -and (Test-Path (Join-Path $ov "cdb.exe"))) { return $ov }
     }
     $candidates = @(
@@ -509,7 +509,7 @@ function security_install_console_debuggers {
     # Persist WINDBG_DEBUGGERS_PATH so future bootstrap detects instantly without
     # scanning all of Windows Kits. The _NT_SYMBOL_PATH already set by
     # security_configure_symbols applies to cdb/kd/ntsd automatically.
-    $cur = [System.Environment]::GetEnvironmentVariable("WINDBG_DEBUGGERS_PATH", "User")
+    $cur = [string][System.Environment]::GetEnvironmentVariable("WINDBG_DEBUGGERS_PATH", "User")
     if ($cur -ne $dbgDir) {
         if (-not $script:DryRun) {
             [System.Environment]::SetEnvironmentVariable("WINDBG_DEBUGGERS_PATH", $dbgDir, "User")

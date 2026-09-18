@@ -56,7 +56,11 @@ function New-GCFixtureRepo {
 . (Join-Path `$PSScriptRoot 'SUTestGuard.ps1')
 `$x = 1
 "@)
-    [IO.File]::WriteAllText((Join-Path $root 'lib\x.ps1'), "function Get-X { 'x' }`r`n")
+    # Carries ONE compliant environment read, so the env-reads check has something to examine and
+    # this fixture keeps the property its header claims: it passes every check. Without a read at
+    # all, that check correctly hits its own floor and the fixture would stop being a clean base.
+    [IO.File]::WriteAllText((Join-Path $root 'lib\x.ps1'),
+        "function Get-X { 'x' }`r`n`$gcEnv = [string][System.Environment]::GetEnvironmentVariable('PATH', 'User')`r`n")
     [IO.File]::WriteAllText((Join-Path $root 'scripts\run-gate-checks.ps1'), "'runner'`r`n")
     [IO.File]::WriteAllText((Join-Path $root 'docs\a.md'), "# Title`r`n`r`nSome prose.`r`n")
     [IO.File]::WriteAllText((Join-Path $root '.markdownlint.json'), "{}`r`n")
@@ -413,12 +417,56 @@ It 'Resolve-GCMarkdownlint returns an Application, never the .ps1 shim' {
 
 Write-Host "`n== the registry, and one broken check not taking the others with it ==" -ForegroundColor Cyan
 
-It 'the registry lists exactly the six expected checks, in order' {
+It 'the registry lists exactly the seven expected checks, in order' {
     # WRITTEN DOWN rather than enumerated, and deliberately so: an enumeration compared against
     # itself can never notice a deletion. Same argument as smoke-test.ps1's $suiteRequired floor.
-    $want = @('parse', 'wiring', 'guard-order', 'writers', 'control-bytes', 'markdown')
+    #
+    # It is also why adding a check cannot be a quiet diff: 'env-reads' arriving on 2026-09-18
+    # failed this test until the name was added here on purpose. Keep it that way.
+    $want = @('parse', 'wiring', 'guard-order', 'writers', 'control-bytes', 'env-reads', 'markdown')
     $got = @(Get-GateCheckTable | ForEach-Object { $_.Name })
     ($got.Count -eq $want.Count) -and (-not (Compare-Object $got $want -SyncWindow 0))
+}
+
+It 'env-reads: a clean repo reports the reads it examined and no findings' {
+    $root = New-GCFixtureRepo
+    $res = Get-GCEnvReadResult -RepoRoot $root
+    if ($res.Examined -lt 1) { Write-Host "       examined $($res.Examined) read(s)" -ForegroundColor DarkYellow }
+    ($res.Examined -ge 1) -and ($res.Findings.Count -eq 0)
+}
+
+It 'env-reads: an UNCAST GetEnvironmentVariable is a finding, on the right line' {
+    # The read returns $null for a value that does not exist, and a later method call on it
+    # throws. This is the form that killed smoke-test.ps1's PATH truncation check on a fresh
+    # profile, where HKCU\Environment\Path genuinely does not exist.
+    $root = New-GCFixtureRepo
+    [IO.File]::WriteAllText((Join-Path $root 'lib\x.ps1'),
+        "function Get-X { 'x' }`r`n`$bad = [System.Environment]::GetEnvironmentVariable('PATH', 'User')`r`n")
+    $res = Get-GCEnvReadResult -RepoRoot $root
+    $f = @($res.Findings | Where-Object { $_.Rule -eq 'uncast' })
+    ($f.Count -eq 1) -and ($f[0].Line -eq 2) -and ($f[0].File -eq 'lib\x.ps1')
+}
+
+It 'env-reads: a MENTION in a comment or a string is not a read' {
+    # AST, not grep. A check that counted text would report this file as two violations and the
+    # repo would then be "fixed" by editing prose.
+    $root = New-GCFixtureRepo
+    [IO.File]::WriteAllText((Join-Path $root 'lib\x.ps1'), @"
+# [System.Environment]::GetEnvironmentVariable('PATH', 'User') in a comment
+`$note = '[System.Environment]::GetEnvironmentVariable(''PATH'', ''User'') in a string'
+`$real = [string][System.Environment]::GetEnvironmentVariable('PATH', 'User')
+"@)
+    $res = Get-GCEnvReadResult -RepoRoot $root
+    ($res.Examined -eq 1) -and ($res.Findings.Count -eq 0)
+}
+
+It 'FLOOR env-reads: zero reads found is a failure, not a clean sweep' {
+    # If the API is renamed or the AST walk breaks, this check must say so rather than report
+    # that it swept everything and found nothing wrong.
+    $root = New-GCFixtureRepo
+    [IO.File]::WriteAllText((Join-Path $root 'lib\x.ps1'), "function Get-X { 'x' }`r`n")
+    $res = Get-GCEnvReadResult -RepoRoot $root
+    @($res.Findings | Where-Object { $_.Rule -eq 'floor' }).Count -eq 1
 }
 
 It 'every registered check is reachable - one result per registered name' {

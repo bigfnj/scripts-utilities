@@ -601,6 +601,67 @@ function Get-GCMarkdownResult {
 }
 
 
+function Get-GCEnvReadResult {
+    <#
+        Every [System.Environment]::GetEnvironmentVariable(...) read must be cast to [string].
+
+        It returns $null for a value that does not exist, and a method call on the result then
+        throws "You cannot call a method on a null-valued expression". Not theoretical:
+        HKCU\Environment\Path is genuinely absent on a newly created profile, so
+        scripts\smoke-test.ps1's 4095-char PATH truncation check died on $null.TrimEnd(';') on
+        exactly the fresh box a workstation setup is aimed at - and because that file sets neither
+        Stop nor StrictMode it printed red, CONTINUED, and emitted no verdict at all. 23 further
+        reads sat one refactor away from the same thing.
+
+        BACKLOG proposed dataflow analysis, because none of the reads is a direct .Method chain -
+        every one goes through a variable, so tracing "can this null reach a dereference" would
+        need it. THIS ASKS A DIFFERENT QUESTION: not whether a null can reach a method, but whether
+        the read was written in the form that cannot produce one. [string]$null is '', so the cast
+        is free on a value that exists and removes the class outright. A cheap total rule beats an
+        expensive precise one.
+
+        AST, not grep, for two reasons: the cast has to be the PARENT of the call, which no regex
+        can establish, and a mention inside a comment or a string is not a read.
+    #>
+    param([Parameter(Mandatory)][string]$RepoRoot)
+
+    $findings = @()
+    $files = @(Get-GCSourceFiles -RepoRoot $RepoRoot -Extension '.ps1')
+    $reads = 0
+
+    foreach ($f in $files) {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+        if (-not $ast) { continue }
+        $calls = @($ast.FindAll({
+                    param($n)
+                    ($n -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) -and
+                    ($n.Member.Extent.Text -ieq 'GetEnvironmentVariable')
+                }, $true))
+        foreach ($c in $calls) {
+            $reads++
+            $parent = $c.Parent
+            $cast = ($parent -is [System.Management.Automation.Language.ConvertExpressionAst]) -and
+                    ($parent.Type.TypeName.Name -ieq 'string')
+            if (-not $cast) {
+                $findings += New-GCFinding -Check 'env-reads' -File (Get-GCRelativePath -RepoRoot $RepoRoot -Path $f.FullName) `
+                    -Line $c.Extent.StartLineNumber -Rule 'uncast' `
+                    -Message 'GetEnvironmentVariable is not cast to [string] - it returns $null for a value that does not exist'
+            }
+        }
+    }
+
+    # A FLOOR. If the reads stop being found - a renamed API, a broken AST walk - this check must
+    # fail rather than report a clean sweep of nothing.
+    if ($reads -eq 0) {
+        $findings += New-GCFinding -Check 'env-reads' -Rule 'floor' `
+            -Message 'found 0 GetEnvironmentVariable reads - this check examined nothing'
+    }
+
+    New-GCResult -Check 'env-reads' -Examined $reads -Findings $findings `
+        -Evidence ("{0} environment read(s) in {1} .ps1 file(s), all cast to [string]" -f $reads, $files.Count)
+}
+
+
 function Get-GateCheckTable {
     <#
         The registry, in run order. ONE object, so a check cannot be listed-but-unreachable or
@@ -612,6 +673,7 @@ function Get-GateCheckTable {
         [pscustomobject]@{ Name = 'guard-order';   Run = { param($Ctx) Get-GCGuardOrderResult -RepoRoot $Ctx.RepoRoot } }
         [pscustomobject]@{ Name = 'writers';       Run = { param($Ctx) Get-GCWriterResult -RepoRoot $Ctx.RepoRoot } }
         [pscustomobject]@{ Name = 'control-bytes'; Run = { param($Ctx) Get-GCControlByteResult -RepoRoot $Ctx.RepoRoot } }
+        [pscustomobject]@{ Name = 'env-reads';     Run = { param($Ctx) Get-GCEnvReadResult -RepoRoot $Ctx.RepoRoot } }
         [pscustomobject]@{ Name = 'markdown';      Run = { param($Ctx) Get-GCMarkdownResult -RepoRoot $Ctx.RepoRoot -MarkdownRunner $Ctx.MarkdownRunner } }
     )
 }

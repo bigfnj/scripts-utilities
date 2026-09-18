@@ -260,10 +260,12 @@ if (Test-Path $tbRoot) {
     #
     # A truncated PATH is what removed git and the whole sysinternals layer on this box once, so
     # the one machine where this check is most valuable was the one where it could not fire.
-    $userPath = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
-    if ($null -eq $userPath) { $userPath = '' }
-    $machinePath = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
-    if ($null -eq $machinePath) { $machinePath = '' }
+    #
+    # The [string] cast is the guard, and it replaced a pair of `if ($null -eq ...)` lines that
+    # did the same thing longhand. It is now the repo-wide idiom for this read and
+    # lib\GateChecks.ps1 enforces it, because the same null was waiting behind 23 other reads.
+    $userPath = [string][System.Environment]::GetEnvironmentVariable('PATH', 'User')
+    $machinePath = [string][System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
     $nativeBin = Join-Path $tbRoot 'native\bin'
     if (Test-Path $nativeBin) {
         $onUser = @($userPath -split ';' | Where-Object { $_.TrimEnd('\') -ieq $nativeBin.TrimEnd('\') })
@@ -351,13 +353,13 @@ if (Test-Path $tbRoot) {
     # The toolbox Python must be discoverable via TOOLBOX_PYTHON instead.
     $venvPython = Join-Path $tbRoot 'python\.venv\Scripts\python.exe'
     if (Test-Path $venvPython) {
-        $tp = [System.Environment]::GetEnvironmentVariable('TOOLBOX_PYTHON', 'User')
+        $tp = [string][System.Environment]::GetEnvironmentVariable('TOOLBOX_PYTHON', 'User')
         if ($tp -and ($tp.TrimEnd('\') -ieq $venvPython.TrimEnd('\'))) { Test-Ok "TOOLBOX_PYTHON persisted" }
         else { Test-Fail "TOOLBOX_PYTHON not set - tools cannot locate the toolbox Python 3.11" }
     }
     $tess = Join-Path $tbRoot 'native\tesseract\tessdata'
     if (Test-Path $tess) {
-        $tpx = [System.Environment]::GetEnvironmentVariable('TESSDATA_PREFIX', 'User')
+        $tpx = [string][System.Environment]::GetEnvironmentVariable('TESSDATA_PREFIX', 'User')
         if ($tpx -and ($tpx.TrimEnd('\') -ieq $tess.TrimEnd('\'))) { Test-Ok "TESSDATA_PREFIX persisted" }
         else { Test-Warn "TESSDATA_PREFIX not persisted - OCR language data may not resolve" }
     }

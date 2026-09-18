@@ -195,7 +195,7 @@ function Remove-StaleAgentBlocks {
 
 function Remove-StaleCodexToolboxEnv {
     foreach ($scope in @("User", "Machine")) {
-        $value = [System.Environment]::GetEnvironmentVariable("CODEX_TOOLBOX", $scope)
+        $value = [string][System.Environment]::GetEnvironmentVariable("CODEX_TOOLBOX", $scope)
         if (-not $value) { continue }
         if ($value.TrimEnd('\') -ieq $CANONICAL_TOOLBOX.TrimEnd('\')) { continue }
         if ($DryRun) {
@@ -301,9 +301,9 @@ function Test-OldToolchainDetected {
         if (Test-Path -LiteralPath $path) { return $true }
     }
     foreach ($scope in @("User", "Machine")) {
-        $value = [System.Environment]::GetEnvironmentVariable("CODEX_TOOLBOX", $scope)
+        $value = [string][System.Environment]::GetEnvironmentVariable("CODEX_TOOLBOX", $scope)
         if ($value -and ($value.TrimEnd('\') -ine $CANONICAL_TOOLBOX.TrimEnd('\'))) { return $true }
-        $pathValue = [System.Environment]::GetEnvironmentVariable("PATH", $scope)
+        $pathValue = [string][System.Environment]::GetEnvironmentVariable("PATH", $scope)
         foreach ($oldRoot in $KNOWN_OLD_TOOLBOX_ROOTS) {
             if ($pathValue -and ($pathValue -like "*$oldRoot*")) { return $true }
         }
@@ -361,11 +361,11 @@ function Assert-OldToolchainClean {
         if (Test-Path -LiteralPath $path) { $problems += "old toolbox path remains: $path" }
     }
     foreach ($scope in @("User", "Machine")) {
-        $value = [System.Environment]::GetEnvironmentVariable("CODEX_TOOLBOX", $scope)
+        $value = [string][System.Environment]::GetEnvironmentVariable("CODEX_TOOLBOX", $scope)
         if ($value -and ($value.TrimEnd('\') -ine $CANONICAL_TOOLBOX.TrimEnd('\'))) {
             $problems += "stale $scope CODEX_TOOLBOX remains: $value"
         }
-        $pathValue = [System.Environment]::GetEnvironmentVariable("PATH", $scope)
+        $pathValue = [string][System.Environment]::GetEnvironmentVariable("PATH", $scope)
         foreach ($oldRoot in $KNOWN_OLD_TOOLBOX_ROOTS) {
             if ($pathValue -and ($pathValue -like "*$oldRoot*")) {
                 $problems += "stale $scope PATH entry references: $oldRoot"
@@ -413,7 +413,7 @@ function Register-ToolboxUserPath {
     # system interpreter, and no 3.11 python.exe is registered or on PATH.
     $venvPython = Join-Path $toolboxRoot "python\.venv\Scripts\python.exe"
     if (Test-Path -LiteralPath $venvPython) {
-        $curPy = [System.Environment]::GetEnvironmentVariable("TOOLBOX_PYTHON", "User")
+        $curPy = [string][System.Environment]::GetEnvironmentVariable("TOOLBOX_PYTHON", "User")
         if ($curPy -ne $venvPython) {
             if ($DryRun) {
                 Write-Info "[DRY-RUN] would set User TOOLBOX_PYTHON=$venvPython"
@@ -447,7 +447,7 @@ function Register-ToolboxUserPath {
     $hasLangData = ($langFiles.Count -gt 0) -and
         (@($langFiles | Where-Object { $_.Name -eq 'eng.traineddata' }).Count -gt 0)
     if ($hasLangData) {
-        $current = [System.Environment]::GetEnvironmentVariable("TESSDATA_PREFIX", "User")
+        $current = [string][System.Environment]::GetEnvironmentVariable("TESSDATA_PREFIX", "User")
         if ($current -ne $tessdata) {
             if ($DryRun) {
                 Write-Info "[DRY-RUN] would set User TESSDATA_PREFIX=$tessdata"

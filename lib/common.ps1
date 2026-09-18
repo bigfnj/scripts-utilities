@@ -51,8 +51,8 @@ PowerShell window and confirm 'winget --version' works before running bootstrap.
 # the wrong input here. The prohibition is on the round trip - reading expanded and WRITING that
 # back - and nothing below writes.
 function Sync-EnvPath {
-    $machine = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
-    $user    = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+    $machine = [string][System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
+    $user    = [string][System.Environment]::GetEnvironmentVariable('PATH', 'User')
     $paths = @()
     $toolboxRoot = if ($env:CODEX_TOOLBOX) { $env:CODEX_TOOLBOX }
                    else { "$env:LOCALAPPDATA\DevToolbox" }
@@ -533,7 +533,7 @@ function Set-NodeSystemCaBundle {
         return
     }
     Set-Content -LiteralPath $bundle -Value $lines -Encoding ASCII
-    $cur = [System.Environment]::GetEnvironmentVariable('NODE_EXTRA_CA_CERTS', 'User')
+    $cur = [string][System.Environment]::GetEnvironmentVariable('NODE_EXTRA_CA_CERTS', 'User')
     if ($cur -ne $bundle) {
         [System.Environment]::SetEnvironmentVariable('NODE_EXTRA_CA_CERTS', $bundle, 'User')
         Write-Ok "NODE_EXTRA_CA_CERTS -> $bundle ($($seen.Count) roots)"
