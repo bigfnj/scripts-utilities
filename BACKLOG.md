@@ -28,11 +28,13 @@ triage=31`, and parity green on all seven suites under CI's invocation *and* CI'
 All seven suites also pass under `Set-StrictMode -Version Latest`, and the smoke test passes from
 inside a git worktree.
 
-One of those four smoke warnings is EXPECTED, and it is the new machinery working rather than a
-problem to chase: `build is DEGRADED in 1 component(s)` is the toolbox manifest honestly reporting
-the `pip check` failure described under Housekeeping. The other three are the long-standing optional
-ones - `cdb` and `poolmon` need a WDK/SDK install, and the weekly forensics task is admin-only to
-read.
+One of those four smoke warnings is EXPECTED and is **not** a task. `build is DEGRADED in 1
+component(s)` is the toolbox manifest honestly reporting a `pip check` failure that the owner has
+decided to keep: an orphaned `timm` another project installed into the shared venv. That decision,
+its evidence and its standing consequence are in `docs/engineering-record.md` - read it before
+"fixing" the warning, because uninstalling `timm` is explicitly not wanted. The other three
+warnings are the long-standing optional ones: `cdb` and `poolmon` need a WDK/SDK install, and the
+weekly forensics task is admin-only to read.
 
 The previous 29 open items are closed: fixed, refuted, or recorded as decisions in
 `docs/engineering-record.md`. What follows is what this round surfaced, minus what was then fixed
@@ -126,53 +128,6 @@ refusal against. Needs a real blocked URL before the detector can be trusted on 
 ---
 
 ## Housekeeping - LOW
-
-### `pip check` fails the build on an orphaned `timm`, which this repo never installs - NEEDS AN OWNER DECISION
-
-`scripts/build-devtoolbox.ps1`, `Run-Smoke`. Measured 2026-09-18, the exact and only output:
-
-```text
-timm 1.0.29 requires huggingface-hub, which is not installed.
-timm 1.0.29 requires safetensors, which is not installed.
-```
-
-`timm` appears in neither `$CorePackages`, nor `$HeavyPackages`, nor `catalog.json`, and
-`pip show timm` reports `Required-by:` **empty** - nothing in the venv depends on it.
-
-Provenance, read out of the dist-info metadata on 2026-09-18 rather than guessed:
-
-| evidence | value |
-|---|---|
-| installed | 2026-09-15 10:41, `INSTALLER` = `pip` |
-| `REQUESTED` marker | present on `av`, `einops` **and** `timm` - one explicit install named all three |
-| `direct_url.json` | absent, so plain PyPI rather than a local path or VCS |
-| same-transaction siblings | `av 18.1.0`, `einops 0.8.2`; nothing else shares that timestamp |
-| first-party importers | **none** - 21 hits for `import timm` under `D:\.ai-work`, every one inside `site-packages` or a `uv-cache` archive of `modelscope` |
-
-The missing deps are the tell. Of timm's five requirements, `torch`, `torchvision` and `pyyaml` were
-already in the venv from the toolbox's own package steps, and exactly the two that were **not** -
-`huggingface-hub` and `safetensors` - are the two absent. That is the signature of `--no-deps`,
-not of a later removal.
-
-So it is an abandoned experiment, three packages wide, installed into the **shared toolbox venv**
-rather than a project venv. `av` and `einops` are harmless, having no unmet requirements of their
-own; only `timm` breaks `pip check`. Checked and ruled out: wallpaperengine, the most likely
-candidate, has its own `.venv`, holds none of the three, and references none of them in its source.
-
-**Not resolved here on purpose.** The two directions are not equivalent and only the owner can pick:
-
-- `pip uninstall timm` removes the orphan and `pip check` goes clean. This is the honest fix and the
-  recommended one, but it is a deletion in a venv shared with the owner's GPU work.
-- `pip install huggingface-hub safetensors` also makes `pip check` clean and cannot break anything,
-  but it installs two packages to satisfy one that nothing needs, making the drift permanent.
-
-Consequence while it sits, as of the `-Soft` change in the same round: the other five probes now run
-and pass, the manifest records `smoke: run pip dependency check failed (exit 1)` in its `degraded`
-array, `scripts/smoke-test.ps1` surfaces that as a build-health WARN, and the build still exits
-non-zero. Visible and bounded rather than fatal and silent - but the build cannot report success
-until someone picks.
-
-This is box drift, not a repo defect: a fresh workstation has no `timm` and would not hit it.
 
 ### The native probe's `soffice` step outlived its 120s timeout and stalled a build - MECHANISM UNCONFIRMED
 

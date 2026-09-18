@@ -338,3 +338,47 @@ That is worth paying at a callsite whose answer is baked into a shim that then l
 Verified on the live two-version state before it was cleaned up: the build re-resolved to
 `qpdf 12.4.1`. The test uses a synthetic fixture named so the OLDER file sorts first, so it does not
 depend on this box, and it carries a control asserting that premise still holds.
+
+### The orphaned `timm` STAYS - owner's decision, 2026-09-18. Do not uninstall it
+
+`pip check` fails in `Run-Smoke` with exactly two lines, every run:
+
+```text
+timm 1.0.29 requires huggingface-hub, which is not installed.
+timm 1.0.29 requires safetensors, which is not installed.
+```
+
+**The owner has decided to leave it**, on the grounds that another project installed it for a
+reason and it costs little space. That decision is the point of this entry: a future pass will find
+an orphaned package with unmet dependencies, recognise it as drift, and want to remove it. Do not.
+
+Evidence gathered before the decision, so nobody re-derives it:
+
+| evidence | value |
+|---|---|
+| installed | 2026-09-15 10:41, `INSTALLER` = `pip` |
+| `REQUESTED` marker | present on `av`, `einops` **and** `timm` - one explicit install named all three |
+| `direct_url.json` | absent, so plain PyPI rather than a local path or VCS |
+| same-transaction siblings | `av 18.1.0`, `einops 0.8.2`; nothing else shares that timestamp |
+| `pip show timm` | `Required-by:` **empty** - nothing in the venv depends on it |
+| first-party importers | none found - 21 hits for an import of it across the work drive, every one inside `site-packages` or a `uv-cache` archive of `modelscope` |
+
+Of timm's five requirements, `torch`, `torchvision` and `pyyaml` were already present from the
+toolbox's own package steps and are satisfied; exactly the two that were not are the two missing.
+That is the signature of `--no-deps`, not of a later removal. `wallpaperengine` was checked and
+ruled out as the source: it has its own venv, holds none of the three, and references none of them.
+
+**THE STANDING CONSEQUENCE, which is the part that needs a decision of its own.** Because a failed
+smoke probe is fatal by design, `scripts/build-devtoolbox.ps1` now exits **non-zero on every run**
+on this box, permanently. The manifest records `smoke: run pip dependency check failed (exit 1)` and
+`scripts/smoke-test.ps1` reports it as a build-health WARN, both of which are honest and useful.
+The exit code is the problem: a build that always fails carries no signal, so a *new* smoke probe
+failure would land behind a known one and look identical to it. That is the same shape as the
+always-red merge gate recorded elsewhere, which hid six real checks for a month.
+
+Not resolved, because it changes gate semantics and wants an explicit yes. The narrow fix is an
+allowlist of accepted degraded entries, matched exactly and listed in one place, so the build can
+exit 0 while the manifest still records the entry and smoke still warns - and any entry NOT on the
+list still fails the build. The risk of that mechanism is obvious and worth writing down now: an
+allowlist is how a real failure eventually gets waved through, so it should be short, exact-match
+only, and require a reason string per entry.
