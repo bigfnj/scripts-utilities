@@ -1919,6 +1919,96 @@ It 'Add-UserPathEntry cannot reach its registry write under -DryRun' {
     $bad.Count -eq 0
 }
 
+# STUBBED REGISTRY HELPERS, in a & { } so they cannot leak into the sections either side.
+# PowerShell resolves function names up the CALL scope chain, so Remove-MachinePathEntry - defined
+# in this file's scope by the dot-source - finds the Get-RawPath/Set-RawPath/Test-PathAdmin
+# defined in here. That is the same seam the Install-CatalogItem stubs higher up use, and it is
+# what makes this the one PATH editor testable at RUNTIME rather than by inspection.
+#
+# Test-PathAdmin is stubbed to $true deliberately: unelevated the real one returns $false and the
+# function returns 'NeedsElevation' before it ever reaches a write, so the interesting half would
+# never run. Which means the stubs MUST be proven live before any call - hence Assert-SUStubbed,
+# called first in every body below. If the shadow had not taken, this would be handing the real
+# machine hive to a real writer, and the margin is one scope wide.
+& {
+    $script:SUFakeMachine = $null
+    $script:SUFakeWrites = New-Object 'System.Collections.Generic.List[string]'
+    function Get-RawPath    { param($Scope) return $script:SUFakeMachine }
+    function Set-RawPath    { param($Scope, $Value) $script:SUFakeWrites.Add("$Scope=$Value") }
+    function Sync-EnvPath   { }
+    function Test-PathAdmin { return $true }
+
+    function Assert-SUStubbed {
+        # REFUSING rather than failing, same shape as the $script:MANIFEST refusal at the top of
+        # this file: if the shadow did not take, Get-RawPath is the real registry reader and the
+        # next line would put the real machine PATH in front of a real Set-RawPath.
+        param([string]$Raw)
+        $script:SUFakeMachine = $Raw
+        $script:SUFakeWrites.Clear()
+        if ((Get-RawPath -Scope Machine) -ne $Raw) {
+            Write-Host "     REFUSING: the Get-RawPath stub did not take - this would read the REAL machine hive" -ForegroundColor Red
+            return $false
+        }
+        if (Test-PathAdmin) { return $true }
+        Write-Host "     REFUSING: the Test-PathAdmin stub did not take" -ForegroundColor Red
+        return $false
+    }
+
+    $suVarEntry = '%LOCALAPPDATA%\DevToolbox\native\bin'
+    $suVarExpanded = [Environment]::ExpandEnvironmentVariables($suVarEntry)
+
+    It 'Remove-MachinePathEntry EXPANDS to compare, so a hand-written %VAR% entry is found' {
+        # It used to hand $Path straight to Remove-PathEntryFromString and compare raw to raw, so
+        # an absolute literal never matched a %VAR% entry naming the same directory and the
+        # function answered 'NotPresent' - having written nothing and warned about nothing. The
+        # silent-subset shape: uninstall-toolbox.ps1 would report a clean reversal over an entry
+        # still sitting in HKLM. Measured before the fix, 2026-09-17: NotPresent, 0 writes.
+        if (-not (Assert-SUStubbed "$suVarEntry;C:\Windows\system32")) { return $false }
+        $status = Remove-MachinePathEntry -Path $suVarExpanded
+        ($status -eq 'Removed') -and (@($script:SUFakeWrites).Count -eq 1) -and
+            ($script:SUFakeWrites[0] -eq 'Machine=C:\Windows\system32')
+    }
+
+    It 'Remove-MachinePathEntry still matches the RAW literal, which is how both callers spell it' {
+        # The positive control on the form that already worked. A "fix" that traded one spelling
+        # for the other would break the only two call sites there are.
+        if (-not (Assert-SUStubbed "$suVarEntry;C:\Windows\system32")) { return $false }
+        $status = Remove-MachinePathEntry -Path $suVarEntry
+        ($status -eq 'Removed') -and (@($script:SUFakeWrites).Count -eq 1)
+    }
+
+    It 'Remove-MachinePathEntry says NotPresent for an absent entry and writes nothing' {
+        # The negative control. Expansion makes the comparison see MORE, and a matcher that had
+        # started saying yes too readily would remove entries nobody named - on the machine hive,
+        # which is the one this repo took down on 2026-09-09.
+        if (-not (Assert-SUStubbed 'C:\Windows\system32;%SystemRoot%\System32\Wbem')) { return $false }
+        $status = Remove-MachinePathEntry -Path 'C:\nowhere\at\all'
+        ($status -eq 'NotPresent') -and (@($script:SUFakeWrites).Count -eq 0)
+    }
+
+    It 'the %VAR% entries Remove-MachinePathEntry KEEPS are re-emitted raw, never expanded' {
+        # The expansion must stop at the comparison. Re-emitting it is the REG_SZ bug by another
+        # route: the value written back would be today's literal expansion of %SystemRoot%, and a
+        # REG_SZ PATH never expands a %VAR% again. This is why the fix lives in this function and
+        # not in Remove-PathEntryFromString, which deliberately does not expand at all.
+        if (-not (Assert-SUStubbed "%SystemRoot%\system32;$suVarEntry;%SystemRoot%\System32\Wbem")) { return $false }
+        $status = Remove-MachinePathEntry -Path $suVarExpanded
+        ($status -eq 'Removed') -and (@($script:SUFakeWrites).Count -eq 1) -and
+            ($script:SUFakeWrites[0] -eq 'Machine=%SystemRoot%\system32;%SystemRoot%\System32\Wbem') -and
+            ($script:SUFakeWrites[0] -notmatch [regex]::Escape($env:SystemRoot))
+    }
+
+    It 'Remove-MachinePathEntry writes nothing under -DryRun, even with a match' {
+        if (-not (Assert-SUStubbed "$suVarEntry;C:\Windows\system32")) { return $false }
+        $prev = $script:DryRun
+        try {
+            $script:DryRun = $true
+            $status = Remove-MachinePathEntry -Path $suVarExpanded
+        } finally { $script:DryRun = $prev }
+        ($status -eq 'DryRun') -and (@($script:SUFakeWrites).Count -eq 0)
+    }
+}
+
 It 'all three .bak- writers prune, so no fourth one can be added without noticing' {
     # THE ALLOW-LIST INVERTED. Three sites built "<file>.bak-<yyyyMMdd-HHmmss>" and not one of
     # them ever deleted a backup: 34 files / 356 KB had piled up across the four agent files,

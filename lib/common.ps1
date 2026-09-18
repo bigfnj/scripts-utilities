@@ -242,7 +242,27 @@ function Remove-UserPathEntry {
 function Remove-MachinePathEntry {
     param([Parameter(Mandatory)][string]$Path)
     $raw = Get-RawPath -Scope Machine
-    $res = Remove-PathEntryFromString -Value $raw -Remove @($Path)
+    # EXPANDED TO COMPARE, RAW TO REMOVE - the same split Remove-UserPathEntry above makes, and
+    # for the same reason. This function used to hand $Path straight to Remove-PathEntryFromString
+    # and compare raw text to raw text, which cannot see that '%LOCALAPPDATA%\DevToolbox\native\bin'
+    # and the expanded literal name one directory. Both callers derive their argument from an env
+    # var as an absolute literal, so nothing misfires today; the failure it leaves open is a
+    # hand-edited %VAR% machine entry the uninstaller reports as 'NotPresent' and walks away from,
+    # having written nothing and warned about nothing - the silent-subset shape this file keeps
+    # closing. Measured 2026-09-17 against a stubbed hive holding
+    # '%LOCALAPPDATA%\DevToolbox\native\bin': the expanded argument returned NotPresent with 0
+    # writes, while Remove-UserPathEntry handed the identical argument removed it.
+    #
+    # THE EXPANSION STOPS AT THE COMPARISON. $drop carries the untouched registry literals, so
+    # Remove-PathEntryFromString still matches and re-emits verbatim - it deliberately does not
+    # expand, and two tests assert that, because a value rebuilt from expansions is the REG_SZ
+    # bug by another route. The fix belongs here, not in the string helper.
+    $target = ([System.Environment]::ExpandEnvironmentVariables($Path)).TrimEnd('\')
+    $drop = @(Split-PathList $raw | Where-Object {
+        ([System.Environment]::ExpandEnvironmentVariables($_)).TrimEnd('\') -ieq $target
+    })
+    if ($drop.Count -eq 0) { return 'NotPresent' }
+    $res = Remove-PathEntryFromString -Value $raw -Remove $drop
     if (@($res.Removed).Count -eq 0) { return 'NotPresent' }
     if ($script:DryRun) {
         Write-Info "[DRY-RUN] would remove machine PATH entry: $Path"
