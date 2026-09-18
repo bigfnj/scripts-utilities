@@ -364,8 +364,50 @@ if (Test-Path $tbRoot) {
 # profile pass as healthy for a year - see the note at :454-456 below.
 Test-Hdr "agent discovery blocks"
 . (Join-Path $REPO_ROOT (Join-Path 'lib' 'AgentDiscovery.ps1'))
+
+# THE BODY IS GENERATED FOR THE MAIN CHECKOUT, NOT FOR THE ONE RUNNING THIS GATE, and that is what
+# makes this group usable from a git worktree.
+#
+# Write-AgentDiscovery's body embeds $RepoRoot - "Managed by: <root>" plus every docs path - so a
+# body generated from a worktree differs from the deployed copy in every line mentioning the root,
+# and all four targets report STALE. Measured 2026-09-18: two agents working in
+# .claude\worktrees\agent-* independently got `73 passed / 3 warnings / 5 failed` and neither could
+# use "gate passed" as a done-criterion; both fell back to "the failure set is unchanged from
+# baseline", which is far weaker. And the obvious repair is actively harmful - re-running bootstrap
+# from a worktree deploys a CLAUDE.md into the real user profile pointing at a temporary directory.
+#
+# So the comparison is re-based instead of skipped: the check stays a real staleness check, it just
+# asks the right question. A worktree's .git is a FILE containing `gitdir: <path>` rather than a
+# directory, and that path contains \.git\worktrees\, so the main root is derivable by string
+# surgery with NO git invocation - which also keeps this file clear of the native-command lint
+# rules it is policed by.
+$adMainRoot = $REPO_ROOT
+$adIsWorktree = $false
+$adRebaseNote = $null
+$adDotGit = Join-Path $REPO_ROOT '.git'
+if (Test-Path -LiteralPath $adDotGit -PathType Leaf) {
+    $adIsWorktree = $true
+    $adGitDirLine = @([IO.File]::ReadAllText($adDotGit) -split "`r?`n" |
+                      Where-Object { $_ -match '^\s*gitdir:\s*(\S.*)$' })[0]
+    if ($adGitDirLine -and $adGitDirLine -match '^\s*gitdir:\s*(\S.*)$') {
+        $adGitDir = ($Matches[1].Trim()) -replace '/', '\'
+        $adCut = $adGitDir.IndexOf('\.git\worktrees\', [StringComparison]::OrdinalIgnoreCase)
+        if ($adCut -gt 0) { $adMainRoot = $adGitDir.Substring(0, $adCut) }
+    }
+    if ($adMainRoot -ieq $REPO_ROOT) {
+        # Could not derive it. Say so rather than compare against the wrong root and report four
+        # failures that name the wrong cause.
+        $adRebaseNote = 'running from a worktree but the main checkout could not be derived from .git - the comparison below is against THIS checkout and may report stale'
+    } else {
+        $adRebaseNote = "running from a worktree; comparing against the generator as it would render for the main checkout ($adMainRoot)"
+    }
+}
+# UNCONDITIONAL when it applies. A re-based comparison that does not announce itself is
+# indistinguishable from one that was never needed.
+if ($adRebaseNote) { Write-Host ("  {0}" -f $adRebaseNote) -ForegroundColor DarkGray }
+
 $adGen = Get-AgentDiscoveryBody -CommonPath (Join-Path $REPO_ROOT (Join-Path 'lib' 'common.ps1')) `
-                                -RepoRoot $REPO_ROOT
+                                -RepoRoot $adMainRoot
 $adRegime = 'NO REFERENCE'
 $adTally  = 'the generator could not be read'
 if ($adGen.Reason) {
