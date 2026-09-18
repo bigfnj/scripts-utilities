@@ -21,6 +21,37 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $ToolboxSchemaVersion = 2
 
+# THE DEGRADED LEDGER, and the reason a build needs one.
+#
+# Three installers here are best-effort by explicit and defensible design: a missing Ghostscript
+# or a failed OCR language should not fail a whole toolbox build. But each one warned into the
+# transcript and then discarded what it knew - Install-Tessdata collected a $failed list, printed
+# it and dropped it, so a run that landed 0 of 11 languages still exited 0 - and NOTHING
+# aggregated the three into one verdict. bootstrap.ps1 gates readiness on the manifest merely
+# EXISTING, so a thoroughly degraded toolbox reported ready.
+#
+# One list, written into the manifest, read back by scripts\smoke-test.ps1 on every run. That is
+# what turns three transcript lines nobody re-reads into a fact the gate can state.
+#
+# NOT a schema_version bump: `degraded` is additive, every existing reader ignores unknown keys,
+# and bumping would make every manifest written before today read as an unknown schema. The
+# reader treats an absent key as "this manifest predates the ledger" and says so rather than
+# reporting a clean build it cannot actually vouch for.
+$script:BuildDegraded = New-Object 'System.Collections.Generic.List[string]'
+
+function Add-BuildDegraded {
+    <#
+        Record one soft failure. The component name is first so the manifest sorts usefully, and
+        the detail has to be specific enough to act on - "tessdata" tells you nothing, "tessdata:
+        3 of 11 languages missing (jpn, kor, chi_sim)" tells you whether to care.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Component,
+        [Parameter(Mandatory)][string]$Detail
+    )
+    $script:BuildDegraded.Add(("{0}: {1}" -f $Component, $Detail))
+}
+
 # THE ONLY DOT-SOURCE IN THIS FILE, and it stays the only one.
 #
 # This script is deliberately standalone: bootstrap.ps1 runs it as a CHILD PROCESS, so it gets
@@ -826,6 +857,7 @@ function Install-Ghostscript {
     $sevenZip = Find-Executable -Name "7z"
     if (-not $sevenZip) {
         Write-Warn "7z not available; skipping Ghostscript extraction"
+        Add-BuildDegraded -Component 'ghostscript' -Detail '7z was not available, so Ghostscript was never extracted'
         return
     }
     $url = "https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/download/gs10071/gs10071w64.exe"
@@ -853,6 +885,8 @@ function Install-Ghostscript {
             Write-Ok "$command -> $target"
         } else {
             Write-Warn "Ghostscript extracted, but $command was not found"
+            Add-BuildDegraded -Component 'ghostscript' -Detail (
+                "extracted, but {0} was not found, so no shim was written for it" -f $command)
         }
     }
 }
@@ -881,7 +915,14 @@ function Install-Tessdata {
         try { Get-Download -Url $url -OutFile $out -MinimumBytes 100KB }
         catch { Write-Warn "tessdata '$lang' download failed (non-fatal): $($_.Exception.Message)"; $failed += $lang }
     }
-    if ($failed.Count) { Write-Warn "tessdata not installed (rerun to retry): $($failed -join ', ')" }
+    if ($failed.Count) {
+        Write-Warn "tessdata not installed (rerun to retry): $($failed -join ', ')"
+        # Recorded, not just printed. This list used to be discarded here, which is how a run
+        # that landed 0 of 11 languages still exited 0 with nothing downstream able to tell.
+        Add-BuildDegraded -Component 'tessdata' -Detail (
+            "{0} of {1} language(s) missing ({2}) - OCR will fail on those languages; rerun to retry" -f `
+                $failed.Count, $langs.Count, ($failed -join ', '))
+    }
 }
 
 function Assert-NodeCaBundleSane {
@@ -1002,25 +1043,41 @@ function Write-ActivationHelpers {
     $activatePs1 = Join-Path $Root "scripts\Activate-CodexToolbox.ps1"
     $activateCmd = Join-Path $Root "scripts\activate-toolbox.cmd"
     $nativeBin = Join-Path $Root "native\bin"
-    $venvScripts = Join-Path $Root "python\.venv\Scripts"
     $tessdata = Join-Path $Root "native\tesseract\tessdata"
     if ($DryRun) {
         Write-Info "[DRY-RUN] write activation helpers"
         return
     }
+    # THE VENV Scripts DIRECTORY IS DELIBERATELY NOT ON THIS PATH, and it used to be.
+    #
+    # Both helpers prepended python\.venv\Scripts, which puts the toolbox python.exe and pip.exe
+    # on PATH - the one thing this toolbox's design forbids. A bare `python` is supposed to stay
+    # the sanctioned system interpreter, which is why %TOOLBOX_PYTHON% exists and why
+    # scripts\smoke-test.ps1 treats that directory being on the persistent PATH as a FAIL
+    # ("exposes python.exe (should be off PATH)"). So these helpers shipped a one-command way to
+    # put the machine into a state the gate calls broken.
+    #
+    # Removing it costs nothing, and that is the part worth stating: New-VenvCliWrappers already
+    # wraps every venv console script into native\bin, so the only things that directory
+    # contributed uniquely were the interpreter and pip - exactly the two the wrapper generator
+    # skips on purpose. Anything that genuinely needs the interpreter uses %TOOLBOX_PYTHON%.
 @"
 `$env:CODEX_TOOLBOX = '$Root'
 `$env:TESSDATA_PREFIX = '$tessdata'
-`$env:PATH = '$nativeBin;$venvScripts;' + `$env:PATH
+`$env:TOOLBOX_PYTHON = '$Root\python\.venv\Scripts\python.exe'
+`$env:PATH = '$nativeBin;' + `$env:PATH
 Write-Host "Codex toolbox activated: `$env:CODEX_TOOLBOX"
+Write-Host "  python: `$env:TOOLBOX_PYTHON (deliberately NOT on PATH)"
 "@ | Set-Content -Path $activatePs1 -Encoding ASCII
 
 @"
 @echo off
 set "CODEX_TOOLBOX=$Root"
 set "TESSDATA_PREFIX=$tessdata"
-set "PATH=$nativeBin;$venvScripts;%PATH%"
+set "TOOLBOX_PYTHON=$Root\python\.venv\Scripts\python.exe"
+set "PATH=$nativeBin;%PATH%"
 echo Codex toolbox activated: %CODEX_TOOLBOX%
+echo   python: %TOOLBOX_PYTHON% (deliberately NOT on PATH)
 "@ | Set-Content -Path $activateCmd -Encoding ASCII
 }
 
@@ -1245,6 +1302,15 @@ function Write-Manifest {
         schema_version = $ToolboxSchemaVersion
         created_at = (Get-Date).ToString("o")
         root = $Root
+        # THE COMBINED VERDICT the three best-effort installers never had. Empty on a healthy
+        # build; one entry per soft failure otherwise, each specific enough to act on.
+        # scripts\smoke-test.ps1 reads it back and reports it on every run, so a degraded toolbox
+        # stops being three warnings in a transcript nobody re-reads.
+        #
+        # @() FORCED, because ConvertTo-Json renders a one-element list as a bare scalar and the
+        # reader would then iterate its characters. A List[string] with one item is exactly the
+        # common case here.
+        degraded = @($script:BuildDegraded.ToArray())
         python = [ordered]@{
             executable = $Python
             venv = $venvPath

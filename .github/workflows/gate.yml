@@ -126,6 +126,20 @@ jobs:
           if ($null -eq $code) { Write-Host 'FAIL suite set no exit code'; exit 1 }
           if ($code -ne 0) { exit $code }
 
+      # lib\AgentDiscovery.ps1 ends in `& $sb` over source assembled from lib\common.ps1, so its
+      # allowlist is the only thing between this gate and executing whatever that generator
+      # contains. It had no tests until 2026-09-17, and two holes: it walked CommandAst only, so
+      # METHOD invocations were invisible, and it cleared the assignments while splicing two
+      # argument expressions per call into the same scriptblock unexamined.
+      - name: AgentDiscovery suite
+        if: ${{ !cancelled() }}
+        shell: powershell
+        run: |
+          .\tests\Invoke-AgentDiscoveryTests.ps1
+          $code = $LASTEXITCODE
+          if ($null -eq $code) { Write-Host 'FAIL suite set no exit code'; exit 1 }
+          if ($code -ne 0) { exit $code }
+
   # A SEPARATE JOB, not a step. Six checks lived in this file as inline PowerShell and stopped
   # running the day an unrelated suite went red. A second job cannot be aborted by the first
   # one's failure, so "the suites are broken" and "the repository is malformed" are now two

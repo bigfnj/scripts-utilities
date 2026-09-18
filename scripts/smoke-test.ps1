@@ -249,8 +249,21 @@ if ($py) {
 Test-Hdr "toolbox PATH readiness"
 $tbRoot = if ($env:CODEX_TOOLBOX) { $env:CODEX_TOOLBOX } else { "$env:LOCALAPPDATA\DevToolbox" }
 if (Test-Path $tbRoot) {
+    # COALESCED TO '', because $null here silently DELETES the check below.
+    #
+    # GetEnvironmentVariable returns $null when the registry value does not exist, and
+    # HKCU\Environment\Path is genuinely absent on a newly created profile - which is precisely
+    # the box a fresh-workstation run is aimed at. `$null.TrimEnd(';')` then throws "You cannot
+    # call a method on a null-valued expression", and because this file sets neither Stop nor
+    # StrictMode it prints red and CONTINUES: the 4095-char truncation check never runs, emits no
+    # Test-Ok / Test-Warn / Test-Fail, and the tally looks exactly the same as a pass.
+    #
+    # A truncated PATH is what removed git and the whole sysinternals layer on this box once, so
+    # the one machine where this check is most valuable was the one where it could not fire.
     $userPath = [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+    if ($null -eq $userPath) { $userPath = '' }
     $machinePath = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine')
+    if ($null -eq $machinePath) { $machinePath = '' }
     $nativeBin = Join-Path $tbRoot 'native\bin'
     if (Test-Path $nativeBin) {
         $onUser = @($userPath -split ';' | Where-Object { $_.TrimEnd('\') -ieq $nativeBin.TrimEnd('\') })
@@ -328,11 +341,17 @@ if (Test-Path $tbRoot) {
 }
 
 # -- Agent discovery blocks ----------------------------------------------------
-# BACKLOG.md:242-245 records this gap: the generator gained a Sysmon/deletion-forensics paragraph
-# (lib\common.ps1:564-575) that none of the four deployed CLAUDE.md/AGENTS.md copies has, and
-# "nothing verifies deployed against generator". README.md:261 meanwhile already tells the reader
-# that this gate exercises the agent-discovery blocks. It did not. This is the missing half, so
-# that sentence becomes true rather than being deleted.
+# WHY THIS GROUP EXISTS. The four deployed CLAUDE.md/AGENTS.md copies had drifted a whole section
+# behind the generator, nothing compared deployed against generator, and the README already told
+# the reader that this gate exercised the agent-discovery blocks. It did not. This is the missing
+# half, so that sentence became true rather than being deleted.
+#
+# THAT DRIFT IS CLOSED, re-measured 2026-09-17: the Sysmon/deletion-forensics paragraph is in
+# Write-AgentDiscovery's here-string and all four deployed copies carry it. The group stays,
+# because the next generator edit without a deploy recreates the gap - but the comment no longer
+# asserts a staleness that has been fixed. Line anchors into BACKLOG.md and lib\common.ps1 were
+# removed with it: both had moved, and this repo's own backlog header records that line anchors
+# go stale while symbol names do not.
 #
 # READ ONLY BY CONSTRUCTION, not by promise. lib\AgentDiscovery.ps1 parses common.ps1 and
 # evaluates only the ASSIGNMENT statements out of Write-AgentDiscovery, so Write-AgentBlock -
@@ -427,6 +446,56 @@ Write-Host ("  regime: {0} - {1}" -f $adRegime, $adTally) -ForegroundColor DarkG
 # missing network nor a closed browser is a defect in the tool. Their DEGRADED lines
 # are surfaced here on purpose: a check that hides what it skipped is a check nobody
 # can trust.
+# -- build health --------------------------------------------------------------
+# THE THREE SOFT FAILURES THAT USED TO VANISH. Install-Tessdata, Install-Ghostscript and
+# Install-Sysinternals in scripts\build-devtoolbox.ps1 are best-effort by explicit design - a
+# missing Ghostscript should not fail a whole toolbox build - but each one warned into the
+# transcript and discarded what it knew. Install-Tessdata collected a $failed list, printed it and
+# dropped it, so a run that landed 0 of 11 OCR languages still exited 0, and bootstrap.ps1 gates
+# readiness on the manifest merely EXISTING. Three soft failures, no combined verdict, and a
+# readiness flag that could not see any of them.
+#
+# The builder now writes a `degraded` array into the toolbox manifest and this reads it back, so
+# the verdict survives the run that produced it.
+#
+# WARN, NOT FAIL, and that is the honest level: these components are optional by design, so a
+# degraded build is a fact to surface rather than a broken gate. An ABSENT key is reported
+# separately - a manifest written before the ledger existed cannot vouch for a clean build, and
+# saying "clean" on its behalf would be the silent-pass shape this file exists to remove.
+Test-Hdr "build health"
+if (-not (Test-Path -LiteralPath $tbRoot)) {
+    Test-Warn "DevToolbox not found at $tbRoot - cannot read the build's degraded list"
+} else {
+    $bhManifest = Join-Path $tbRoot 'toolbox-manifest.json'
+    if (-not (Test-Path -LiteralPath $bhManifest)) {
+        Test-Warn "no toolbox manifest at $bhManifest - run .\scripts\build-devtoolbox.ps1"
+    } else {
+        $bhJson = $null
+        try {
+            # utf-8-sig tolerant: the builder writes via Set-Content, and a BOM makes
+            # ConvertFrom-Json throw on the first character.
+            $bhRaw = [IO.File]::ReadAllText($bhManifest)
+            $bhJson = $bhRaw.TrimStart([char]0xFEFF) | ConvertFrom-Json
+        } catch {
+            Test-Fail "toolbox manifest is not valid JSON: $($_.Exception.Message)"
+        }
+        if ($bhJson) {
+            $bhHasKey = @($bhJson.PSObject.Properties.Name) -contains 'degraded'
+            if (-not $bhHasKey) {
+                Test-Warn "toolbox manifest predates the degraded ledger - rebuild to get a build-health verdict"
+            } else {
+                $bhList = @($bhJson.degraded)
+                if ($bhList.Count -eq 0) {
+                    Test-Ok "build reported no degraded components"
+                } else {
+                    Test-Warn "build is DEGRADED in $($bhList.Count) component(s):"
+                    foreach ($bhItem in $bhList) { Write-Host "     $bhItem" -ForegroundColor Yellow }
+                }
+            }
+        }
+    }
+}
+
 Test-Hdr "browse (web read)"
 $brShim = Join-Path $tbRoot (Join-Path 'native\bin' 'browse.cmd')
 if (-not (Test-Path -LiteralPath $brShim)) {
@@ -705,7 +774,8 @@ if (-not (Test-Path -LiteralPath $smokeLintLib)) {
 # already gone silently missing once is the last one that should be deletable in silence.
 $suiteRequired = @('Invoke-CoreTests.ps1', 'Invoke-InstallerTests.ps1',
                    'Invoke-TriageTests.ps1', 'Invoke-RenderTests.ps1',
-                   'Invoke-SmokeLintTests.ps1', 'Invoke-GateChecksTests.ps1')
+                   'Invoke-SmokeLintTests.ps1', 'Invoke-GateChecksTests.ps1',
+                   'Invoke-AgentDiscoveryTests.ps1')
 $suiteFiles = @(Get-ChildItem -LiteralPath (Join-Path $REPO_ROOT 'tests') -Filter 'Invoke-*Tests.ps1' `
                     -File -ErrorAction SilentlyContinue | Sort-Object Name)
 foreach ($suiteReq in $suiteRequired) {

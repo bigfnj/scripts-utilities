@@ -3,11 +3,20 @@
     AgentDiscovery.ps1 - read the DEPLOYED agent-discovery blocks and reach the GENERATOR that
     is supposed to have produced them, without running the generator.
 
-    WHY THIS FILE EXISTS. BACKLOG.md:242-245 records that the deployed blocks are one section
-    stale - the generator gained a Sysmon/deletion-forensics paragraph (lib\common.ps1:564-575)
-    that none of the four deployed copies has - and that "nothing verifies deployed against
-    generator". README.md:261 already tells the reader "the gate exercises ... the
-    agent-discovery blocks", which was not true. This is the missing half.
+    WHY THIS FILE EXISTS. The four deployed blocks had drifted a whole section behind the
+    generator - it had gained a Sysmon/deletion-forensics paragraph that none of the deployed
+    copies carried - and nothing compared deployed against generator, while README.md claimed
+    "the gate exercises ... the agent-discovery blocks". This file is that missing half.
+
+    THAT PARTICULAR DRIFT IS CLOSED, re-measured 2026-09-17: the paragraph lives in
+    Write-AgentDiscovery's here-string (search `Sysmon      Deletion forensics`) and all four
+    deployed copies carry it. The check stays because the drift will happen again the next time
+    the generator is edited without a deploy - which is the whole point of a check - but the
+    header no longer asserts a staleness that has been fixed.
+
+    LINE ANCHORS DELIBERATELY REMOVED. This paragraph used to cite BACKLOG.md:242-245 and
+    lib\common.ps1:564-575; both had moved, and the repo's own backlog header records that line
+    anchors go stale while symbol names do not. Name the symbol, let the reader grep.
 
     THE GENERATOR CANNOT SIMPLY BE CALLED. Write-AgentDiscovery builds the body and then hands it
     straight to Write-AgentBlock four times, and Write-AgentBlock WRITES to the user's real
@@ -41,6 +50,15 @@
 # something else is not refused because the new command is dangerous - it is refused because
 # nobody has looked at it yet, and this file executes source it does not own.
 $script:ADAllowedCommands = @('Join-Path')
+
+# METHOD INVOCATIONS ARE REFUSED OUTRIGHT, and the empty list is the point rather than an
+# oversight. The allowlist above walks CommandAst nodes, and a method call is not one:
+# `[IO.File]::ReadAllText(...)` is an InvokeMemberExpressionAst and `$x.Foo()` likewise, so
+# neither was ever examined - in a function whose whole job is to `&` source it does not own.
+# Measured 2026-09-17: Write-AgentDiscovery contains ZERO method invocations and exactly two
+# command calls (Join-Path, Write-AgentBlock), so refusing every method costs nothing today and
+# forces a review the first time one appears. Add a member name here only after reading it.
+$script:ADAllowedMembers = @()
 
 function Get-AgentDiscoveryBody {
     <#
@@ -98,14 +116,39 @@ function Get-AgentDiscoveryBody {
 
     # The statements about to be EVALUATED are source from a file this one does not own. Refuse
     # anything outside the allowlist rather than run it and hope.
-    foreach ($a in $assignments) {
-        foreach ($c in $a.FindAll({ param($n)
-                $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+    #
+    # ONE WALK, THREE CALL SITES, and it covers METHODS as well as commands. The original walked
+    # CommandAst only, so every method invocation was invisible to it - which in a function that
+    # ends in `& $sb` is the gap that matters most. It also checked the ASSIGNMENTS only, while
+    # the path and marker argument expressions below are spliced verbatim into that same
+    # scriptblock and evaluated; two arguments per Write-AgentBlock call went in unexamined.
+    $clearAst = {
+        param($Node, $What)
+        foreach ($c in $Node.FindAll({ param($x)
+                $x -is [System.Management.Automation.Language.CommandAst] }, $true)) {
             $n = $c.GetCommandName()
-            if ($n -and $script:ADAllowedCommands -notcontains $n) {
-                return (& $fail ("the generator's setup at {0}:{1} calls '{2}', which this extractor is not cleared to execute - review it and add it to `$script:ADAllowedCommands if it is inert" -f (Split-Path $CommonPath -Leaf), $c.Extent.StartLineNumber, $n))
+            # $null means the name is not a literal - `& $var`, or a parenthesised expression.
+            # That is refused rather than skipped: an unknowable name cannot be on an allowlist.
+            if (-not $n) {
+                return ("{0} at {1}:{2} invokes a command whose name is not a literal, so it cannot be cleared - rewrite it as a direct call" -f $What, (Split-Path $CommonPath -Leaf), $c.Extent.StartLineNumber)
+            }
+            if ($script:ADAllowedCommands -notcontains $n) {
+                return ("{0} at {1}:{2} calls '{3}', which this extractor is not cleared to execute - review it and add it to `$script:ADAllowedCommands if it is inert" -f $What, (Split-Path $CommonPath -Leaf), $c.Extent.StartLineNumber, $n)
             }
         }
+        foreach ($m in $Node.FindAll({ param($x)
+                $x -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true)) {
+            $member = if ($m.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $m.Member.Value } else { '<computed>' }
+            if ($script:ADAllowedMembers -notcontains $member) {
+                return ("{0} at {1}:{2} invokes method '{3}', which this extractor is not cleared to execute - review it and add it to `$script:ADAllowedMembers if it is inert" -f $What, (Split-Path $CommonPath -Leaf), $m.Extent.StartLineNumber, $member)
+            }
+        }
+        return $null
+    }
+
+    foreach ($a in $assignments) {
+        $reason = & $clearAst $a "the generator's setup"
+        if ($reason) { return (& $fail $reason) }
     }
 
     $bodyAssign = @($assignments | Where-Object {
@@ -125,6 +168,13 @@ function Get-AgentDiscoveryBody {
         if ($positional.Count -lt 2) {
             return (& $fail ("Write-AgentBlock call at {0}:{1} has fewer than two positional arguments" -f (Split-Path $CommonPath -Leaf), $w.Extent.StartLineNumber))
         }
+        # The same clearance as the assignments, because these two expressions are spliced into
+        # the evaluated scriptblock below exactly as written.
+        $reason = & $clearAst $positional[0] "a Write-AgentBlock path argument"
+        if ($reason) { return (& $fail $reason) }
+        $reason = & $clearAst $positional[1] "a Write-AgentBlock marker argument"
+        if ($reason) { return (& $fail $reason) }
+
         $pathArgs   += $positional[0].Extent.Text
         $markerArgs += $positional[1].Extent.Text
     }
