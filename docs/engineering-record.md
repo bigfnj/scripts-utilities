@@ -117,12 +117,12 @@ intentional, not an accident.
 
 ---
 
-## Scoped, not done: a measurement instead of an attempt
+## Measured first, then done - or deliberately not
 
-### `Set-StrictMode` across the suites - DONE for six of seven
+### `Set-StrictMode` across the suites - DONE, all seven
 
 Measured, then done, 2026-09-18. The starting position was **49 failures across four suites**, which
-looked like 49 problems and was four:
+looked like 49 problems and was three:
 
 | suite | before | after |
 |---|---|---|
@@ -132,7 +132,7 @@ looked like 49 problems and was four:
 | Installer | 124 / **1** | 126 / 0 |
 | Render | 4 / **19** | 28 / 0 |
 | SmokeLint | 9 / **9** | 18 / 0 |
-| Triage | 11 / **20** | 11 / **20** - see the STOP below |
+| Triage | 11 / **20** | 31 / 0 - see below |
 
 **What the 49 actually were.** Two causes, each in two places:
 
@@ -155,12 +155,14 @@ revealed that some existing coverage was fictional.
 Render gained 5 assertions (23 -> 28) that check rendered output rather than absence of a throw, two
 of them reaching escape sites nothing had reached before.
 
-### Triage cannot get StrictMode without one line in a frozen file
+### Triage needed one line in a frozen file, and got it
 
-**STOPPED deliberately**, and this is the decision to revisit rather than the work.
+**RESOLVED 2026-09-18 with the owner's agreement**, after being stopped on the freeze first. The
+stop was right: the record of *why* is the valuable part, because the obvious alternative was worse
+than the bug.
 
-The Triage fixture is already production-accurate, property for property. The defect is in the
-frozen subject: `Get-FxTriage` walks a heterogeneous set and reads members blind -
+The Triage fixture was already production-accurate, property for property. The defect was in the
+subject: `Get-FxTriage` walks a heterogeneous set and read members blind -
 
 ```powershell
 foreach ($set in @($Facts.TopProcesses, $Facts.Bursts, $Facts.Novel, $Facts.Sentinels)) {
@@ -184,8 +186,48 @@ plausible directory, `$okDir` widens and a finding citing a path that was never 
 one failure the suite exists to prevent. So the passing state is worse than the failing one, and
 that is why it was not taken.
 
-The prompt builder is unaffected: `ConvertTo-FxTriagePrompt` reads `Novel` and `Sentinels`, which do
-carry `Dir`, and both its tests pass under StrictMode. All 20 failures are inside `Get-FxTriage`.
+The prompt builder was unaffected: `ConvertTo-FxTriagePrompt` reads `Novel` and `Sentinels`, which do
+carry `Dir`, and both its tests passed under StrictMode throughout. All 20 failures were inside
+`Get-FxTriage`.
+
+**What was changed.** `Get-FxTriage` now probes with `$x.PSObject.Properties[...]` rather than
+reading blind, exactly as `ForensicsReport.Render.ps1` already does for its own optional property.
+Applied in two places, because fixing the first exposed the second:
+
+- the fact loop, for `Name` / `Image` / `Dir` across the four heterogeneous collections;
+- the **degraded-model path**, for `findings` and `concern`. That second one matters more than it
+  looks: a local model returning valid JSON of the wrong shape is a case this function is written to
+  survive, and under StrictMode reading an absent `.findings` threw out of the one function whose
+  stated contract is "nothing below may throw out of here". The last two strict-mode failures were
+  the two tests asserting exactly that resilience. A defence that throws on the input it exists for
+  is not a defence.
+
+Behaviour is unchanged for every real input: a member that is present reads as before, and one that
+is absent was already treated as `$null` by the surrounding guards. Verified 31/0 both with and
+without StrictMode, and `tests/Invoke-TriageTests.ps1` now sets StrictMode itself. The sibling
+forensics suites are untouched at Core 27/0 and Render 28/0. Mutation-tested: reverting one probe to
+a blind read fails the suite with "The property 'Dir' cannot be found".
+
+### The Sysmon config check failed on every fresh clone, and no frozen file was needed
+
+`scripts/smoke-test.ps1` compares the deployed `filedelete-forensics.xml` against the repo template
+rendered for the current profile. `core.autocrlf=true` with no `.gitattributes` makes that template's
+bytes a property of the **checkout**: measured 2026-09-18, a long-lived working copy carries LF
+(15,912 bytes, byte-identical to `git show HEAD:`) while a fresh checkout of the same commit carries
+CRLF (16,163). Exact string equality therefore reported the deployed config as stale on every fresh
+clone - the first thing a new workstation would see - and on every git worktree.
+
+**Fixed in the comparison, which is `smoke-test.ps1`'s own code, so the frozen subsystem was not
+touched.** Three states instead of two, because collapsing them would hide a real staleness: an
+exact match is silent, a line-endings-only match passes *and says which one it got*, and anything
+else still fails. Sysmon parses XML, where CRLF and LF are equivalent.
+
+Verified all three: exact on main, line-endings on a probe worktree, and a one-tag content mutation
+in the worktree template still FAILS. Rejected `.gitattributes`, which would renormalise the whole
+tree - the exact condition `lib/ShimFormat.ps1`'s header is written to work around.
+
+With this and the worktree re-basing, `smoke test passed` from inside a worktree for the first time:
+61 passed, 5 warnings, **0 failed**.
 
 ### `logs/` holds three inputs inside a directory whose name invites deletion
 

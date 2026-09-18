@@ -23,8 +23,10 @@ justifies the category.
 ## Where to pick up - handoff, 2026-09-18
 
 Repo is on `main`, pushed, CI **green on both jobs** (`suites` and `checks`). Gate green:
-`checks=6 smoke=82/4/0 agentdiscovery=19 core=27 gatechecks=43 installer=125 render=23 smokelint=18
+`checks=6 smoke=86/4/0 agentdiscovery=19 core=27 gatechecks=43 installer=126 render=28 smokelint=18
 triage=31`, and parity green on all seven suites under CI's invocation *and* CI's error preference.
+All seven suites also pass under `Set-StrictMode -Version Latest`, and the smoke test passes from
+inside a git worktree.
 
 The previous 29 open items are closed: fixed, refuted, or recorded as decisions in
 `docs/engineering-record.md`. What follows is what this round surfaced, minus what was then fixed
@@ -40,6 +42,16 @@ the same day:
 - **The gate passes from a worktree.** The agent-block comparison is re-based onto the main
   checkout, derived from the `.git` file with no git invocation, and it announces the re-base on
   every run. Verified from a probe worktree: four failures became four OK.
+- **The Sysmon config check no longer fails on a fresh clone.** It was comparing bytes where
+  `core.autocrlf` decides them (LF in a long-lived working copy, CRLF in a fresh checkout of the
+  same commit). Now three states rather than two: exact match silent, line-endings-only match passes
+  *and says so*, real difference still fails. Fixed in `smoke-test.ps1`'s own comparison, so no
+  frozen file was touched. With the re-basing above, `smoke test passed` from a worktree for the
+  first time - 61 passed, 5 warnings, 0 failed.
+- **All seven suites run under StrictMode.** Triage's last 20 needed one line in a frozen file and
+  got it, with the owner's agreement. `Get-FxTriage` now probes optional members instead of reading
+  them blind - including on the degraded-model path, where an absent `.findings` was throwing out of
+  the one function whose contract is "nothing below may throw out of here".
 
 **The single most useful thing learned, worth applying before anything below.** A test that passes
 locally and fails in CI is an **environment divergence**, and there were three, all of which had
@@ -144,29 +156,6 @@ number - but it is a number, and nothing asserts the suite finishes inside it. I
 grows a long-running test, the gate becomes wrong in the dangerous direction. Currently 0 orphans on
 this box, so the sweep is working.
 
-### The Sysmon config check fails on any FRESH checkout, because of line endings
-
-`scripts/smoke-test.ps1` compares the deployed `C:\ProgramData\Sysmon\filedelete-forensics.xml`
-against `config/sysmon-filedelete.xml` rendered for the current profile, by hash.
-
-`core.autocrlf=true` and there is no `.gitattributes`, so the bytes of that template are a property
-of the **checkout**, not of the repo. Measured 2026-09-18: the main working copy carries **LF**
-(15,912 bytes, byte-identical to `git show HEAD:`) while a fresh worktree checkout of the same
-commit carries **CRLF** (16,163 bytes), differing at char 5 of line 1. The rendered hash therefore
-differs and the check reports the deployed config as stale.
-
-This is not a worktree quirk. **Any fresh clone fails this check**, which makes it the first thing a
-new workstation sees. Same class `lib/ShimFormat.ps1`'s header already records about here-strings:
-"the bytes have to be a property of THIS CODE, not of the machine or of the checkout".
-
-**Not fixed, and the reason is the freeze**: `config/sysmon-filedelete.xml`,
-`lib/SysmonConfig.ps1` and `scripts/install-deletion-forensics.ps1` are the deliberately frozen
-forensics subsystem. The two candidate fixes are a `.gitattributes` pinning that file (or the tree)
-to LF, which has repo-wide renormalisation blast radius and is exactly the condition
-`ShimFormat.ps1` is written to work around; or normalising line endings inside
-`Get-RenderedSysmonConfig` before hashing, which is a one-line change in a frozen file. Neither
-should be done without the owner deciding which.
-
 ### A null environment read cannot be linted here, and there are 30 of them
 
 `[Environment]::GetEnvironmentVariable(...)` returns `$null` for a value that does not exist, and a
@@ -192,15 +181,11 @@ non-null contract, then the remaining reads are non-PATH and individually review
 The measurement lives in `docs/engineering-record.md` rather than here so it is read before work
 starts:
 
-- **`Set-StrictMode` across the suites - DONE for six of seven.** Was 49 failures across four
-  suites; now 0 across six. It was two causes, not 49: a value unrolled on the way out of a
-  function, and fixtures that did not match the shape of real data. Read the record for what those
-  tests were actually asserting against before StrictMode exposed it.
-- **Triage is the seventh, and it is STOPPED on purpose.** Its 20 failures need one line in
-  `scripts/ForensicsReport.Triage.ps1` (`$x.PSObject.Properties['Dir']` in place of `$x.Dir`,
-  which the sibling renderer already does), and that file is frozen. The record explains why the
-  obvious fixture workaround is worse than the failure: it would make every "is DISCARDED" test in
-  that suite pass for the wrong reason. **This is an owner decision, not pending work.**
+- **`Set-StrictMode` across the suites - DONE, all seven.** Was 49 failures across four suites;
+  now 0. It was three causes, not 49: a value unrolled on the way out of a function, fixtures that
+  did not match the shape of real data, and blind member reads over heterogeneous or
+  deliberately-malformed objects. Read the record for what those tests were actually asserting
+  against before StrictMode exposed it.
 - **Relocating the three inputs out of `logs/`.** Touches seven files and resets the ledger baseline
   for every checkout at once. **Copy, do not move** - one of the three is the only surviving record
   of the pre-outage PATH order.

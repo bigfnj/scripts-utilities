@@ -684,8 +684,32 @@ if (-not $fxSvc) {
     else {
         $want = Get-RenderedSysmonConfig -TemplatePath $cfgRepo -ProfilePath $env:USERPROFILE
         $have = [IO.File]::ReadAllText($cfgLive)
-        if ($want -eq $have) { Test-Ok "deployed Sysmon config matches the template rendered for this profile" }
-        else { Test-Fail "deployed Sysmon config is stale - re-run install-deletion-forensics.ps1 elevated" }
+        # THREE STATES, NOT TWO, because line endings are a property of the CHECKOUT here and not
+        # of the config.
+        #
+        # core.autocrlf=true and there is no .gitattributes, so this template's bytes depend on how
+        # git handed it to the working copy. Measured 2026-09-18: a long-lived working copy carries
+        # LF (15,912 bytes, byte-identical to `git show HEAD:`) while a FRESH checkout of the same
+        # commit carries CRLF (16,163), differing at char 5 of line 1. Exact string equality
+        # therefore reported the deployed config as stale on every fresh clone - the first thing a
+        # new workstation would see - and on every git worktree, which is what two agents hit.
+        #
+        # Collapsing that into a pass would hide a real staleness, so the two cases are kept apart:
+        # an exact match is silent, a line-endings-only match PASSES AND SAYS SO, and anything else
+        # still fails. Sysmon parses XML, where CRLF and LF are equivalent, so the middle case is a
+        # genuine match - but a reader deserves to know which one they got.
+        #
+        # Fixed HERE rather than in lib\SysmonConfig.ps1 or the installer on purpose: the comparison
+        # is this file's, and the forensics subsystem is frozen. No forensics file was touched.
+        $wantLf = $want -replace "`r`n", "`n"
+        $haveLf = $have -replace "`r`n", "`n"
+        if ($want -eq $have) {
+            Test-Ok "deployed Sysmon config matches the template rendered for this profile"
+        } elseif ($wantLf -eq $haveLf) {
+            Test-Ok "deployed Sysmon config matches this profile's render, ignoring line endings (this checkout's template is CRLF, the deployed copy is LF - core.autocrlf, no .gitattributes)"
+        } else {
+            Test-Fail "deployed Sysmon config is stale - re-run install-deletion-forensics.ps1 elevated"
+        }
     }
 
     # A SEPARATE fact. The deployed file can be a faithful render of an older template AND

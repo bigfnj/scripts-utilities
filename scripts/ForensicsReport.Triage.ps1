@@ -199,11 +199,39 @@ function Get-FxTriage {
     # reasonably writes "rm.exe" for a full path and may quote a parent directory.
     $okProc = @{}
     $okDir = New-Object 'System.Collections.Generic.List[string]'
+    # PROBED, NOT READ BLIND, because this loop walks a HETEROGENEOUS set on purpose.
+    #
+    # TopProcesses carries Name + Count and no Dir; Bursts carries Image + Count + Seconds and no
+    # Name. Both are the correct production shapes, and reading a member that an object does not
+    # have is legal only while Set-StrictMode is off - under strict mode each read throws
+    # "The property 'X' cannot be found on this object". Measured 2026-09-18: the production
+    # shapes threw on 'Dir', and supplying Dir then threw on 'Name', so it is two members and not
+    # one. Same defensive read ForensicsReport.Render.ps1 already uses for its own optional
+    # property.
+    #
+    # THE FIXTURE WORKAROUND WAS REJECTED, and the reason is worth keeping. Bolting Dir onto the
+    # TopProcesses fixture makes tests\Invoke-TriageTests.ps1 pass, and the moment anyone gives
+    # that field a plausible directory instead of $null, $okDir widens - so a model finding that
+    # cites a path which was never shown comes back KEPT. Every "is DISCARDED" test in that suite
+    # would then pass for the wrong reason, which is the single failure the suite exists to
+    # prevent. A passing state can be worse than a failing one.
+    #
+    # Behaviour is unchanged for every real input: a member that is present reads exactly as
+    # before, and one that is absent was already treated as $null by the `if` guards.
+    $peek = {
+        param($Obj, $Name)
+        $p = $Obj.PSObject.Properties[$Name]
+        if ($p) { return $p.Value }
+        return $null
+    }
     foreach ($set in @($Facts.TopProcesses, $Facts.Bursts, $Facts.Novel, $Facts.Sentinels)) {
         foreach ($x in @($set)) {
-            $n = if ($x.Name) { $x.Name } elseif ($x.Image) { $x.Image } else { $null }
+            $xName = & $peek $x 'Name'
+            $xImage = & $peek $x 'Image'
+            $xDir = & $peek $x 'Dir'
+            $n = if ($xName) { $xName } elseif ($xImage) { $xImage } else { $null }
             if ($n) { $okProc[([IO.Path]::GetFileName([string]$n)).ToLowerInvariant()] = $true }
-            if ($x.Dir) { $okDir.Add(([string]$x.Dir).TrimEnd('\', '/').ToLowerInvariant()) }
+            if ($xDir) { $okDir.Add(([string]$xDir).TrimEnd('\', '/').ToLowerInvariant()) }
         }
     }
 
@@ -225,13 +253,25 @@ function Get-FxTriage {
 
     $parsed = $null
     try { $parsed = $raw | ConvertFrom-Json } catch { $out.Reason = 'response was not JSON'; return $out }
-    if (-not $parsed -or -not $parsed.findings) { $out.Reason = 'no findings in response'; return $out }
+    # PROBED, for the same reason as the fact loop above and with more force here: this is the
+    # DEGRADED-MODEL path, so the whole point is that these members may be absent. A local model
+    # returning valid JSON of the wrong shape is a case this function is written to survive, and
+    # under Set-StrictMode reading `.findings` on an object that lacks it THROWS instead - out of
+    # the one function whose contract is "nothing below may throw out of here".
+    #
+    # Measured 2026-09-18: the two tests named "valid JSON of the wrong shape yields no findings"
+    # and "a finding missing its concern is discarded" were the last two strict-mode failures in
+    # tests\Invoke-TriageTests.ps1, and they are precisely the two asserting this resilience. A
+    # defence that throws on the input it exists for is not a defence.
+    $findings = & $peek $parsed 'findings'
+    if (-not $parsed -or -not $findings) { $out.Reason = 'no findings in response'; return $out }
 
     $kept = @()
-    foreach ($f in @($parsed.findings)) {
-        $proc = [string]$f.process
-        $dir = [string]$f.directory
-        if (-not $proc -or -not $dir -or -not $f.concern) { $out.Rejected++; continue }
+    foreach ($f in @($findings)) {
+        $proc = [string](& $peek $f 'process')
+        $dir = [string](& $peek $f 'directory')
+        $concern = & $peek $f 'concern'
+        if (-not $proc -or -not $dir -or -not $concern) { $out.Rejected++; continue }
         $leaf = ([IO.Path]::GetFileName($proc)).ToLowerInvariant()
         if (-not $okProc.ContainsKey($leaf)) { $out.Rejected++; continue }
         # The directory must be one we showed it, or an ANCESTOR of one. A model quoting a parent
@@ -264,7 +304,9 @@ function Get-FxTriage {
         # unnormalised and rendered it verbatim into the page.
         $conf = ([string]$f.confidence).Trim().ToLowerInvariant()
         if ($conf -notin @('low', 'medium', 'high')) { $conf = 'low' }
-        $kept += [pscustomobject]@{ Process = $proc; Directory = $dir; Concern = [string]$f.concern; Confidence = $conf }
+        # $concern, already probed above - reading $f.concern again here would reintroduce the
+        # throw on the path where it is absent, and it is guaranteed non-empty by the guard.
+        $kept += [pscustomobject]@{ Process = $proc; Directory = $dir; Concern = [string]$concern; Confidence = $conf }
     }
     $out.Findings = @($kept | Select-Object -First 4)
     if (-not $out.Findings.Count -and $out.Rejected) { $out.Reason = 'every finding cited something it was not shown' }

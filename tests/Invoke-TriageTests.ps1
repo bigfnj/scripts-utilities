@@ -17,35 +17,39 @@ param()
 # cmdlet. $PSScriptRoot rather than $repoRoot so this needs nothing computed first.
 . (Join-Path $PSScriptRoot 'SUTestGuard.ps1')
 
-# THERE IS DELIBERATELY NO `Set-StrictMode -Version Latest` HERE, unlike Invoke-RenderTests.ps1.
-# It was tried, measured and reverted; this is the record so nobody repeats the investigation.
+# THE FIXTURE WAS NEVER THE PROBLEM, and that is worth keeping because the obvious fix to the
+# strict-mode failures was a trap.
 #
-# Strict run: 11 passed, 20 failed, every failure the same message - "The property 'Dir' cannot be
-# found on this object". The cause is NOT this fixture. $facts below already matches the Facts
-# object New-ForensicsReport.ps1:299-305 builds, property for property. The mismatch is in the
-# subject: Get-FxTriage walks a HETEROGENEOUS set of four collections
-#     foreach ($set in @($Facts.TopProcesses, $Facts.Bursts, $Facts.Novel, $Facts.Sentinels))
-# and reads $x.Name / $x.Image / $x.Dir off each member blind. TopProcesses carries Name+Count and
-# no Dir; Bursts carries Image+Count+Seconds and no Name. Both are the correct production shapes,
-# and under StrictMode both throw.
+# Before the subject was fixed, a strict run here was 11 passed / 20 failed, every failure the same
+# message - "The property 'Dir' cannot be found on this object". $facts below already matches the
+# Facts object New-ForensicsReport.ps1 builds, property for property. The mismatch was in the
+# subject: Get-FxTriage walks a HETEROGENEOUS set of four collections and read $x.Name / $x.Image /
+# $x.Dir off each member blind. TopProcesses carries Name+Count and no Dir; Bursts carries
+# Image+Count+Seconds and no Name. Both are the correct production shapes, and both threw.
 #
 # Measured escalation, in this order:
-#   production shape as-is            -> throws on 'Dir'  (from TopProcesses)
-#   + Dir on TopProcesses             -> throws on 'Name' (from Bursts)
-#   + Dir and Name everywhere, $null  -> passes
+#   production shape as-is            -> threw on 'Dir'  (from TopProcesses)
+#   + Dir on TopProcesses             -> threw on 'Name' (from Bursts)
+#   + Dir and Name everywhere, $null  -> passed
 #
-# That last state is the trap, and it is why the fixture was left alone. Those properties do not
+# THAT LAST STATE IS THE TRAP, and it is why the fixture was left alone. Those properties do not
 # exist on the real objects, so a future author filling one in with a plausible value is doing the
 # natural thing - and it was measured: give the bolted-on TopProcesses.Dir a real directory and
 # $okDir silently widens, so a finding citing a directory the model was never shown comes back
-# KEPT with Rejected = 0. Every "is DISCARDED" test above would then pass for the wrong reason,
-# which is the one failure this suite exists to prevent. A fixture that lies to satisfy a linter
-# is worse than a suite without the linter.
+# KEPT with Rejected = 0. Every "is DISCARDED" test below would then pass for the wrong reason,
+# which is the one failure this suite exists to prevent. A fixture that lies to satisfy a linter is
+# worse than a suite without the linter.
 #
-# What would unblock it is one line in scripts\ForensicsReport.Triage.ps1 - probe with
-# $x.PSObject.Properties['Dir'] instead of $x.Dir, exactly as the renderer already does at
-# ForensicsReport.Render.ps1:414 for its own optional property. That file is frozen by owner
-# decision, so the change was NOT made and this comment stands in its place.
+# RESOLVED 2026-09-18 in the subject instead, with the owner's agreement: Get-FxTriage now probes
+# with $x.PSObject.Properties[...] rather than reading blind, exactly as the renderer already does
+# for its own optional property, and the same probe was applied to the degraded-model path where
+# `.findings` and `.concern` are legitimately absent. Behaviour is unchanged for every real input -
+# a member that is present reads as before, and one that is absent was already treated as $null by
+# the surrounding guards. This suite is 31/0 under strict mode AND without it.
+#
+# AFTER the guard dot-source, so the deletion tripwire is still the first one loaded - the CI check
+# asserts that, and Set-StrictMode is not a dot-source so it cannot disturb it.
+Set-StrictMode -Version Latest
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $repoRoot 'scripts\ForensicsReport.Triage.ps1')
