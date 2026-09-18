@@ -23,10 +23,16 @@ justifies the category.
 ## Where to pick up - handoff, 2026-09-18
 
 Repo is on `main`, pushed, CI **green on both jobs** (`suites` and `checks`). Gate green:
-`checks=6 smoke=86/4/0 agentdiscovery=19 core=27 gatechecks=43 installer=126 render=28 smokelint=18
+`checks=6 smoke=87/4/0 agentdiscovery=19 core=27 gatechecks=43 installer=131 render=28 smokelint=18
 triage=31`, and parity green on all seven suites under CI's invocation *and* CI's error preference.
 All seven suites also pass under `Set-StrictMode -Version Latest`, and the smoke test passes from
 inside a git worktree.
+
+One of those four smoke warnings is EXPECTED, and it is the new machinery working rather than a
+problem to chase: `build is DEGRADED in 1 component(s)` is the toolbox manifest honestly reporting
+the `pip check` failure described under Housekeeping. The other three are the long-standing optional
+ones - `cdb` and `poolmon` need a WDK/SDK install, and the weekly forensics task is admin-only to
+read.
 
 The previous 29 open items are closed: fixed, refuted, or recorded as decisions in
 `docs/engineering-record.md`. What follows is what this round surfaced, minus what was then fixed
@@ -59,6 +65,18 @@ the same day:
   machine-scope natives. The deployed activation helpers were also pre-fix, still putting the venv
   `Scripts` on PATH - regenerated. **A green gate does not mean a correct workstation; run
   `build-devtoolbox.ps1` and read what it resolves.**
+- **Then upgrading qpdf on purpose, to exercise the stale-shim check, found a second bug.** The
+  upgrade did not behave as predicted: `winget upgrade` installed 12.4.1 and **left 12.3.2 in
+  place**, so nothing was stale, both targets existed, and the shim went on running the old binary
+  after a successful upgrade. The resolver's `Select-Object -First 1` was taking the OLDEST
+  version-stamped directory; it now sorts by `LastWriteTime`. Verified live: the shim re-resolved to
+  12.4.1. **Deliberately breaking a thing to test a check is worth doing even when the check does
+  not fire - what it does instead is the finding.**
+- **A failed build no longer writes a manifest claiming success.** `Write-Manifest` ran before
+  `Run-Smoke`, so a throw in the smoke step left `degraded: []` on disk for a build that died, and
+  `bootstrap.ps1` gates readiness on that file existing. Now written twice, with `Invoke-Checked
+  -Soft` recording probe failures into the ledger; the build still exits non-zero. Side benefit that
+  mattered as much: `pip check` is the first probe, and its throw had been hiding the other five.
 
 **The single most useful thing learned, worth applying before anything below.** A test that passes
 locally and fails in CI is an **environment divergence**, and there were three, all of which had
@@ -77,35 +95,6 @@ fail locally. If you add a test, ask what on this box it is quietly reading.
 ---
 
 ## Correctness - MEDIUM
-
-### The toolbox manifest is written BEFORE the build's own smoke step, so a failed build leaves a manifest claiming it succeeded
-
-`scripts/build-devtoolbox.ps1`, main flow: `Write-Manifest` runs at the `manifest` step, `Run-Smoke`
-at the `smoke` step after it. `Run-Smoke`'s first act is `Invoke-Checked "run pip dependency check"`,
-which `throw`s on a non-zero exit.
-
-Measured 2026-09-18 on this box, twice: the build threw at `pip check` and still left
-`toolbox-manifest.json` with `degraded: []` and a fresh `created_at`. So the manifest asserts a clean
-build for a build that did not finish, and the degraded ledger - added precisely so a degraded
-toolbox stops being three warnings nobody re-reads - reads healthy because nothing after the write
-can append to it.
-
-This matters more than the cosmetics, and the builder's own header says why: "bootstrap.ps1 gates
-readiness on the manifest merely EXISTING". A build that dies in `Run-Smoke` therefore hands
-bootstrap a readiness token it did not earn.
-
-Two candidate fixes, and the choice is not obvious:
-
-- Write the manifest LAST, after `Run-Smoke`. Correct verdict, but a failed smoke then leaves **no**
-  manifest at all, and a box with a working toolbox and no manifest is a worse starting state than
-  the reverse.
-- Keep the early write and re-write it after `Run-Smoke` with the smoke outcome folded into
-  `degraded`. Costs a second write and needs the `throw` in `Invoke-Checked` converted to a recorded
-  failure for this caller only.
-
-Prefer the second. Whoever does it should also decide whether `pip check` belongs in the degraded
-ledger or should stay fatal - see the pip-check entry under Housekeeping for why it is currently
-firing on something the repo never installed.
 
 ### `browse`'s journal records the rung that returned the MOST TEXT, not the rung that was NEEDED
 
@@ -145,28 +134,71 @@ refusal against. Needs a real blocked URL before the detector can be trusted on 
 ```text
 timm 1.0.29 requires huggingface-hub, which is not installed.
 timm 1.0.29 requires safetensors, which is not installed.
-Command failed: run pip dependency check (exit 1)
 ```
 
 `timm` appears in neither `$CorePackages`, nor `$HeavyPackages`, nor `catalog.json`, and
-`pip show timm` reports `Required-by:` **empty** - nothing in the venv depends on it. It is drift,
-most likely left behind when something in the `rembg` / `basicsr` / `gfpgan` / `facexlib` chain was
-reinstalled. The correct end state is that it is not there.
+`pip show timm` reports `Required-by:` **empty** - nothing in the venv depends on it.
+
+Provenance, read out of the dist-info metadata on 2026-09-18 rather than guessed:
+
+| evidence | value |
+|---|---|
+| installed | 2026-09-15 10:41, `INSTALLER` = `pip` |
+| `REQUESTED` marker | present on `av`, `einops` **and** `timm` - one explicit install named all three |
+| `direct_url.json` | absent, so plain PyPI rather than a local path or VCS |
+| same-transaction siblings | `av 18.1.0`, `einops 0.8.2`; nothing else shares that timestamp |
+| first-party importers | **none** - 21 hits for `import timm` under `D:\.ai-work`, every one inside `site-packages` or a `uv-cache` archive of `modelscope` |
+
+The missing deps are the tell. Of timm's five requirements, `torch`, `torchvision` and `pyyaml` were
+already in the venv from the toolbox's own package steps, and exactly the two that were **not** -
+`huggingface-hub` and `safetensors` - are the two absent. That is the signature of `--no-deps`,
+not of a later removal.
+
+So it is an abandoned experiment, three packages wide, installed into the **shared toolbox venv**
+rather than a project venv. `av` and `einops` are harmless, having no unmet requirements of their
+own; only `timm` breaks `pip check`. Checked and ruled out: wallpaperengine, the most likely
+candidate, has its own `.venv`, holds none of the three, and references none of them in its source.
 
 **Not resolved here on purpose.** The two directions are not equivalent and only the owner can pick:
 
-- `pip uninstall timm` removes the orphan and `pip check` goes clean. This is the honest fix, but it
-  is a deletion in a venv shared with the owner's own GPU work, and a sweep of `D:\` for a direct
-  `import timm` did not finish, so "nothing imports it" is unproven rather than established.
+- `pip uninstall timm` removes the orphan and `pip check` goes clean. This is the honest fix and the
+  recommended one, but it is a deletion in a venv shared with the owner's GPU work.
 - `pip install huggingface-hub safetensors` also makes `pip check` clean and cannot break anything,
   but it installs two packages to satisfy one that nothing needs, making the drift permanent.
 
-Consequence while it sits: `build-devtoolbox.ps1` **cannot complete** on this box. It gets as far as
-writing the activation helpers and the manifest - so a re-run does still repair generated artifacts,
-which is how the qpdf shim was fixed - and then throws before any of the five smoke probes run. Those
-five were run by hand instead: python 0 failures, native 0 failures, sysinternals 0 failures.
+Consequence while it sits, as of the `-Soft` change in the same round: the other five probes now run
+and pass, the manifest records `smoke: run pip dependency check failed (exit 1)` in its `degraded`
+array, `scripts/smoke-test.ps1` surfaces that as a build-health WARN, and the build still exits
+non-zero. Visible and bounded rather than fatal and silent - but the build cannot report success
+until someone picks.
 
 This is box drift, not a repo defect: a fresh workstation has no `timm` and would not hit it.
+
+### The native probe's `soffice` step outlived its 120s timeout and stalled a build - MECHANISM UNCONFIRMED
+
+`scripts/build-devtoolbox.ps1`, the `native_tooling_smoke_test.py` body written by
+`Write-SmokeScripts`. `slow = {"soffice": 120, "magick": 120}` gives LibreOffice a 120-second
+budget, and `subprocess.run(..., stdout=PIPE, stderr=STDOUT, timeout=slow.get(name, 30))` is
+supposed to bound it.
+
+Observed 2026-09-18, once: a build sat on `run native toolbox smoke` for roughly four minutes.
+`Win32_Process` showed **both** `soffice.exe --version` (the direct child) and
+`soffice.bin --version` (its grandchild) still alive, created 11:29:54, well past the 120s mark.
+The build later completed normally and reported only the expected `pip check` failure, so all six
+probes did eventually run.
+
+**What is NOT established.** The plausible mechanism is the classic Windows one - the timeout fires,
+`subprocess.run` kills the direct child, and the following `communicate()` blocks because a
+surviving grandchild still holds the inherited stdout handle - but that was not proved. A kill of
+those two processes was attempted at about the same moment and was refused by a policy classifier,
+so whether the recovery came from that attempt, from LibreOffice answering on its own, or from
+something else is genuinely unknown. One observation, no repro.
+
+Worth confirming rather than fixing blind, because if the mechanism is real then the timeout does
+not bound the step at all and any build can hang indefinitely on it. Cheap confirmation: run the
+probe with LibreOffice already holding a profile lock (open a document first) and watch whether the
+120s budget is honoured. If it is not, the fix is `Popen` plus an explicit process-tree kill rather
+than a larger number - a bigger timeout would only move the hang.
 
 ### The `%TEMP%` fixture sweep's 30-minute window is an assumption, not a measurement
 

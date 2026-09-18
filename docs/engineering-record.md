@@ -284,3 +284,57 @@ lost ~123,605 files to a script that deleted what it should not have, and two of
 are **inputs** rather than output (see the entry above). If anyone ever wants automatic pruning, the
 blast radius of each is narrow and fixed - a literal prefix plus a timestamp suffix, one directory,
 nothing else matches - and that belongs in the proposal rather than being discovered afterwards.
+
+### The manifest was written BEFORE the build's own smoke step - FIXED with two writes, not by moving one
+
+`scripts/build-devtoolbox.ps1`. `Write-Manifest` ran at the `manifest` step and `Run-Smoke` at the
+`smoke` step after it, and `Run-Smoke`'s first act threw on a non-zero `pip check`. Measured twice
+on this box 2026-09-18: the build died and still left a manifest asserting `degraded: []` with a
+fresh `created_at`. The builder's own header notes that `bootstrap.ps1` gates readiness on the
+manifest merely EXISTING, so that pair handed bootstrap a readiness token the build never earned.
+
+**Rejected: writing the manifest only at the end.** It is the obvious fix and it is worse. A build
+that failed in `Run-Smoke` would then leave no manifest at all, and because readiness is gated on
+the file existing, bootstrap would report "not ready" for a toolbox that is fine apart from one
+probe. A box with a working toolbox and no manifest is a worse starting state than the reverse.
+
+**Done:** the early write stays as the floor, `Invoke-Checked` gained an opt-in `-Soft` that records
+into the existing degraded ledger instead of throwing, every probe in `Run-Smoke` passes it, and the
+manifest is written again after the smoke step. The build then still exits non-zero, decided by
+looking for the ledger's `smoke:` prefix - which is what keeps an installer's best-effort soft
+failure (tessdata, Ghostscript, an OCR language) non-fatal while a failed probe stays fatal.
+
+Second benefit, not the motivation but worth as much: `pip check` is the FIRST probe, so its throw
+meant the other five never ran. On this box that hid five clean results behind one orphaned package,
+and they had to be run by hand to discover that. All six now run every time.
+
+Verified against the live failure rather than a fixture: the build ran all six probes, recorded
+`smoke: run pip dependency check failed (exit 1)`, re-wrote the manifest with that entry, and exited
+1 naming the manifest path. Three mutations, one test each and no more: dropping `-Soft` from one
+probe, deleting the post-smoke write, and making `-Soft` throw anyway.
+
+### The resolver took the FIRST match in a search root, which is the OLDEST version
+
+Same function, found while deliberately upgrading qpdf to exercise the stale-shim check. The upgrade
+did not behave as predicted and that is the finding: `winget upgrade --id QPDF.QPDF -e --scope
+machine` installed 12.4.1 and **left 12.3.2 in place**, so `winget list` reported both and
+ProgramFiles held two `qpdf.exe`.
+
+Nothing was stale, because both targets existed. The shim kept running 12.3.2 after a successful
+upgrade, `qpdf --version` answered 12.3.2, and the stale-shim check passed. Measured: the
+enumeration returns 12.3.2 first, so `Select-Object -First 1` pinned the older binary.
+
+**Done:** the exhaustive fallback now sorts by `LastWriteTime` descending within a root. Not by a
+version parsed out of the path, because the naming is not one convention here (`qpdf 12.4.1`,
+`ImageMagick-7.1.2-Q16-HDRI`, `gs10.07.1`) and a string sort puts `12.4.1` above `12.10.0`. Root
+order is unchanged, and an explicit `$CommandSearchPatterns` entry still runs first, so deliberate
+preferences stay deliberate.
+
+**The cost, stated rather than hidden:** a hit can no longer short-circuit the walk, since the newest
+match is not known until the enumeration finishes. The miss path already paid the full walk, which
+BACKLOG measures at 4,048 ms, so the worst case is unchanged and only the lucky-hit case is slower.
+That is worth paying at a callsite whose answer is baked into a shim that then looks fine for months.
+
+Verified on the live two-version state before it was cleaned up: the build re-resolved to
+`qpdf 12.4.1`. The test uses a synthetic fixture named so the OLDER file sorts first, so it does not
+depend on this box, and it carries a control asserting that premise still holds.

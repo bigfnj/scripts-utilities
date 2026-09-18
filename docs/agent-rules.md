@@ -134,6 +134,18 @@ exists to catch - which is why the fix was to let the exhaustive `%ProgramFiles%
 rather than to pin a path. Check the install directory first: if it carries a version, do not add
 an entry.
 
+**A winget upgrade may not remove the old version, and the shim then keeps using it.** Measured
+2026-09-18: `winget upgrade --id QPDF.QPDF -e --scope machine` installed 12.4.1 and left 12.3.2
+in place, so `winget list` reported **both** and `%ProgramFiles%` held two `qpdf.exe`. Nothing was
+stale, because both targets existed, so the shim went on running 12.3.2 after a successful upgrade
+and no check could see it: `qpdf --version` answered 12.3.2 and the stale-shim check passed.
+`Find-Executable` now takes the newest match by `LastWriteTime` within a search root rather than
+the first the enumeration reaches, because the directory naming is not one convention
+(`qpdf 12.4.1`, `ImageMagick-7.1.2-Q16-HDRI`, `gs10.07.1`) and a string sort puts `12.4.1` above
+`12.10.0`. After upgrading a machine-scope native, re-run `scripts/build-devtoolbox.ps1` and read
+the line it prints for that tool. Removing the superseded directory afterwards is optional and
+safe.
+
 To collapse those per-package UAC prompts into a single elevation, run
 `scripts/install-machine-scope.ps1` once with an admin/SYSTEM token before the
 normal-user bootstrap. It installs exactly the machine-scope IDs (plus
