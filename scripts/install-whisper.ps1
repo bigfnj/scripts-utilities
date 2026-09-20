@@ -240,11 +240,23 @@ if (-not $SkipBinary) {
     } elseif ($DryRun) {
         Write-Info "[DRY-RUN] would resolve + download the latest whisper.cpp whisper-bin-x64.zip"
     } else {
-        Write-Info "resolve latest whisper.cpp release"
-        $rel = Get-Json "https://api.github.com/repos/ggerganov/whisper.cpp/releases/latest"
-        $asset = $rel.assets | Where-Object { $_.name -like "whisper-bin-x64.zip" } | Select-Object -First 1
-        if (-not $asset) { $asset = $rel.assets | Where-Object { $_.name -like "*bin-x64*.zip" } | Select-Object -First 1 }
-        if (-not $asset) { throw "no whisper-bin-x64.zip asset in the latest whisper.cpp release" }
+        # The release LIST, not releases/latest. Upstream now tags two kinds of release: the
+        # semantic ones (v1.9.3, v1.9.4) carry NO assets, and the Windows zips ship on the rolling
+        # build tags (b5130). GitHub calls the newest semantic tag "latest", so releases/latest
+        # answers 200 with an empty assets array and this threw "no whisper-bin-x64.zip asset"
+        # for a reason no reader could act on. Measured 2026-09-20: v1.9.4 and v1.9.3 have 0
+        # assets, b5130 has 12. The repo also moved to ggml-org (the old owner still 301s).
+        # Walking the list is indifferent to which scheme upstream uses next.
+        Write-Info "resolve newest whisper.cpp release carrying a Windows x64 build"
+        $releases = Get-Json "https://api.github.com/repos/ggml-org/whisper.cpp/releases?per_page=20"
+        $asset = $null
+        foreach ($rel in $releases) {
+            if (-not $rel.assets) { continue }
+            $asset = $rel.assets | Where-Object { $_.name -like "whisper-bin-x64.zip" } | Select-Object -First 1
+            if (-not $asset) { $asset = $rel.assets | Where-Object { $_.name -like "*bin-x64*.zip" } | Select-Object -First 1 }
+            if ($asset) { Write-Info "using release $($rel.tag_name)"; break }
+        }
+        if (-not $asset) { throw "none of the 20 most recent whisper.cpp releases carries a Windows x64 zip" }
         $zip = Join-Path $dl $asset.name
         Write-Info "download $($asset.name) ($([int]($asset.size / 1MB)) MB)"
         $digest = if ($asset.digest -match '^sha256:(.+)$') { $Matches[1] } else { "" }
