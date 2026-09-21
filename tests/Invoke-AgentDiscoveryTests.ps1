@@ -108,6 +108,28 @@ It 'CONTROL: the REAL lib\common.ps1 still extracts, which is the only test that
         ($r.Body.Length -gt 1000)
 }
 
+It 'the generated block names no single agent host, because all four targets receive it' {
+    # THE SAME BYTES GO TO ALL FOUR TARGETS - two of them Codex's - so any sentence written for
+    # one host's toolset is wrong in at least half the files it lands in. Measured 2026-09-21:
+    # the block told every reader that "a WebFetch that fails ... Claude-User is not a Cloudflare
+    # signed agent", which is meaningless advice inside .codex\AGENTS.md and AGENTS.md, and it
+    # named a Bash tool call in files read by hosts that have no Bash tool.
+    #
+    # This repo is deliberately multi-host: $AGENT_TARGETS covers .codex\AGENTS.md and AGENTS.md
+    # beside the two Claude paths, and the discovery layer is lib\AgentDiscovery.ps1, not a
+    # vendor module. Describe the CAPABILITY ("your host's own web-fetch tool", "a POSIX-shell
+    # tool call"), never the vendor's name for it.
+    $r = Get-AgentDiscoveryBody -CommonPath (Join-Path $repoRoot 'lib\common.ps1') -RepoRoot $repoRoot
+    if ($r.Reason) { return $false }
+
+    # Two strings survive deliberately and are NOT vendor advice:
+    #   CODEX_TOOLBOX      this repo's own environment variable, read by lib\common.ps1
+    #   OpenAI-compatible  the wire protocol Ollama serves, a factual API shape
+    $text = ($r.Body -replace 'CODEX_TOOLBOX', '') -replace 'OpenAI-compatible', ''
+    $hostNames = @('Claude', 'Anthropic', 'WebFetch', 'Codex', 'OpenAI', 'Cursor', 'Copilot', 'Gemini')
+    -not @($hostNames | Where-Object { $text -match $_ }).Count
+}
+
 Write-Host "`n== the allowlist: commands ==" -ForegroundColor Cyan
 
 It 'an allow-listed command (Join-Path) in the setup is accepted' {
