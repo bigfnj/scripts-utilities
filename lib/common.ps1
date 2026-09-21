@@ -498,6 +498,54 @@ function Get-ToolboxPython {
     return $null
 }
 
+# -- Smoke failure identity ----------------------------------------------------
+# Collapse a smoke failure MESSAGE into a stable IDENTITY, so two gate runs can be compared by
+# WHICH checks failed rather than by how many did.
+#
+# The phase ledger in run-gate.ps1 compares suite COUNTS and exempts the smoke triple from
+# failing at all, deliberately: "on this box a rebuild step turns 18 missing tools into 18 OKs
+# without a line of this repository changing", and a gate that punishes that becomes a gate
+# nobody runs. The cost of that exemption is that smoke going 0 failures -> 5 failures prints a
+# TRANSITION and passes. smoke-test.ps1:412 already records where that lands: two agents working
+# in parallel worktrees "both fell back to 'the failure set is unchanged from baseline', which is
+# far weaker" - by hand, because nothing computed it.
+#
+# This is that comparison, computed. Counts stay exempt; identities do not.
+#
+# DERIVED, NOT DECLARED. There are 63 Test-Fail call sites; making each one carry a hand-written
+# -Id would be 63 edits to add a mechanism and 63 chances to forget one later. The identity comes
+# from the message instead, with the parts that legitimately vary between runs masked:
+#
+#   %USERPROFILE% -> ~   so ~\CLAUDE.md and ~\.claude\CLAUDE.md stay DISTINCT (a leaf-name-only
+#                        rule would alias those two into one, and they fail independently)
+#   digits -> #          "121 of 145 line(s) differ" and "6 self-referential shim(s)" must not
+#                        mint a new identity every time a count moves
+#   space, comma -> _    the ledger line is space-delimited and these are comma-joined into one
+#                        field; an id containing either would corrupt the row it is written to
+#
+# The 6-hex tail is a digest of the FULL normalised string, not of the truncated head. Without
+# it, two failures sharing a 48-character prefix would alias into one identity and a real
+# regression could arrive wearing a known id. With it the head stays readable in the ledger and
+# the tail carries the distinctness.
+function ConvertTo-SmokeFailureId {
+    param([Parameter(Mandatory)][string]$Message)
+
+    $s = $Message
+    if ($env:USERPROFILE) { $s = $s -replace [regex]::Escape($env:USERPROFILE), '~' }
+    $s = $s -replace '\d+', '#'
+    $s = ($s -replace '\s+', ' ').Trim().ToLowerInvariant()
+    $s = $s -replace '[,\s]', '_'
+
+    $sha = [System.Security.Cryptography.SHA1]::Create()
+    try {
+        $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($s))
+    } finally { $sha.Dispose() }
+    $tail = -join (@($hash[0..2]) | ForEach-Object { '{0:x2}' -f $_ })
+
+    $head = if ($s.Length -gt 48) { $s.Substring(0, 48) } else { $s }
+    return ('{0}-{1}' -f $head, $tail)
+}
+
 # -- Packaged-host path projection ---------------------------------------------
 # Is THIS process seeing the toolbox through an MSIX package's redirected view?
 #

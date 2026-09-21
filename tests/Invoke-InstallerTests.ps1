@@ -613,6 +613,46 @@ function Get-BuilderFn {
     @($builderFns | Where-Object { $_.Name -eq $Name }) | Select-Object -First 1
 }
 
+# ConvertTo-SmokeFailureId - what makes the phase ledger able to see a REGRESSION.
+#
+# The ledger compares counts and exempts the smoke triple from failing; these identities are the
+# part that is not exempt. Every property below is load-bearing for that comparison.
+
+It 'a failure identity survives a change in the counts inside its message' {
+    # "121 of 145 line(s) differ" becomes "118 of 145" on the next run for reasons that are not
+    # a new failure. If the count reached the identity, every phase would mint fresh ids and
+    # every phase would report a NEW FAILURE - the gate would cry wolf and stop being read.
+    $a = ConvertTo-SmokeFailureId -Message '6 self-referential shim(s) - these fork cmd.exe forever'
+    $b = ConvertTo-SmokeFailureId -Message '2 self-referential shim(s) - these fork cmd.exe forever'
+    $a -eq $b
+}
+
+It 'two agent-block targets that differ only by directory get DIFFERENT identities' {
+    # ~\CLAUDE.md and ~\.claude\CLAUDE.md fail independently and are remediated independently.
+    # A leaf-name-only normalisation would alias them, and a real failure on one would then hide
+    # behind the other's known identity.
+    $a = ConvertTo-SmokeFailureId -Message "$env:USERPROFILE\CLAUDE.md is STALE - re-run bootstrap"
+    $b = ConvertTo-SmokeFailureId -Message "$env:USERPROFILE\.claude\CLAUDE.md is STALE - re-run bootstrap"
+    ($a -ne $b) -and ($a -notmatch [regex]::Escape($env:USERPROFILE))
+}
+
+It 'an identity carries no comma and no whitespace, because the ledger row is delimited by both' {
+    # The ledger line is space-delimited and this column is comma-joined. An id containing
+    # either would corrupt the row it is written into - and the corruption would land in the
+    # baseline, silently, to be compared against forever after.
+    $id = ConvertTo-SmokeFailureId -Message "some check failed, badly, on $env:USERPROFILE\a b\c.txt"
+    ($id -notmatch ',') -and ($id -notmatch '\s')
+}
+
+It 'two messages sharing a long prefix do not alias into one identity' {
+    # The head is truncated for readability in the ledger; the digest tail is what keeps
+    # distinctness. Without it a real regression could arrive wearing a known id and pass.
+    $prefix = 'toolbox venv missing a required package and this message is deliberately long: '
+    $a = ConvertTo-SmokeFailureId -Message ($prefix + 'alpha')
+    $b = ConvertTo-SmokeFailureId -Message ($prefix + 'omega')
+    $a -ne $b
+}
+
 # Test-HostPathProjection - the guard that stops a toolbox build under a packaged host.
 #
 # The condition it detects cost an afternoon on 2026-09-21: pip could not install at all,

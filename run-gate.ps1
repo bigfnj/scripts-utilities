@@ -48,6 +48,12 @@
     breaks a suite. A unit-suite count that moved fails the gate; the smoke triple moves for
     environmental reasons on every rebuild step - a tool arriving flips a FAIL to an OK - so it is
     reported as a TRANSITION instead.
+
+    THE TRIPLE IS EXEMPT; THE IDENTITIES ARE NOT. The failids column carries which checks failed,
+    not how many, so a count may move freely while a failure the previous phase did not have
+    still hard-fails as NEW FAILURE. That is the comparison two agents had to make by hand on
+    2026-09-18 (see scripts\smoke-test.ps1:412), now computed. A failure that CLEARED is a
+    TRANSITION, matching how a grown suite count is treated.
 #>
 [CmdletBinding()]
 param(
@@ -351,6 +357,26 @@ if ($PSBoundParameters.ContainsKey('Phase')) {
         if (-not $sm) { 'skipped' }
         else { '{0}/{1}/{2}' -f (Format-GateCount $sm.Passed), (Format-GateCount $sm.Warnings), (Format-GateCount $sm.Failed) }
 
+    # THE FAILURE IDENTITIES BEHIND THAT TRIPLE, and the one column here that can fail on its
+    # own. The smoke triple is exempt from DRIFT deliberately (see the decrease rule below), which
+    # is right for counts and useless for regressions: 0 failures -> 5 failures is a TRANSITION
+    # today. These identities close that gap without touching the exemption - a count may move
+    # freely, but a failure the previous phase did not have is fatal.
+    #
+    # Read out of smoke's own output rather than recomputed here, so there is exactly one
+    # definition of an identity (ConvertTo-SmokeFailureId, lib\common.ps1) and no second copy to
+    # drift. '?' when smoke ran but printed no such line - an older smoke-test, or one that died
+    # before its summary - and '?' is not comparable, so it fails closed below like every other
+    # column that cannot be read.
+    $phaseCounts['failids'] =
+        if (-not $sm) { 'skipped' }
+        elseif (-not $smokeOut) { '?' }
+        else {
+            $idLine = @($smokeOut -split "`r?`n" | Where-Object { $_ -match '^\s*failure-ids:' }) |
+                Select-Object -Last 1
+            if ($idLine -and ($idLine -match '^\s*failure-ids:\s*(.*)$')) { $Matches[1].Trim() } else { '?' }
+        }
+
     # From disk, exactly like scripts\smoke-test.ps1 and gate.yml's own "no test suite is missing"
     # step. There is no list here to fall out of date, and a suite added to tests\ shows up in the
     # ledger on its first run.
@@ -391,7 +417,7 @@ if ($PSBoundParameters.ContainsKey('Phase')) {
         foreach ($tok in ($prev -split '\s+')) {
             if ($tok -match '^([A-Za-z0-9_]+)=(.+)$') { $prevMap[$Matches[1]] = $Matches[2] }
         }
-        $drift = @(); $transitions = @()
+        $drift = @(); $transitions = @(); $newFailures = @()
         foreach ($k in $phaseCounts.Keys) {
             if (-not $prevMap.ContainsKey($k)) { $transitions += ('{0} is new ({1})' -f $k, $phaseCounts[$k]); continue }
             if ($prevMap[$k] -eq $phaseCounts[$k]) { continue }
@@ -400,6 +426,29 @@ if ($PSBoundParameters.ContainsKey('Phase')) {
             # changing. Failing on that would make the ledger unusable during exactly the work it
             # exists to track.
             if ($k -eq 'smoke') { $transitions += ('smoke {0} -> {1}' -f $prevMap[$k], $phaseCounts[$k]); continue }
+
+            # A SET, compared as a set. An identity present now and absent before is the
+            # regression this column exists to catch and hard-fails; one that disappeared is an
+            # improvement and reads as a TRANSITION, matching how a GROWN suite count is
+            # treated. '-' is the empty set, which is the healthy state and not a missing value.
+            #
+            # FAILS CLOSED on anything unreadable, exactly like the integer comparison: '?' or
+            # 'skipped' on either side means the sets cannot be compared, and a comparison that
+            # cannot be made must never pass for one that found nothing.
+            if ($k -eq 'failids') {
+                $unreadable = @('?', 'skipped')
+                if (($unreadable -contains $prevMap[$k]) -or ($unreadable -contains $phaseCounts[$k])) {
+                    $drift += ('{0} {1} -> {2}' -f $k, $prevMap[$k], $phaseCounts[$k])
+                    continue
+                }
+                $prevIds = @(($prevMap[$k] -split ',') | Where-Object { $_ -and ($_ -ne '-') })
+                $nowIds = @(([string]$phaseCounts[$k] -split ',') | Where-Object { $_ -and ($_ -ne '-') })
+                foreach ($gone in @($prevIds | Where-Object { $nowIds -notcontains $_ })) {
+                    $transitions += ('smoke failure CLEARED: {0}' -f $gone)
+                }
+                $newFailures += @($nowIds | Where-Object { $prevIds -notcontains $_ })
+                continue
+            }
 
             # A DECREASE HARD-FAILS. AN INCREASE DOES NOT. Both used to, and it made the ledger
             # punish the one thing this repo wants: adding a test. Every commit that fixed a bug
@@ -430,14 +479,22 @@ if ($PSBoundParameters.ContainsKey('Phase')) {
         }
 
         foreach ($tr in $transitions) { Write-Host ("TRANSITION {0}" -f $tr) -ForegroundColor Cyan }
+        # Reported before DRIFT and separately from it, because the two say different things: a
+        # DRIFT row means a test count fell or could not be read, a NEW FAILURE means the machine
+        # broke in a way the baseline did not have. Conflating them would cost the reader the one
+        # detail that tells them which.
+        if ($newFailures.Count) {
+            foreach ($nf in $newFailures) { Write-Host ("NEW FAILURE {0}" -f $nf) -ForegroundColor Red }
+            $hardFail = $true
+        }
         if ($drift.Count) {
             # A unit-suite count that FELL, or one that cannot be compared at all. Either way a
             # test count has no environmental excuse the way the smoke triple does. Growth is
             # reported above as a TRANSITION instead - see the reasoning at the decrease check.
             foreach ($d in $drift) { Write-Host ("DRIFT      {0}" -f $d) -ForegroundColor Red }
             $hardFail = $true
-        } elseif ($transitions.Count -eq 0) {
-            Write-Host 'ledger   every suite count matches the previous phase' -ForegroundColor Green
+        } elseif (($transitions.Count -eq 0) -and ($newFailures.Count -eq 0)) {
+            Write-Host 'ledger   every suite count and failure identity matches the previous phase' -ForegroundColor Green
         }
     }
 }

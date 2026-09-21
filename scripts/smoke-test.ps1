@@ -19,7 +19,17 @@ Sync-EnvPath
 $Pass = 0; $Fail = 0; $Warn = 0
 
 function Test-Ok   { param([string]$Msg) Write-Host "OK $Msg" -ForegroundColor Green;  $script:Pass++ }
-function Test-Fail { param([string]$Msg) Write-Host "FAIL $Msg" -ForegroundColor Red;    $script:Fail++ }
+$script:FailIds = New-Object System.Collections.Generic.List[string]
+function Test-Fail {
+    # -Id is an ESCAPE HATCH, not the mechanism. The identity is derived from $Msg by
+    # ConvertTo-SmokeFailureId (lib\common.ps1) so that all 63 call sites carry one without
+    # being edited; pass -Id only where the message cannot yield a stable one.
+    param([string]$Msg, [string]$Id = '')
+    Write-Host "FAIL $Msg" -ForegroundColor Red
+    $script:Fail++
+    $key = if ($Id) { $Id } else { ConvertTo-SmokeFailureId -Message $Msg }
+    if (-not $script:FailIds.Contains($key)) { $script:FailIds.Add($key) }
+}
 function Test-Warn { param([string]$Msg) Write-Host "WARN $Msg" -ForegroundColor Yellow; $script:Warn++ }
 function Test-Hdr  { param([string]$Msg) Write-Host "`n== $Msg ==" -ForegroundColor White }
 
@@ -1066,6 +1076,11 @@ try {
 
 # -- Summary -------------------------------------------------------------------
 Test-Hdr "summary"
+# ALWAYS PRINTED, even with nothing to report, and '-' rather than an empty tail. run-gate.ps1
+# has to tell "this run had no failures" apart from "this run is too old to emit the line" - the
+# first is the healthiest state there is, the second must never be read as it.
+$failIdField = if ($script:FailIds.Count) { (($script:FailIds | Sort-Object) -join ',') } else { '-' }
+Write-Host "failure-ids: $failIdField"
 Write-Host "$Pass passed, $Warn warnings, $Fail failed"
 if ($Fail -gt 0) {
     Write-Host "SMOKE TEST FAILED" -ForegroundColor Red
