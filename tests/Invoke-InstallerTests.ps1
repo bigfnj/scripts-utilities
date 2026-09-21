@@ -613,6 +613,136 @@ function Get-BuilderFn {
     @($builderFns | Where-Object { $_.Name -eq $Name }) | Select-Object -First 1
 }
 
+# Test-HostPathProjection - the guard that stops a toolbox build under a packaged host.
+#
+# The condition it detects cost an afternoon on 2026-09-21: pip could not install at all,
+# and the only symptom the builder surfaced was a distlib traceback naming LICENSE.txt.
+
+It 'Test-HostPathProjection reports $null, not $false, for a path it cannot measure' {
+    # The contract that matters. "I could not tell" and "the view is clean" must not read the
+    # same to bootstrap.ps1, which throws on $true and proceeds on $false - so a $false here
+    # would let an unmeasurable box build anyway.
+    $missing = Join-Path (New-SUFixtureRoot -Prefix 'projection-none-') 'no-such-file.exe'
+    $r = Test-HostPathProjection -Path $missing
+    ($null -eq $r.IsProjected) -and ($r.Reason -match 'does not exist')
+}
+
+It 'Test-HostPathProjection clears a path whose canonical name matches how it was reached' {
+    # THE REPO, NOT A TEMP FIXTURE, and the first draft of this test is why.
+    #
+    # %TEMP% is under %LOCALAPPDATA%, so it is inside the projection like everything else there:
+    # from an agent-host shell this assertion failed against a file it had just written, because
+    # the detector correctly reported $true. That is the detector working, not a bug - but it
+    # makes TEMP useless as the "definitely clean" control.
+    #
+    # bootstrap.ps1 is outside AppData wherever this suite runs (a checkout locally, the runner
+    # workspace in CI) and is guaranteed to exist, since the suite is running out of the same
+    # tree. A $null here would mean the measurement itself is broken on this box, which would
+    # make every other assertion in this group worthless - so $false specifically, not "not true".
+    $probe = Join-Path $repoRoot 'bootstrap.ps1'
+    $r = Test-HostPathProjection -Path $probe
+    ($false -eq $r.IsProjected) -and $r.Canonical
+}
+
+It 'the projected-view pattern names no vendor, package family or product' {
+    # HOST-AGNOSTIC BY CONSTRUCTION, and pinned so it stays that way. The measurement was taken
+    # under one vendor's MSIX host, and the obvious "fix" when someone next debugs this is to
+    # narrow the pattern to the package id they happen to see. That would silently stop
+    # detecting every other packaged host - Codex, Cursor, a packaged VS Code - each of which
+    # projects %LOCALAPPDATA% identically and breaks pip the same way.
+    $commonSrc = Get-Content -LiteralPath (Join-Path $repoRoot 'lib\common.ps1') -Raw
+    $patternLine = @($commonSrc -split "`r?`n" | Where-Object { $_ -match '\$script:ProjectedViewPattern\s*=' })
+    if ($patternLine.Count -ne 1) { return $false }
+    $vendors = @('Claude', 'Anthropic', 'Codex', 'OpenAI', 'Cursor', 'VSCode', 'Microsoft', 'pzs8sxrjxfjjc')
+    -not @($vendors | Where-Object { $patternLine[0] -match [regex]::Escape($_) }).Count
+}
+
+# Find-Executable's last-resort tier - BEHAVIOURAL, unlike everything else in this section.
+#
+# The rest of these are AST assertions because their defects were guards that read correctly and
+# could not fire. This one is a different shape: a filter that looked right and returned $null
+# for three real commands. Measured 2026-09-21 - npm, npx and corepack ship as .cmd in
+# C:\Program Files\nodejs with no .exe anywhere on the box, the tier filtered on "$Name.exe", so
+# Find-Executable returned $null, Install-NativeTools printed "could not locate command after
+# install", New-CmdWrapper was never called, and the 2026-08-07 self-referential shim survived
+# every rebuild. No source-level assertion distinguishes a correct filter from a wrong one.
+#
+# The function is extracted and evaluated rather than dot-sourced for the reason stated above:
+# build-devtoolbox.ps1's main body mutates the machine at load.
+$findExeFn = Get-BuilderFn -Name 'Find-Executable'
+if ($findExeFn) { . ([scriptblock]::Create($findExeFn.Extent.Text)) }
+
+It 'Find-Executable resolves a .cmd-only command and never its own shim' {
+    $fxRoot  = New-SUFixtureRoot -Prefix 'findexe-cmd-'
+    $toolbox = Join-Path $fxRoot 'toolbox'
+    $binDir  = Join-Path $toolbox 'native\bin'
+    $pfDir   = Join-Path $fxRoot 'pf'
+    $toolDir = Join-Path $pfDir 'SuFixture 1.0'
+    New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+    New-Item -ItemType Directory -Path $toolDir -Force | Out-Null
+
+    # The decoy, in the shape of the six measured on this box: a shim in native\bin named
+    # exactly after the command. Admitting .cmd to the search without excluding this directory
+    # is how the self-reference would come straight back.
+    Set-Content -LiteralPath (Join-Path $binDir 'sufixture.cmd') -Value '@echo off' -Encoding ASCII
+    # The real tool: .cmd and nothing else - the npm/npx/corepack shape.
+    $real = Join-Path $toolDir 'sufixture.cmd'
+    Set-Content -LiteralPath $real -Value '@echo off' -Encoding ASCII
+
+    $savedPf = $env:ProgramFiles
+    $savedPf86 = ${env:ProgramFiles(x86)}
+    $savedLad = $env:LOCALAPPDATA
+    try {
+        $env:ProgramFiles = $pfDir
+        ${env:ProgramFiles(x86)} = ''
+        # Somewhere that does not exist, so the winget-package tier cannot reach real state.
+        $env:LOCALAPPDATA = Join-Path $fxRoot 'lad'
+        $Root = $toolbox
+        $CommandSearchPatterns = @{}
+        $got = Find-Executable -Name 'sufixture'
+    } finally {
+        $env:ProgramFiles = $savedPf
+        ${env:ProgramFiles(x86)} = $savedPf86
+        $env:LOCALAPPDATA = $savedLad
+    }
+    $got -eq $real
+}
+
+It 'Find-Executable prefers .exe over a NEWER .cmd of the same name' {
+    # Extension rank must beat LastWriteTime, or admitting .cmd would let a stale wrapper win
+    # over the real binary. The .exe here is deliberately ten days older than the .cmd.
+    $fxRoot  = New-SUFixtureRoot -Prefix 'findexe-rank-'
+    $toolbox = Join-Path $fxRoot 'toolbox'
+    $pfDir   = Join-Path $fxRoot 'pf'
+    $toolDir = Join-Path $pfDir 'SuFixture 2.0'
+    New-Item -ItemType Directory -Path (Join-Path $toolbox 'native\bin') -Force | Out-Null
+    New-Item -ItemType Directory -Path $toolDir -Force | Out-Null
+
+    $exePath = Join-Path $toolDir 'sufixture2.exe'
+    $cmdPath = Join-Path $toolDir 'sufixture2.cmd'
+    Set-Content -LiteralPath $exePath -Value 'MZ' -Encoding ASCII
+    Set-Content -LiteralPath $cmdPath -Value '@echo off' -Encoding ASCII
+    (Get-Item -LiteralPath $exePath).LastWriteTime = (Get-Date).AddDays(-10)
+    (Get-Item -LiteralPath $cmdPath).LastWriteTime = (Get-Date)
+
+    $savedPf = $env:ProgramFiles
+    $savedPf86 = ${env:ProgramFiles(x86)}
+    $savedLad = $env:LOCALAPPDATA
+    try {
+        $env:ProgramFiles = $pfDir
+        ${env:ProgramFiles(x86)} = ''
+        $env:LOCALAPPDATA = Join-Path $fxRoot 'lad'
+        $Root = $toolbox
+        $CommandSearchPatterns = @{}
+        $got = Find-Executable -Name 'sufixture2'
+    } finally {
+        $env:ProgramFiles = $savedPf
+        ${env:ProgramFiles(x86)} = $savedPf86
+        $env:LOCALAPPDATA = $savedLad
+    }
+    $got -eq $exePath
+}
+
 It 'no bare native command inside a builder function' {
     # THE Bug-1 regression test. An unredirected native command inside a function writes to
     # that FUNCTION'S output stream, so `winget @args; if ($LASTEXITCODE -ne 0) { return

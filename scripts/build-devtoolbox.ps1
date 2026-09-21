@@ -710,11 +710,19 @@ function Find-Executable {
     # scripts\smoke-test.ps1's stale-shim check PASSED throughout, because it asks whether the
     # target exists and the target did exist - it was the shim.
     #
-    # qpdf is the only package that hits this, and the reason is a half-applied pattern rather
-    # than bad luck. A machine-scope winget package is invisible to the package walk above (that
-    # reads %LOCALAPPDATA% only), so it needs either a $CommandSearchPatterns entry - soffice,
-    # tesseract and 7z have one - or an installer that puts itself on PATH, as ImageMagick and
-    # Node do. qpdf is the one machine-scope package with NEITHER.
+    # SIX commands hit this, not one, and the reason is a half-applied pattern rather than bad
+    # luck. A machine-scope winget package is invisible to the package walk above (that reads
+    # %LOCALAPPDATA% only), so it needs either a $CommandSearchPatterns entry - soffice,
+    # tesseract and 7z have one - or the exhaustive fallback below to find it. Three
+    # machine-scope packages have NEITHER a table entry nor a discoverable .exe under a root the
+    # walk reads: QPDF.QPDF, ImageMagick.ImageMagick and OpenJS.NodeJS.LTS, and Node alone
+    # supplies four command names.
+    #
+    # Corrected 2026-09-21. This comment previously said "qpdf is the only package that hits
+    # this" and credited ImageMagick and Node with "an installer that puts itself on PATH" - true,
+    # but irrelevant, because being on PATH is exactly what makes Get-Command return our own shim.
+    # Measured the same day: corepack, magick, node, npm, npx and qpdf were ALL self-referential
+    # in native\bin, every one of them dated 2026-08-07.
     #
     # Deliberately NOT fixed by adding qpdf to $CommandSearchPatterns: its install directory
     # carries the version ("qpdf 12.3.2"), winget already offers 12.4.1, and a version-stamped
@@ -761,7 +769,30 @@ function Find-Executable {
     # The cheap half of that BACKLOG line - "bound the depth" - is also NOT done: $env:ProgramFiles
     # has no bounded depth that is safe to guess, and a bound that is one level too shallow turns
     # a slow correct answer into a fast wrong one.
-    $exe = if ($Name.EndsWith(".exe")) { $Name } else { "$Name.exe" }
+    # EVERY RUNNABLE EXTENSION, not just .exe. Measured 2026-09-21: this tier filtered on
+    # "$Name.exe" alone, and C:\Program Files\nodejs ships npm, npx and corepack as .cmd with no
+    # .exe anywhere on the box. So for those three every tier missed - tier 1 because they are
+    # machine-scope and it reads %LOCALAPPDATA% only, tier 2 because they have no
+    # $CommandSearchPatterns entry, tier 3 because $cmdIsOwnShim correctly refused the self-shim,
+    # and tier 4 because of this filter - Find-Executable returned $null, Install-NativeTools
+    # printed "could not locate command after install", New-CmdWrapper was never called, and the
+    # 2026-08-07 self-referential shim SURVIVED the rebuild untouched. The $cmdIsOwnShim guard had
+    # turned "silently rewrite the loop" into "silently leave the loop in place".
+    #
+    # $runnable is the list declared at the top of this function, and its order is the preference:
+    # .exe beats .cmd beats .bat beats .com for the same name, and LastWriteTime breaks ties only
+    # within one extension. A .cmd is a real answer here, not a fallback - it is what npm IS.
+    $probeFilter = if ($runnable -contains [IO.Path]::GetExtension($Name).ToLowerInvariant()) {
+        $Name
+    } else {
+        "$Name.*"
+    }
+
+    # The shim directory is excluded below using $shimDir, already computed by the Get-Command
+    # tier above. Without that exclusion this fix re-opens the hole it closes: $Root\native is
+    # the first search root and native\bin is full of .cmd files named exactly after the commands
+    # being resolved, so admitting .cmd here would let this tier hand back the self-referential
+    # shim that the tier above just refused.
     $roots = @(
         (Join-Path $Root "native"),
         "$env:LOCALAPPDATA\Microsoft\WinGet\Packages",
@@ -793,8 +824,26 @@ function Find-Executable {
         # walk - BACKLOG measures it at 4,048 ms - so the worst case is unchanged and only the
         # lucky-hit case gets slower. Correctness beats luck at a callsite whose output is baked
         # into a shim that then looks fine for months.
-        $found = Get-ChildItem -Path $searchRoot -Recurse -File -Filter $exe -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending |
+        # ONE walk per root, not one per extension. -Filter is the provider-level filter and the
+        # only cheap part of this tier; looping four Get-ChildItem -Recurse calls over
+        # %ProgramFiles% would quadruple a miss that BACKLOG already measures at 4,048 ms. So the
+        # wildcard widens by one character and the extension test moves into the filter below.
+        #
+        # "$Name.*" also matches an extensionless file of the same name; $runnable rejects it,
+        # which is right - a bare extensionless file is not runnable as a native command.
+        $hits = @(Get-ChildItem -Path $searchRoot -Recurse -File -Filter $probeFilter -ErrorAction SilentlyContinue |
+            Where-Object {
+                ($runnable -contains $_.Extension.ToLowerInvariant()) -and
+                ([IO.Path]::GetFullPath($_.DirectoryName).TrimEnd('\') -ine $shimDir)
+            })
+        if (-not $hits.Count) { continue }
+
+        # Extension rank first, LastWriteTime second. [array]::IndexOf rather than
+        # $runnable.IndexOf: under Set-StrictMode the latter is a method call on a plain
+        # object[] and reads as an accident, and this one is deliberate.
+        $found = $hits |
+            Sort-Object @{ Expression = { [array]::IndexOf($runnable, $_.Extension.ToLowerInvariant()) } },
+                        @{ Expression = { $_.LastWriteTime }; Descending = $true } |
             Select-Object -First 1
         if ($found) { return $found.FullName }
     }
