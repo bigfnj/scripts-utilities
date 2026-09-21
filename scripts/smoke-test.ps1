@@ -322,6 +322,18 @@ if (Test-Path $tbRoot) {
             # loses Ghidra first and without a word.
             $target = Get-ShimTarget -Lines @(Get-Content -LiteralPath $w.FullName -ErrorAction SilentlyContinue)
             if (-not $target) { continue }
+            # EXPAND %VAR% BEFORE PROBING, and only here. A wrapper may legitimately resolve its
+            # target at run time - codexcli.cmd on this box ends '"%_CODEX_EXE%" %*' and picks the
+            # exe by probing several locations - so Test-Path on the literal string always fails
+            # and this gate reports a healthy wrapper as stale. Get-ShimTarget itself stays
+            # untouched: it is the byte contract the four writers and install-browse.ps1's
+            # assertion share, and it has to keep returning what the file literally says.
+            $target = [Environment]::ExpandEnvironmentVariables($target)
+            # Still %-wrapped after expansion means the variable is set by the wrapper itself or
+            # by the calling shell, so only run time can say whether the target exists. Skipping
+            # is the honest answer - this gate cannot tell that case apart from a real stale
+            # target, and a false alarm here trains people to ignore the whole group.
+            if ($target -match '%[^%]+%') { continue }
             # Normalised both sides: the shim body is whatever Find-Executable returned, and
             # Get-ChildItem hands back a full path, so a raw -ieq would miss a trailing-slash or
             # short-name spelling of the same file.
