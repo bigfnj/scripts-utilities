@@ -498,6 +498,115 @@ function Get-ToolboxPython {
     return $null
 }
 
+# -- Packaged-host path projection ---------------------------------------------
+# Is THIS process seeing the toolbox through an MSIX package's redirected view?
+#
+# An agent host installed as an MSIX package gets %LOCALAPPDATA% and %APPDATA% projected into
+# its own Packages\<pkg>\LocalCache\ tree, and every process it launches inherits that view -
+# including a plain powershell.exe with no package identity of its own. The files are the same
+# files: one hardlink name, same bytes, same size. What differs is which NAME the filesystem
+# reports as canonical, and it differs asymmetrically - a FILE resolves to the package name
+# while its PARENT DIRECTORY resolves to the unredirected one.
+#
+# That asymmetry breaks pip outright. distlib 0.4.2's ResourceFinder._is_in_base compares
+# realpath(package dir) with realpath(resource) using startswith, so under a projected view
+# EVERY resource lookup raises "Resource name escapes package" and `pip install` cannot run at
+# all - which stopped scripts\build-devtoolbox.ps1 in its python phase on 2026-09-21, four
+# phases before it would have repaired a single shim.
+#
+# HOST-AGNOSTIC BY CONSTRUCTION. The pattern below matches \Packages\<anything>\LocalCache\, not
+# a vendor or a package family name. Claude Desktop is simply the host that happened to spawn
+# the shell where this was measured; a Codex, Cursor or VS Code build packaged as MSIX projects
+# the same way and breaks pip identically. Do not narrow this to a known package id.
+#
+# NOT detectable by the obvious routes, all three measured and ruled out on 2026-09-21: there is
+# NO reparse point on any component of either path, the shell has NO package identity
+# (GetCurrentPackageFullName returns APPMODEL_ERROR_NO_PACKAGE), and the two paths are not
+# separate hardlinks - fsutil reports exactly ONE name, and it is the package one. Hence asking
+# the filesystem for that one name rather than testing for a link.
+$script:ProjectedViewPattern = '\\Packages\\[^\\]+\\LocalCache\\'
+
+function Test-HostPathProjection {
+    <#
+        Returns an object describing whether $Path is reached through a projected view:
+
+            IsProjected   $true / $false, or $null when it could not be measured
+            Probe         the path actually measured
+            Canonical     the name the filesystem reports for it
+            PackageRoot   the ...\Packages\<pkg>\ prefix responsible, when projected
+            Reason        why, in one sentence, for a caller that wants to print it
+
+        $null IsProjected is deliberately NOT $false: "I could not tell" and "it is fine" must
+        not read the same to a caller deciding whether to run a build.
+    #>
+    param([string]$Path = "")
+
+    $probe = $Path
+    if (-not $probe) { $probe = Get-ToolboxPython }
+    if (-not $probe) {
+        $root = if ($env:CODEX_TOOLBOX) { $env:CODEX_TOOLBOX } else { "$env:LOCALAPPDATA\DevToolbox" }
+        $probe = $root
+    }
+    if (-not $probe -or -not (Test-Path -LiteralPath $probe)) {
+        return [pscustomobject]@{
+            IsProjected = $null; Probe = $probe; Canonical = $null; PackageRoot = $null
+            Reason = "nothing to measure: '$probe' does not exist"
+        }
+    }
+
+    # fsutil, not Get-Item.Target: there is no reparse point to follow, and .Target is $null
+    # here. `hardlink list` is the cheapest call that reports the name the volume actually
+    # holds, and it needs no elevation. Through Invoke-Native because this file is dot-sourced
+    # by callers that set $ErrorActionPreference='Stop', under which a redirected native call
+    # raises NativeCommandError - see that wrapper's header.
+    $fsutil = Join-Path $env:SystemRoot 'System32\fsutil.exe'
+    if (-not (Test-Path -LiteralPath $fsutil)) {
+        return [pscustomobject]@{
+            IsProjected = $null; Probe = $probe; Canonical = $null; PackageRoot = $null
+            Reason = 'fsutil.exe not found, so the canonical name cannot be read'
+        }
+    }
+
+    $r = Invoke-Native -FilePath $fsutil -Arguments @('hardlink', 'list', $probe)
+    if ($r.ExitCode -ne 0) {
+        return [pscustomobject]@{
+            IsProjected = $null; Probe = $probe; Canonical = $null; PackageRoot = $null
+            Reason = "fsutil hardlink list exited $($r.ExitCode)"
+        }
+    }
+
+    $canonical = @($r.Output | ForEach-Object { [string]$_ } |
+        Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() }) |
+        Select-Object -First 1
+
+    if (-not $canonical) {
+        return [pscustomobject]@{
+            IsProjected = $null; Probe = $probe; Canonical = $null; PackageRoot = $null
+            Reason = 'fsutil returned no name'
+        }
+    }
+
+    # Projected when the volume's own name for the file sits under a package LocalCache but the
+    # path we reached it by does not. Both halves matter: a caller that deliberately addressed
+    # the LocalCache path is NOT projected - it asked for exactly what it got, and pip works
+    # there precisely because both realpath calls then agree.
+    $canonHit = $canonical -match $script:ProjectedViewPattern
+    $probeHit = $probe -match $script:ProjectedViewPattern
+    $packageRoot = $null
+    if ($canonHit -and -not $probeHit) {
+        if ($canonical -match '^(.*\\Packages\\[^\\]+)\\LocalCache\\') { $packageRoot = $Matches[1] }
+        return [pscustomobject]@{
+            IsProjected = $true; Probe = $probe; Canonical = $canonical; PackageRoot = $packageRoot
+            Reason = "the filesystem's only name for this file is under $packageRoot, so realpath of a file and of its parent directory disagree and pip cannot install"
+        }
+    }
+
+    return [pscustomobject]@{
+        IsProjected = $false; Probe = $probe; Canonical = $canonical; PackageRoot = $null
+        Reason = 'the canonical name matches the path used to reach it'
+    }
+}
+
 function Set-NodeSystemCaBundle {
     # Make node/npm trust the OS certificate store so 'npm install' works behind
     # corporate TLS interception. node ships its own CA bundle and ignores the
@@ -880,14 +989,16 @@ PATH too. Set CODEX_TOOLBOX to override the toolbox root path.
               Exit 3 = refused. Ask the user to clear the challenge in that
               browser window; never retry in a loop. Exit 4 = robots.txt said
               no. Exit 5 = the site charges for machine access; no bypass.
-              A WebFetch that fails on a site may not be fixable: Claude-User
-              is not a Cloudflare signed agent and its UA is not configurable.
+              If your host's own web-fetch tool fails on a site, that may not
+              be fixable from here: most agent fetchers are not Cloudflare
+              signed agents and their user-agent is not configurable.
               Use browse instead.
               Install: $RepoRoot\scripts\install-browse.ps1
               Rules, exit codes, measurements: $RepoRoot\docs\agent-rules.md
-              FROM A BASH TOOL CALL a .cmd shim needs its extension -
-              browse.cmd, ffmpeg.cmd - because Git Bash appends .exe and not
-              .cmd when searching PATH. From PowerShell the bare name works.
+              FROM A POSIX-SHELL TOOL CALL a .cmd shim needs its extension -
+              browse.cmd, ffmpeg.cmd - because Git Bash and similar POSIX
+              shells append .exe and not .cmd when searching PATH. From
+              PowerShell the bare name works.
               True of every wrapped tool in native\bin, not just this one.
 
 ### Developer CLI tools - on PATH (winget; user scope unless noted)
@@ -956,9 +1067,10 @@ PATH too. Set CODEX_TOOLBOX to override the toolbox root path.
 
 If present, a local Ollama runtime serves an OpenAI-compatible API entirely on
 this machine (nothing leaves the box). Discover it via %TOOLBOX_LLM_URL% (=
-http://127.0.0.1:11434/v1); models live in $toolboxRoot\models. Point any OpenAI
-client at that base URL for offline / sensitive RAG and inference. CLI: ollama
-run <model> / ollama list. Default models are VRAM-tiered (moondream vision,
+http://127.0.0.1:11434/v1); models live in $toolboxRoot\models. Point any
+OpenAI-compatible client at that base URL for offline / sensitive RAG and
+inference. CLI: ollama run <model> / ollama list. Default models are
+VRAM-tiered (moondream vision,
 qwen2.5:3b + mistral:7b text, qwen3-embedding:0.6b embeddings; mistral-small on
 24 GB+). A cross-encoder reranker (run via the toolbox Python + onnxruntime) may
 be provisioned at $toolboxRoot\scripts\rerank.py. Not installed unless the user

@@ -534,6 +534,29 @@ function Test-DevToolboxReady {
         Write-Info "[DRY-RUN] would build DevToolbox with: $builder"
         return
     }
+    # REFUSE TO BUILD THROUGH A PACKAGED HOST'S PROJECTED VIEW.
+    #
+    # The builder's python phase is its FIRST real phase and an unskippable hard gate: a failed
+    # `pip install --upgrade pip setuptools wheel` throws out of Invoke-Checked and terminates
+    # the script before a single shim is written. Under a projected view that pip call cannot
+    # succeed at all - not "is slow", not "may fail" - so letting the build start only produces
+    # a distlib traceback that names LICENSE.txt and nothing about the real cause. Measured
+    # 2026-09-21: that is exactly how an afternoon was spent.
+    #
+    # Checked HERE rather than inside the builder because the builder deliberately dot-sources
+    # only lib\ShimFormat.ps1 (see its header) while this file already has lib\common.ps1, and
+    # because this is the last point where the message can still name a remedy.
+    $projection = Test-HostPathProjection
+    if ($projection.IsProjected) {
+        throw ("refusing to build the toolbox through a packaged host's projected view. " +
+               "$($projection.Reason). Re-run this build from a shell that host did not spawn, " +
+               "or through: .\scripts\run-unprojected.ps1 .\bootstrap.ps1 -ScriptArgs '-RefreshToolbox'. " +
+               "Diagnose with: .\scripts\test-host-projection.ps1")
+    }
+    if ($null -eq $projection.IsProjected) {
+        Write-Warn "could not determine whether this shell sees a projected view - $($projection.Reason)"
+    }
+
     Write-Group "build DevToolbox"
     $args = @("-ExecutionPolicy", "Bypass", "-File", $builder, "-Root", $toolboxRoot)
     if ($SkipHeavyToolboxBuild) { $args += "-SkipHeavy" }

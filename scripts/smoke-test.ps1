@@ -544,6 +544,44 @@ Write-Host ("  regime: {0} - {1}" -f $adRegime, $adTally) -ForegroundColor DarkG
 # separately - a manifest written before the ledger existed cannot vouch for a clean build, and
 # saying "clean" on its behalf would be the silent-pass shape this file exists to remove.
 Test-Hdr "build health"
+
+# WARN, DELIBERATELY NOT FAIL. A projected view is a property of WHO RAN THE GATE, not of the
+# machine's health: the same toolbox is clean when measured from a shell Task Scheduler started
+# and projected when measured from one an MSIX-packaged agent host started. Failing here would
+# make the gate unpassable from an agent session for a condition that no commit can fix, and a
+# gate that cannot pass stops being run. bootstrap.ps1 is where this condition is fatal, because
+# that is where it would actually corrupt something.
+$smokeProjection = Test-HostPathProjection
+if ($smokeProjection.IsProjected) {
+    Test-Warn ("this shell sees the toolbox through a packaged host's projected view " +
+               "($($smokeProjection.PackageRoot)) - pip cannot install from here; " +
+               "build via .\scripts\run-unprojected.ps1")
+} elseif ($null -eq $smokeProjection.IsProjected) {
+    Test-Warn "could not determine whether this shell sees a projected view - $($smokeProjection.Reason)"
+} else {
+    Test-Ok "no packaged-host path projection - the toolbox resolves to its real location"
+}
+
+# A FAIL, unlike the check above, and the difference is the point. The projection is a property
+# of the shell asking; THIS is a property of the toolbox on disk - a path baked into a file by
+# some earlier build that ran through a projected view. Measured 2026-09-21: pyvenv.cfg's
+# `executable` read
+#   C:\...\AppData\Local\Packages\<pkg>\LocalCache\Roaming\uv\python\...\python.exe
+# while `home` and `command` on the same four lines named the real path. It survives every
+# rebuild that reuses the venv, and it dies the day that package is uninstalled - taking
+# sys._base_executable, `python -m venv --upgrade` and any venv-from-venv with it.
+$venvCfg = Join-Path $tbRoot 'python\.venv\pyvenv.cfg'
+if (Test-Path -LiteralPath $venvCfg) {
+    $cfgBad = @(Get-Content -LiteralPath $venvCfg -ErrorAction SilentlyContinue |
+        Where-Object { $_ -match $script:ProjectedViewPattern })
+    if ($cfgBad.Count) {
+        Test-Fail ("pyvenv.cfg names a packaged host's container in $($cfgBad.Count) line(s) - " +
+                   "that path dies with the package: $($cfgBad[0].Trim())")
+    } else {
+        Test-Ok "pyvenv.cfg names no packaged-host container"
+    }
+}
+
 if (-not (Test-Path -LiteralPath $tbRoot)) {
     Test-Warn "DevToolbox not found at $tbRoot - cannot read the build's degraded list"
 } else {
