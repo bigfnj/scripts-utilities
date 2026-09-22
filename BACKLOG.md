@@ -24,8 +24,26 @@ justifies the category.
 
 Repo is on `main`, pushed, CI green on both jobs. Gate green **from an agent session**:
 `checks=7 smoke=84/4/0 agentdiscovery=21 core=27 gatechecks=47 installer=150 render=28
-smokelint=18 triage=31`. The four smoke warnings are the long-standing optional ones (`browse`,
-Sysmon, USN journal size, the admin-only task read).
+smokelint=18 triage=31`. The four smoke warnings in that session were the long-standing optional
+ones (`browse`, Sysmon, USN journal size, the admin-only task read).
+
+⚠ **The smoke triple and the warning identities are PER-CHECKOUT, not repository facts - do not
+cite the line above as this box's expected state.** The same commit measured `smoke=90/4/0` from a
+different session on 2026-09-22, with a different four: `cdb` and `poolmon` (absent until a
+WDK/SDK install), the `build is DEGRADED in 1 component(s)` line for the orphaned `timm` that
+`docs/engineering-record.md` records as a decision, and the admin-only task read. Both runs were
+green. The unit-suite counts (`agentdiscovery` through `triage`) and `checks` ARE repository facts
+and should reproduce anywhere; the smoke numbers describe a workstation. Measure your own before
+treating any warning as a regression.
+
+⚠ **Expect four `is STALE` FAILURES the first time you gate an existing box after pulling this
+tag, and they are not a regression.** De-vendoring the generated block so it names no single agent
+host changed 85 of its 148 lines, so every already-deployed `~\CLAUDE.md`, `~\.claude\CLAUDE.md`,
+`~\AGENTS.md` and `~\.codex\AGENTS.md` is out of date until rewritten. Measured here 2026-09-22:
+`smoke=86/4/4` before, `90/4/0` after. `bootstrap.ps1` fixes it, but if you want only those four
+files, dot-source `lib\common.ps1` and call `Write-AgentDiscovery -RepoRoot <repo>` under
+`powershell.exe` - `-DryRun` will NOT do it, because the call site is inside `if (-not
+$script:DryRun)`.
 
 **Read `docs/agent-rules.md` on packaged agent hosts before building anything from an agent
 shell.** An MSIX-packaged host redirects `%LOCALAPPDATA%` and `%APPDATA%` copy-on-write, so a

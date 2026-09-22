@@ -3,6 +3,20 @@
 Build the durable Windows DevToolbox under %LOCALAPPDATA%\DevToolbox.
 
 This is stage 1 of the workstation setup. bootstrap.ps1 is stage 2.
+
+THERE IS NO PROJECTED-VIEW GUARD IN THIS FILE, and that is deliberate. bootstrap.ps1 calls
+Test-HostPathProjection and refuses with a remedy BEFORE it invokes this script, so the ordinary
+route is covered. The check cannot move here: the detector lives in lib\common.ps1, and this file
+dot-sources EXACTLY ONE library - lib\ShimFormat.ps1, whose header explains why that is worth
+keeping - because bootstrap.ps1 runs this script as a CHILD PROCESS that inherits none of its
+scope. Invoke-InstallerTests.ps1 pins that count, so reaching for common.ps1 here fails the gate.
+
+The consequence lands on whoever runs this script DIRECTLY, which bootstrap.ps1's tessdata
+warning, smoke-test.ps1's self-referential-shim failure and install-browse.ps1's missing-Python
+throw all tell you to do. From an MSIX-packaged agent host the first pip phase
+(Install-PythonPackages) dies with distlib's "Resource name escapes package: 'LICENSE.txt'" and
+nothing in that traceback names the real cause. If you are here after being sent here, run
+scripts\test-host-projection.ps1 first, or go through bootstrap.ps1 instead.
 #>
 [CmdletBinding()]
 param(
