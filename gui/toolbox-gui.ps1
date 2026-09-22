@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 DevToolbox installer GUI - a thin WinForms front-end over the existing scripts.
 
@@ -302,6 +302,24 @@ function Invoke-Streamed {
     return (Invoke-ChildProcess -Psi $psi)
 }
 
+# SURFACE THE EXIT CODE. Both helpers above already RETURN it and all four buttons piped it to
+# Out-Null, so a failed full install, a failed per-tool install and a failed uninstall looked
+# exactly like success - the only trace was one uncoloured "<<< exit 1" line in a log pane the
+# user has usually scrolled past. A GUI that cannot tell you the job failed is worse than a
+# console that can.
+function Show-ChildExit {
+    param([Parameter(Mandatory)][string]$What, $Code)
+    $n = if ($null -eq $Code) { -1 } else { [int]$Code }
+    if ($n -eq 0) {
+        Add-Log ("--- {0}: completed (exit 0)" -f $What)
+        return
+    }
+    Add-Log ("!!! {0}: FAILED (exit {1}) - see the log above for the failing step" -f $What, $n)
+    [void][System.Windows.Forms.MessageBox]::Show(
+        ("{0} failed (exit {1}).`r`n`r`nThe log pane holds the output. This toolbox is idempotent, so re-running only retries what is missing." -f $What, $n),
+        "Failed", "OK", "Error")
+}
+
 # The runner takes layer/component switches only - there is no per-tool argument to
 # add here, which is exactly why the per-tool boxes cannot reach a full run.
 function Get-RunnerArgs {
@@ -375,14 +393,14 @@ $null = New-Button "Refresh status" 110 {
 $null = New-Button "Dry run (full)" 110 {
     if (-not (Confirm-TicksIgnored -What "Dry run (full)")) { return }
     Set-Busy $true
-    try { Invoke-Streamed -File $Runner -ScriptArgs (@("-DryRun") + (Get-RunnerArgs)) | Out-Null }
+    try { Show-ChildExit -What "Dry run (full)" -Code (Invoke-Streamed -File $Runner -ScriptArgs (@("-DryRun") + (Get-RunnerArgs))) }
     finally { Set-Busy $false }
 }
 
 $null = New-Button "Full install / update" 140 {
     if (-not (Confirm-TicksIgnored -What "Full install / update")) { return }
     Set-Busy $true
-    try { Invoke-Streamed -File $Runner -ScriptArgs (Get-RunnerArgs) | Out-Null }
+    try { Show-ChildExit -What "Full install / update" -Code (Invoke-Streamed -File $Runner -ScriptArgs (Get-RunnerArgs)) }
     finally { Set-Busy $false }
 }
 
@@ -405,7 +423,7 @@ $null = New-Button "Install checked tools" 150 {
         $psi.WorkingDirectory = $REPO_ROOT
         # Same pump as every other button: this copy had its own stdout-only loop, so it
         # carried the same stderr deadlock and leaked its Process object on every click.
-        Invoke-ChildProcess -Psi $psi | Out-Null
+        Show-ChildExit -What "Install checked tools" -Code (Invoke-ChildProcess -Psi $psi)
     } finally { Set-Busy $false }
 }
 
@@ -418,7 +436,7 @@ $null = New-Button "Uninstall..." 90 {
     try {
         $a = @("-Yes")
         if ($removeTools -eq "Yes") { $a += "-RemoveWingetTools" }
-        Invoke-Streamed -File $Uninstall -ScriptArgs $a | Out-Null
+        Show-ChildExit -What "Uninstall" -Code (Invoke-Streamed -File $Uninstall -ScriptArgs $a)
     } finally { Set-Busy $false }
 }
 

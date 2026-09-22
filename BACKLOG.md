@@ -1,4 +1,4 @@
-# Backlog - scripts-utilities
+﻿# Backlog - scripts-utilities
 
 ## How to work this list
 
@@ -20,7 +20,31 @@ justifies the category.
 
 ---
 
-## Where to pick up - handoff, 2026-09-18
+## Where to pick up - handoff, 2026-09-22
+
+Repo is on `main`, pushed, CI green on both jobs. Gate green **from an agent session**:
+`checks=7 smoke=84/4/0 agentdiscovery=21 core=27 gatechecks=47 installer=150 render=28
+smokelint=18 triage=31`. The four smoke warnings are the long-standing optional ones (`browse`,
+Sysmon, USN journal size, the admin-only task read).
+
+**Read `docs/agent-rules.md` on packaged agent hosts before building anything from an agent
+shell.** An MSIX-packaged host redirects `%LOCALAPPDATA%` and `%APPDATA%` copy-on-write, so a
+toolbox built from inside one leaves a private shadow and the two trees drift apart silently.
+That had happened here since 2026-08-07: the real tree and the shadow disagreed by 25 shims and
+six of the shadow's were self-referential. `bootstrap.ps1` now refuses to build through a
+redirected view; `scripts/run-unprojected.ps1` gets you a process the host did not spawn; and
+`scripts/clear-host-shadow.ps1` removes an existing shadow.
+
+**The ledger now carries failure IDENTITIES, not just counts.** `run-gate.ps1 -Phase <label>`
+records a `failids` column and hard-fails on an identity the previous phase did not have.
+Counts stay exempt from DRIFT, deliberately - see `run-gate.ps1`'s header.
+
+Two findings from that round had a proposed remedy that would have introduced a bug. Both are
+in `docs/engineering-record.md`.
+
+---
+
+## Previous round - handoff, 2026-09-18
 
 Repo is on `main`, pushed, CI **green on both jobs** (`suites` and `checks`). Gate green:
 `checks=7 smoke=87/4/0 agentdiscovery=19 core=27 gatechecks=47 installer=137 render=28 smokelint=18
@@ -106,143 +130,26 @@ fail locally. If you add a test, ask what on this box it is quietly reading.
 
 ---
 
-## Open items - 2026-09-21
+## Open items: NONE
 
-The 2026-09-18 list was empty. These are what a full read-only audit of the tree surfaced on
-2026-09-21, minus everything fixed the same day. Each names the file, the symbol and the
-measurement. Nothing here blocks a green gate: the gate passed at `checks=7 smoke=84/4/0` with
-these open.
+Empty on purpose, and stated rather than left to inference: an empty file and a file whose sections
+happen to be blank read the same, which is how the handoff above gets mistaken for a task list.
 
-### The CUDA toolkit will not install while a reboot is pending - OWNER ACTION, then retry
+The nine items here on 2026-09-21 are all closed. Seven were fixed; two were closed as DECISIONS
+and live in `docs/engineering-record.md` rather than here, because "do not do this, and here is the
+measurement" reads identically to "do this" once it has scrolled past:
 
-`catalog.json` `cuda-toolkit` / `Nvidia.CUDA`, installed by `modules/extras.ps1`.
+- **`--scope machine` must not be added to `Install-WingetTool` - REFUTED.** The audit was right
+  that `-MachineScope` and `-NoScope` build identical command lines and wrong about the remedy: the
+  WDK answers `0x8A150010` to that flag, `install-machine-scope.ps1` already owns it, and emitting
+  it would raise UAC during an ordinary unelevated bootstrap. A test now pins its absence.
+- **Four redundant sub-conditions - not fixed, deliberately.** They are working guards and one of
+  them protects a recursive delete. Editing a live safety guard to save a reader four seconds is
+  the worse trade.
 
-Measured 2026-09-21: `winget install Nvidia.CUDA` (13.4) downloaded and hash-verified, then
-`Installer failed with exit code: 2147944003` - that is `0x80070643`, generic installer failure.
-All four pending-reboot indicators were set at the time (`CBS\RebootPending`,
-`WindowsUpdate\Auto Update\RebootRequired`, `CBS\PackagesPending`, `PendingFileRenameOperations`),
-with the OS still on build 26100 and KB5129195 staged, so the servicing stack was mid-transaction.
-
-A later run in the same session reported `cuda-toolkit installed (not yet on PATH - open a new
-shell)`, so this may already be closed. **Re-measure after the reboot before treating it as open:**
-
-```powershell
-winget list --id Nvidia.CUDA -e
-```
-
-Not a blocker either way - `torch 2.11.0+cu128` is installed and reports
-`torch_cuda_available: true` on an RTX PRO 1000 Blackwell.
-
-### `-MachineScope` and `-NoScope` build IDENTICAL winget command lines - NEEDS AN OWNER DECISION
-
-`lib/common.ps1`, `Install-WingetTool`.
-
-```powershell
-if ($NoScope) {
-    # Deliberately no --scope flag; see the parameter comment above.
-}
-elseif (-not $MachineScope) { $args += @("--scope", "user") }
-```
-
-`-NoScope` emits no scope flag; `-MachineScope` falls through the `elseif` and also emits none.
-Neither ever produces `--scope machine`, so `lib/catalog.ps1`'s `winget-machine` and
-`winget-default` channels are byte-identical and the `if ($NoScope)` body is a literal empty
-block. One of the two switches carries no behaviour, and `docs/agent-rules.md` reads as though
-`winget-machine` does something different.
-
-Two ways out and they are not equivalent, which is why this is a decision and not a fix: emit
-`--scope machine` under `-MachineScope` (and verify every `machine_scope_ids` package accepts it -
-`docs/engineering-record.md` shows `--scope machine` being used against QPDF), or delete `-NoScope`
-and collapse the two channels onto one switch. The first changes install behaviour on ten packages.
-
-### `install-llm.ps1` prints "ready" for a run that installed nothing
-
-`scripts/install-llm.ps1`, the tail after the model-pull loop.
-
-The file contains **zero** `exit` statements, so its exit code is whatever `ollama pull` or the
-venv `find_spec` probe last left. `Install-CatalogItem ... | Out-Null` discards an Ollama install
-failure; a failed pull only warns and does not increment `$pulled`; and `$modelsInToolbox` is
-re-measured only when `$pulled -gt 0`, so a run where every pull failed keeps its `$true` default
-and the last line announces `local LLM stack ready - endpoint: ... (models in ...)` over an empty
-directory. The file's own comment condemns exactly this shape. Both `Write-Err` calls in it reach
-no exit code at all.
-
-Opt-in script, so nothing reaches it unless the owner runs it - which is why it is here rather
-than fixed with the rest.
-
-### `fresh-toolbox-setup-runner.ps1` drops the exit code of three of its four callees
-
-`fresh-toolbox-setup-runner.ps1`, `Invoke-Checked`.
-
-The function has no final branch: a non-zero code with neither `-TrustExitCode` nor a matching
-`-NonFatalExitCodes` entry falls off the end with no warning at all. The sharp case is that
-bootstrap is run twice - once **with** `-TrustExitCode`, and again as `& $Bootstrap -Only security`
-**without** it - so `bootstrap INCOMPLETE - N tool(s) failed` after a Ghidra install is invisible.
-The same gap covers the Ghidra and LLM installers.
-
-Fix shape: add `-TrustExitCode` to the three bare calls, and give `Invoke-Checked` a trailing
-`Write-Warn` so an unhandled non-zero code is never dropped in silence.
-
-### `Add-WinManifest` does a non-atomic read-modify-write with no backup
-
-`lib/common.ps1`, `Add-WinManifest`.
-
-`Set-Content` truncates in place. An interrupt between truncate and flush leaves truncated JSON,
-and the next run's `ConvertFrom-Json` throws under `bootstrap.ps1`'s `$ErrorActionPreference =
-'Stop'`, killing bootstrap at the first tool with no `.bak-` to fall back to. `Write-AgentBlock`
-copies before rewriting and `consolidate-path.ps1` calls `Backup-PathRegistry`; this does neither.
-
-Lost-update variant: the GUI's "Install checked tools" and a terminal `bootstrap.ps1` running
-together both read N entries and both write N+1, and one tool's entry vanishes with no error.
-
-The `ConvertTo-Json` unrolling bug on the same line was fixed on 2026-09-21; the atomicity was not.
-
-### The GUI logs every child exit code and then discards it
-
-`gui/toolbox-gui.ps1`, `Invoke-ChildProcess` / `Invoke-Streamed`.
-
-Both return the child's exit code and all four call sites pipe it to `Out-Null`. A failed full
-install, a failed per-tool install and a failed uninstall are indistinguishable from success except
-for one uncoloured `<<< exit 1` line in a scrolling log pane.
-
-### Undisposed IDisposables
-
-Bounded, no measured leak, listed so the next audit does not re-derive them:
-
-- `[Security.Principal.WindowsIdentity]::GetCurrent()` holds an access-token handle and is never
-  disposed - `lib/path-registry.ps1` (`Test-PathAdmin`, called per PATH entry), `run-gate.ps1`,
-  `scripts/consolidate-path.ps1` (twice), `install-deletion-forensics.ps1`, `scripts/smoke-test.ps1`,
-  `scripts/test-host-projection.ps1`, `scripts/uninstall-toolbox.ps1`.
-- `Start-Process -PassThru` returns a `Process` holding an OS handle - `consolidate-path.ps1`,
-  `install-deletion-forensics.ps1`. Same for `Get-Process -Id $PID`.
-- `Set-NodeSystemCaBundle` enumerates both root certificate stores and never disposes the
-  `X509Certificate2` objects, each holding an unmanaged `CERT_CONTEXT` - the full machine root
-  store, once per bootstrap run.
-
-### `Get-AgentBlockDrift`'s "everything matches" return is unreachable
-
-`lib/AgentDiscovery.ps1`, `Get-AgentBlockDrift`.
-
-Its one production caller reaches it only inside the `else` of an equality test that uses the same
-normaliser, so two strings that are unequal after identical normalisation cannot split into
-element-wise equal arrays of equal length. The single test passes deliberately differing input.
-Either delete the branch or add an `It` that calls it with identical blocks.
-
-### Four sub-conditions that can never independently decide
-
-`bootstrap.ps1` (tessdata language check), `lib/ShimPlan.ps1` (`$pkgHits` / `$distinct`),
-`scripts/uninstall-toolbox.ps1` (drive-root test), `modules/security.ps1` (`$poolmonPath |
-Select-Object -First 1` on a value that is already scalar). All harmless; the cost is reading time.
-
-The five that were here on the morning of 2026-09-18 are all fixed, and the group is worth reading
-in `docs/engineering-record.md` before trusting any future entry in this file: **three of the five
-overstated their own difficulty and two named a fix that was wrong.** One "needed a rule that needed
-measurement" and needed neither, one "needed a real blocked URL" when the detection it wanted was
-already sitting in a status code, and one "would need dataflow analysis" when a cheap total rule
-closed it outright. An entry's proposed remedy is a hypothesis; only its measurement is a finding.
-
-What remains below is not open work: one deferred decision with its cost written down, and a note
-about where per-package install knobs belong.
+Read that file before re-deriving either. Two of this round's findings had a proposed remedy that
+would have introduced a bug, which is the same lesson the five items before them taught: **an
+entry's proposed remedy is a hypothesis and only its measurement is a finding.**
 
 ---
 

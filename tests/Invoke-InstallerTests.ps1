@@ -613,6 +613,26 @@ function Get-BuilderFn {
     @($builderFns | Where-Object { $_.Name -eq $Name }) | Select-Object -First 1
 }
 
+It 'Install-WingetTool emits no --scope machine, because two of its packages reject it' {
+    # PINNING A REFUTED REMEDY. An audit on 2026-09-21 observed that -MachineScope and -NoScope
+    # build identical command lines and proposed emitting `--scope machine` under the first.
+    # That would break things: install-machine-scope.ps1 already owns that flag and exists so
+    # ten machine-scope packages cost ONE elevation; the WDK answers 0x8A150010 "No applicable
+    # installer found" to it (hence catalog.json's no_scope_flag override); and emitting it here
+    # would raise UAC during an ordinary unelevated bootstrap. Omitting --scope lets winget use
+    # the manifest's own default, which for these packages IS machine scope.
+    $commonAst = [System.Management.Automation.Language.Parser]::ParseFile(
+        (Join-Path $repoRoot 'lib\common.ps1'), [ref]$null, [ref]$null)
+    $fn = @($commonAst.FindAll({
+        param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                  $n.Name -eq 'Install-WingetTool' }, $true)) | Select-Object -First 1
+    if (-not $fn) { return $false }
+    $body = $fn.Extent.Text
+    # Strip comments: the explanation above is allowed to say the words the code must not use.
+    $code = (($body -split "`r?`n") | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+    ($code -notmatch '--scope"?\s*,?\s*"?machine') -and ($code -match '--scope"\s*,\s*"user')
+}
+
 # ConvertTo-SmokeFailureId - what makes the phase ledger able to see a REGRESSION.
 #
 # The ledger compares counts and exempts the smoke triple from failing; these identities are the

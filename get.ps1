@@ -70,13 +70,18 @@ $git = Install-Git
 
 # --- target dir + OneDrive guard --------------------------------------------
 Write-Head "Install folder: $Dir"
+$ans = Read-Host '  Press Enter to use it, or type another path'
+if ($ans) { $Dir = $ans }
+
+# AFTER the prompt, not before it. Computed up front, the guard described the DEFAULT path and
+# was never re-evaluated, so typing a OneDrive path at the prompt produced no warning at all -
+# the one case where it is needed. (The repository this ships from is itself checked out under
+# OneDrive, so the case is not hypothetical.)
 $inOneDrive = ($Dir -match 'OneDrive') -or ($env:OneDrive -and $Dir -like "$env:OneDrive*")
 if ($inOneDrive) {
   Write-Warn2 'That path is under OneDrive. Setup transcripts and a git checkout do not sync well;'
   Write-Warn2 "prefer somewhere under your profile, e.g. $env:USERPROFILE\scripts-utilities."
 }
-$ans = Read-Host '  Press Enter to use it, or type another path'
-if ($ans) { $Dir = $ans }
 
 # --- clone or update ---------------------------------------------------------
 if (Test-Path (Join-Path $Dir '.git')) {

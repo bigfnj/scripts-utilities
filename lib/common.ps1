@@ -456,10 +456,22 @@ function Install-WingetTool {
     if ($InstallerType) {
         $args += @("--installer-type", $InstallerType)
     }
-    if ($NoScope) {
-        # Deliberately no --scope flag; see the parameter comment above.
-    }
-    elseif (-not $MachineScope) {
+    # -MachineScope AND -NoScope BOTH MEAN "emit no --scope flag", and that is deliberate.
+    # They are kept as two names because they record two different INTENTS at the call site -
+    # lib\catalog.ps1 uses -MachineScope for the winget-machine channel and -NoScope for
+    # winget-default - but the command line is identical on purpose and must stay that way.
+    #
+    # AUDITED 2026-09-21 and the obvious remedy is REFUTED. An audit flagged that neither
+    # switch ever emits `--scope machine` and proposed adding it. Do not:
+    #   - install-machine-scope.ps1 already owns that flag, and is the script that exists so
+    #     the ten machine-scope packages take ONE elevation instead of ten;
+    #   - some of those packages REJECT it - the WDK answers 0x8A150010 "No applicable
+    #     installer found" to `--scope machine` even though it installs to machine-scope
+    #     paths, which is why catalog.json carries a no_scope_flag override for it;
+    #   - emitting it here would force a UAC prompt during an ordinary unelevated bootstrap.
+    # Omitting --scope lets winget use the manifest's own default, which for these packages IS
+    # machine scope. The empty `if ($NoScope) { }` block this replaces read as an oversight.
+    if (-not ($MachineScope -or $NoScope)) {
         # User scope keeps PATH changes in user scope and avoids elevation where supported.
         $args += @("--scope", "user")
     }
@@ -733,14 +745,19 @@ function Set-NodeSystemCaBundle {
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     $seen  = @{}
     $lines = New-Object System.Collections.Generic.List[string]
+    # EACH CERTIFICATE IS DISPOSED. An X509Certificate2 holds an unmanaged CERT_CONTEXT, and
+    # this walks BOTH root stores - the full machine trust list, several hundred certificates -
+    # once per bootstrap run. Nothing released them.
     foreach ($store in @('Cert:\LocalMachine\Root', 'Cert:\CurrentUser\Root')) {
         foreach ($c in (Get-ChildItem $store -ErrorAction SilentlyContinue)) {
-            if ($seen.ContainsKey($c.Thumbprint)) { continue }
-            $seen[$c.Thumbprint] = $true
-            $lines.Add("# " + $c.Subject)
-            $lines.Add("-----BEGIN CERTIFICATE-----")
-            $lines.Add([Convert]::ToBase64String($c.RawData, [System.Base64FormattingOptions]::InsertLineBreaks))
-            $lines.Add("-----END CERTIFICATE-----")
+            try {
+                if ($seen.ContainsKey($c.Thumbprint)) { continue }
+                $seen[$c.Thumbprint] = $true
+                $lines.Add("# " + $c.Subject)
+                $lines.Add("-----BEGIN CERTIFICATE-----")
+                $lines.Add([Convert]::ToBase64String($c.RawData, [System.Base64FormattingOptions]::InsertLineBreaks))
+                $lines.Add("-----END CERTIFICATE-----")
+            } finally { $c.Dispose() }
         }
     }
     if ($seen.Count -eq 0) {
@@ -971,7 +988,16 @@ function Add-WinManifest {
     # one tool was written as a JSON object {...} rather than a one-element array [{...}].
     # Survivable internally because the reader re-wraps with @(), but any consumer reading
     # .Count off the parsed file gets $null.
-    ConvertTo-Json -InputObject $list -Depth 4 | Set-Content $manifestPath -Encoding UTF8
+    #
+    # WRITTEN BESIDE, THEN MOVED OVER. Set-Content truncates in place, so an interrupt between
+    # truncate and flush left TRUNCATED JSON - and the next run's ConvertFrom-Json above throws
+    # under bootstrap.ps1's $ErrorActionPreference='Stop', killing bootstrap at its first tool
+    # with nothing to fall back to. A rename on the same volume is atomic, so a reader sees
+    # either the old file or the new one and never a half-written one. Beside the target rather
+    # than in TEMP, because a cross-volume Move-Item is a copy-and-delete and is not atomic.
+    $manifestTmp = "$manifestPath.tmp-$PID"
+    ConvertTo-Json -InputObject $list -Depth 4 | Set-Content $manifestTmp -Encoding UTF8
+    Move-Item -LiteralPath $manifestTmp -Destination $manifestPath -Force
 }
 
 # -- Agent discovery -----------------------------------------------------------

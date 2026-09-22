@@ -252,6 +252,16 @@ It 'Get-AgentBlockDrift names the FIRST line that disagrees' {
     ($d -match 'OLD') -and ($d -match 'NEW')
 }
 
+It 'Get-AgentBlockDrift has a match branch, and it is reachable only from here' {
+    # THE BRANCH NO PRODUCTION CALLER CAN REACH. smoke-test.ps1 calls this only inside the
+    # `else` of an equality test that uses the same normaliser, so two strings unequal after
+    # identical normalisation cannot split into element-wise equal arrays - $diffs -eq 0 is
+    # dead from there. Keeping the branch and covering it here is cheaper than removing it and
+    # leaving the function able to return nothing for a caller that does not have that guard.
+    $d = Get-AgentBlockDrift -Deployed "same`nsame" -Generated "same`nsame"
+    $d -match '^\d+ block line\(s\) match$'
+}
+
 } finally {
     Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

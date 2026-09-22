@@ -103,6 +103,16 @@ function Invoke-Checked {
         return
     }
     if ($TrustExitCode -and $code -ne 0) { throw "$Description failed (exit $code)" }
+
+    # NOTHING FALLS OFF THE END IN SILENCE. A non-zero code with neither -TrustExitCode nor a
+    # matching -NonFatalExitCodes entry used to return here with no output at all, so three of
+    # the four callees below could fail invisibly - including the SECOND bootstrap run
+    # (`-Only security`), which this file's own header says qualifies for -TrustExitCode
+    # because bootstrap exits 1 on GROUP_FAILURES. A warning is the minimum; whether it should
+    # be fatal is the caller's call, and now a reader can see the ones that are not.
+    if ($code -ne 0) {
+        Write-Warn ("{0}: exited {1} - not treated as fatal here" -f $Description, $code)
+    }
 }
 
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
@@ -130,7 +140,10 @@ try {
             & $GhidraInstaller -DryRun
         } else {
             Invoke-Checked "Install portable Ghidra and JDK" { & $GhidraInstaller }
-            Invoke-Checked "Register Ghidra in the security group" { & $Bootstrap -Only security }
+            # -TrustExitCode, matching the first bootstrap run above: bootstrap exits 1 on
+            # GROUP_FAILURES, so without it "bootstrap INCOMPLETE - N tool(s) failed" after a
+            # Ghidra install was invisible and the runner carried on to PATH consolidation.
+            Invoke-Checked "Register Ghidra in the security group" { & $Bootstrap -Only security } -TrustExitCode
         }
     }
 

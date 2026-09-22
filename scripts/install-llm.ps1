@@ -33,6 +33,11 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# Declared HERE, not beside its first increment: Install-Reranker also touches it and is
+# defined above the "install Ollama" group, so under StrictMode a reranker failure in a run
+# that somehow skipped that group would read an undefined variable.
+$script:LlmFailures = 0
+
 $REPO_ROOT = Split-Path $PSScriptRoot
 . (Join-Path $REPO_ROOT "lib\common.ps1")
 . (Join-Path $REPO_ROOT "lib\catalog.ps1")
@@ -241,6 +246,10 @@ if __name__ == "__main__":
     if ($missing.Count) {
         # rerank.py is still written - a rerun only needs the assets - but do not
         # claim a reranker that cannot load.
+        # Counted too. "Best-effort" described the CONTROL FLOW - it warns and continues rather
+        # than throwing - and was read as "does not affect the verdict", so a run that
+        # provisioned no reranker at all still exited 0 with a "ready" banner.
+        $script:LlmFailures++
         Write-Err ("reranker NOT provisioned: {0} of {1} asset(s) missing ({2}). rerank.py will fail at load; rerun to retry." -f
                    $missing.Count, @($rr.files).Count, ($missing -join ', '))
         return
@@ -259,7 +268,13 @@ if (-not $DryRun) { New-Item -ItemType Directory -Path $modelsDir -Force | Out-N
 Set-UserEnvVar -Name "OLLAMA_MODELS" -Value $modelsDir
 
 Write-Group "install Ollama"
-Install-CatalogItem -Item (Get-CatalogItem -Name "ollama") | Out-Null
+# COUNTED, not discarded. Everything downstream - the service wait, every pull, the endpoint
+# this script advertises - depends on Ollama actually being installed, and | Out-Null threw
+# away the one signal that said whether it was.
+if (-not (Install-CatalogItem -Item (Get-CatalogItem -Name "ollama"))) {
+    Write-Err "Ollama did not install - nothing below this line can work"
+    $script:LlmFailures++
+}
 Set-UserEnvVar -Name "TOOLBOX_LLM_URL" -Value $llm.endpoint
 
 if ($IncludeLlamaCpp) {
@@ -320,8 +335,17 @@ foreach ($m in $models) {
 # being true: uninstall-toolbox.ps1 clears the toolbox root, so models parked in
 # %USERPROFILE%\.ollama\models survive it silently - tens of GB that nobody
 # attributes to this script.
-$modelsInToolbox = $true
+#
+# $false BY DEFAULT on a real run, and that inversion is the fix. It defaulted to $true and was
+# only ever re-measured when $pulled -gt 0, so a run where EVERY pull failed - or where Ollama
+# never installed - kept the default and the banner below announced "models in <toolbox>" over
+# an empty directory. The default now states what has actually been established: nothing.
+$modelsInToolbox = $DryRun
 $actualStore     = $modelsDir
+if (-not $DryRun -and $pulled -eq 0) {
+    Write-Err "no model was pulled successfully - the model store is empty"
+    $script:LlmFailures++
+}
 if (-not $DryRun -and $pulled -gt 0) {
     $modelsInToolbox = Test-ModelStorePopulated $modelsDir
     if (-not $modelsInToolbox) {
@@ -350,4 +374,14 @@ if ($DryRun) {
 } else {
     Write-Warn "local LLM stack reachable at $($llm.endpoint), but its models are in $actualStore - NOT in the toolbox ($modelsDir)"
 }
-Write-Info "Point any OpenAI client at %TOOLBOX_LLM_URL%. Example: ollama run qwen2.5:3b"
+Write-Info "Point any OpenAI-compatible client at %TOOLBOX_LLM_URL%. Example: ollama run qwen2.5:3b"
+
+# AN EXPLICIT EXIT, ON BOTH PATHS. This file had NO exit statement at all, so its code was
+# whatever `ollama pull` or the venv find_spec probe happened to leave - and anything
+# scripting it read that as the install's verdict. Both Write-Err calls above reached no exit
+# code whatsoever.
+if ($script:LlmFailures -gt 0) {
+    Write-Err "local LLM stack INCOMPLETE - $($script:LlmFailures) step(s) failed. Fix those, then re-run; this script is idempotent."
+    exit 1
+}
+exit 0

@@ -135,9 +135,26 @@ function Split-PathList {
 # Named Test-PathAdmin, not Test-Admin: uninstall-toolbox.ps1 has Test-IsElevated, run-gate.ps1
 # and smoke-test.ps1 inline their own, and a file dot-sourced into all of them must not win a
 # name any of those might later reach for.
+# DECLARED, not merely assigned on first use. This file is dot-sourced into callers that set
+# Set-StrictMode -Version Latest, under which READING an unset variable throws - so the
+# `if ($null -eq $script:PathAdminCached)` below would have thrown on its own first call.
+$script:PathAdminCached = $null
+
 function Test-PathAdmin {
-    (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-    ).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
+    # DISPOSED, and CACHED, because this one is called in a loop. WindowsIdentity::GetCurrent()
+    # opens an access-token handle that PowerShell will not release for you, and
+    # Remove-MachinePathEntry calls this once PER PATH ENTRY - so a prune over a 27-entry
+    # machine PATH leaked 27 token handles. The answer also cannot change inside one process:
+    # elevation is fixed at launch, so measuring it more than once is pure cost.
+    if ($null -eq $script:PathAdminCached) {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        try {
+            $script:PathAdminCached =
+                (New-Object Security.Principal.WindowsPrincipal($identity)
+                ).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
+        } finally { $identity.Dispose() }
+    }
+    return $script:PathAdminCached
 }
 
 function Backup-PathRegistry {

@@ -496,3 +496,117 @@ comment or a string is not a read. It has a floor, so zero reads found is a fail
 clean sweep of nothing. Mutation: removing one cast fails it with the exact file and line. Adding
 the check also failed the registry pin until its name was added there deliberately, which is that
 pin working as designed.
+
+---
+
+## The 2026-09-21 rebuild and audit - what closed, and two remedies that were wrong
+
+The post-pull toolbox went from `smoke=69/6/5` to `smoke=84/4/0`. The five failures were six
+self-referential shims and four stale agent blocks. Everything below is closed; the entries
+that matter are the two where the OBVIOUS fix was the wrong one.
+
+### `--scope machine` must NOT be added to `Install-WingetTool` - REFUTED, 2026-09-21
+
+An audit observed correctly that `-MachineScope` and `-NoScope` build identical winget command
+lines, that neither ever emits `--scope machine`, and that the `if ($NoScope) { }` body is a
+literal empty block. It proposed emitting the flag under `-MachineScope`. Do not.
+
+- `scripts/install-machine-scope.ps1` already owns that flag, and exists so the ten
+  `machine_scope_ids` packages cost ONE elevation rather than ten.
+- Some of those packages REJECT it. The WDK answers `0x8A150010` "No applicable installer
+  found" to `--scope machine` even though it installs to machine-scope paths - which is why
+  `catalog.json` carries a `machine_scope_overrides.no_scope_flag` entry for it.
+- Emitting it from `Install-WingetTool` would raise UAC during an ordinary unelevated
+  `bootstrap.ps1` run, which is the thing the separate script exists to avoid.
+
+Omitting `--scope` lets winget use the manifest's own default, which for these packages IS
+machine scope. The redundancy was real and is now one branch with the reasoning attached; the
+missing flag was never a defect. A test pins that no `--scope machine` appears in that function.
+
+### Four redundant sub-conditions - DECIDED, not fixed, and the reason is the risk
+
+`bootstrap.ps1` (tessdata language check), `lib/ShimPlan.ps1` (`$pkgHits` / `$distinct`),
+`scripts/uninstall-toolbox.ps1` (drive-root test), `modules/security.ps1` (`$poolmonPath |
+Select-Object -First 1` on a value that is already scalar).
+
+Each has one sub-condition that cannot independently decide, so each is a line of reading cost
+and nothing else. They are working guards, and one of them - the drive-root test - guards a
+RECURSIVE DELETE on a path this repo has already lost ~123,605 files to once. Editing a live
+safety guard to save a reader four seconds is a worse trade than leaving it. Recorded here
+rather than left in `BACKLOG.md`, because "do not do this" and "do this" look the same in a
+backlog.
+
+### The toolbox existed TWICE, and "one real tree" was wrong when it was said
+
+MSIX redirection is copy-on-write, not just path rewriting: a read falls through to the real
+location, but anything WRITTEN lands in `<package>\LocalCache\` and shadows the real file from
+then on. The earlier measurement - both views reporting 156 shims with identical targets - was
+accurate and led to the wrong conclusion, because the copies had not yet diverged. Rebuilding
+the real tree separated them: 162 shims repaired on the real side, 137 stale ones dated
+2026-08-07 on the package side, and an agent session reading the second reported six broken
+shims on a machine whose real toolbox had none. `%APPDATA%\npm` shadowed the same way, which is
+why `markdownlint` was 0.49.1 for the agent, ABSENT for the user, and pinned at 0.48.0 in CI.
+
+`scripts/clear-host-shadow.ps1` removes the copy. Expect its `robocopy` fallback to be needed:
+a shadow of this toolbox holds paths past `MAX_PATH` (jupyterlab's bundled `node_modules`),
+which `Remove-Item` reports misleadingly as "Could not find a part of the path".
+
+### `fsutil hardlink list` is the wrong instrument for detecting the redirection
+
+It was the first implementation of `Test-HostPathProjection` and it fails four ways, each
+measured: it refuses directories outright (`Error 50: The request is not supported`) - which is
+the fallback probe when no venv exists, i.e. the first run the guard exists for; it returns
+volume-relative names with no drive letter, which were then printed to the user as full paths;
+it returns one line per hardlink, so taking the first was arbitrary; and it fails with the same
+Error 50 on a path that resolves by FALL-THROUGH rather than to a local copy, which is the
+state a machine is in immediately after its shadow is cleared.
+
+Replaced with `GetFinalPathNameByHandle`, which is the same call `os.path.realpath` makes on
+Windows, so the check now reproduces distlib's comparison instead of approximating it. The
+predicate is split out as `Test-ResolvedPathDisagreement` because the positive case cannot be
+reproduced once a machine is fixed - a test needing a live projection would have stopped
+proving anything the day the bug was fixed.
+
+### Admitting `.cmd` to `Find-Executable` needs DEPTH ranking, or it finds npm's own internals
+
+Widening the last-resort tier from `$Name.exe` to every runnable extension is what makes
+`npm`, `npx` and `corepack` repairable at all - they ship as `.cmd` in `C:\Program Files\nodejs`
+with no `.exe` anywhere. But ranked by extension-then-mtime it resolved `npm` to
+`node_modules\npm\bin\npm.cmd`, npm's internal script, which is newer than the launcher beside
+it. The shim built from it failed with `Cannot find module
+'...\npm\bin\node_modules\npm\bin\npm-prefix.js'` - the doubled path being the internal script
+resolving its siblings against a prefix only the launcher sets.
+
+A vendor puts its entry point at the TOP of its install tree and internals below, so depth
+decides first, extension breaks ties at equal depth, and mtime breaks ties at equal depth AND
+extension - still the `qpdf 12.3.2`-vs-`12.4.1` case that rule was added for.
+
+### The phase ledger could not see a regression, only a change in how many
+
+Recorded because the design decision it modifies is deliberate and stays deliberate. The smoke
+triple is exempt from DRIFT on purpose - a rebuild step turning 18 missing tools into 18 OKs is
+not a repository change - and the cost was that 0 failures to 5 failures printed a TRANSITION
+and passed. `run-gate.ps1` now also carries a `failids` column of WHICH checks failed;
+identities are not exempt. Counts still move freely. A ratchet on the fail COUNT was considered
+and rejected: it overrides the documented decision for nothing the identities do not give, and
+it fires during legitimate rebuild churn.
+
+### Undisposed IDisposables - two fixed, the rest DECIDED as not worth a handle
+
+Fixed, because both repeat or hold volume:
+
+- `Test-PathAdmin` (`lib/path-registry.ps1`) opened an access-token handle and never released
+  it, and `Remove-MachinePathEntry` calls it once PER PATH ENTRY - 27 leaked handles on a prune
+  of this box's machine PATH. Now disposed, and cached: elevation is fixed at process launch,
+  so measuring it more than once was pure cost as well.
+- `Set-NodeSystemCaBundle` (`lib/common.ps1`) enumerated BOTH root certificate stores - the
+  full machine trust list - and never disposed the `X509Certificate2` objects, each holding an
+  unmanaged `CERT_CONTEXT`, once per bootstrap run. Now disposed per certificate.
+
+Deliberately NOT fixed: the remaining one-shot `[WindowsIdentity]::GetCurrent()` calls in
+`run-gate.ps1`, `scripts/consolidate-path.ps1`, `install-deletion-forensics.ps1`,
+`scripts/smoke-test.ps1`, `scripts/test-host-projection.ps1` and
+`scripts/uninstall-toolbox.ps1`, and the `Process` objects from `Start-Process -PassThru`.
+Each is called once in a script that then exits, and process teardown releases the handle. The
+prize is one handle for a few seconds; the cost is a `try/finally` around a one-line elevation
+check in six files. The two above were different because they repeat.
