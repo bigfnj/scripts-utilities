@@ -558,10 +558,13 @@ function Test-DevToolboxReady {
     }
 
     Write-Group "build DevToolbox"
-    $args = @("-ExecutionPolicy", "Bypass", "-File", $builder, "-Root", $toolboxRoot)
-    if ($SkipHeavyToolboxBuild) { $args += "-SkipHeavy" }
-    if ($SkipPlaywrightBrowsers) { $args += "-SkipPlaywrightBrowsers" }
-    & powershell.exe @args
+    # $builderArgs, NOT $args: this function has no param() block, so $args here IS the
+    # automatic arguments array. It worked only because the function is always called with no
+    # arguments. scripts\build-devtoolbox.ps1 documents the same anti-pattern and avoids it.
+    $builderArgs = @("-ExecutionPolicy", "Bypass", "-File", $builder, "-Root", $toolboxRoot)
+    if ($SkipHeavyToolboxBuild) { $builderArgs += "-SkipHeavy" }
+    if ($SkipPlaywrightBrowsers) { $builderArgs += "-SkipPlaywrightBrowsers" }
+    & powershell.exe @builderArgs
     if ($LASTEXITCODE -ne 0) {
         throw "DevToolbox build failed (exit $LASTEXITCODE)"
     }
@@ -574,8 +577,11 @@ function Test-DevToolboxReady {
 if ($Help) { Show-Usage; exit 0 }
 if ($List)  { Show-Groups; exit 0 }
 
+# No $script:DryRun assignment here. A script's param() variables ALREADY live in the script
+# scope, so $script:DryRun and $DryRun are one variable and the old line assigned $true to
+# something that was already $true. Both spellings are read further down and both work for
+# that reason; the assignment only made it look as though they were two different flags.
 if ($DryRun) {
-    $script:DryRun = $true
     Write-Info "[DRY-RUN] mode - nothing will be installed"
 }
 

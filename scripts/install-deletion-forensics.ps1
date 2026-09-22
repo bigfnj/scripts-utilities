@@ -461,9 +461,12 @@ if (-not $NoSchedule) {
             # StartWhenAvailable so a machine that was off on Sunday still gets its report.
             $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
                 -DontStopIfGoingOnBatteries -AllowStartIfOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 1)
-            if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-                Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-            }
+            # NO Unregister FIRST. Register-ScheduledTask -Force already overwrites, so the
+            # delete was redundant - and its only real effect was to open a window in which a
+            # WORKING weekly task was gone and its replacement had not landed yet. If Register
+            # then failed (scheduler stopped, or policy refusing the SYSTEM/Highest principal)
+            # the catch below downgraded it to a warning and the installer still reported
+            # success, leaving the box with no report task at all. Safe once, destructive twice.
             $null = Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
                 -Principal $principal -Settings $settings -Force -ErrorAction Stop
             Write-Ok "weekly report task '$TaskName' registered (Sunday 04:00, SYSTEM)"

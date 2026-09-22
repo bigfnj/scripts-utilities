@@ -684,6 +684,27 @@ It 'Test-HostPathProjection clears a path whose canonical name matches how it wa
     ($false -eq $r.IsProjected) -and $r.Canonical
 }
 
+It 'the projection predicate fires on the pair actually measured under a packaged host' {
+    # THE POSITIVE CASE, kept testable on a healthy machine. Once a host's shadow is cleared
+    # the condition cannot be reproduced locally - that is what clearing it means - so a test
+    # needing a live projection would silently stop proving anything the day the bug was fixed.
+    # These two strings are the measurement from 2026-09-21, verbatim.
+    $file = 'C:\Users\justin.lowe\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\DevToolbox\python\.venv\Lib\site-packages\pip\_vendor\distlib\scripts.py'
+    $dir = 'C:\Users\justin.lowe\AppData\Local\DevToolbox\python\.venv\Lib\site-packages\pip\_vendor\distlib'
+    (Test-ResolvedPathDisagreement -Canonical $file -CanonicalParent $dir) -and
+        -not (Test-ResolvedPathDisagreement -Canonical "$dir\scripts.py" -CanonicalParent $dir)
+}
+
+It 'Get-FinalPathName resolves a DIRECTORY, which is the fallback probe when no venv exists' {
+    # fsutil hardlink list, the first implementation, refuses a directory outright with
+    # "Error 50: The request is not supported" - and the directory probe is exactly the one
+    # used when the toolbox has not been built yet, which is the first run the guard exists
+    # for. FILE_FLAG_BACKUP_SEMANTICS is what makes CreateFile accept one.
+    $got = Get-FinalPathName -Path $repoRoot
+    $got -and ($got -notmatch '^\\\\\?\\') -and
+        ($got.TrimEnd('\') -ieq ([IO.Path]::GetFullPath($repoRoot).TrimEnd('\')))
+}
+
 It 'the projected-view pattern names no vendor, package family or product' {
     # HOST-AGNOSTIC BY CONSTRUCTION, and pinned so it stays that way. The measurement was taken
     # under one vendor's MSIX host, and the obvious "fix" when someone next debugs this is to
@@ -746,6 +767,50 @@ It 'Find-Executable resolves a .cmd-only command and never its own shim' {
         $env:LOCALAPPDATA = $savedLad
     }
     $got -eq $real
+}
+
+It 'Find-Executable prefers the SHALLOWEST match, so a vendor launcher beats its own internals' {
+    # THE REGRESSION THIS ORDER EXISTS FOR, measured 2026-09-21 and not hypothetical.
+    #
+    # Admitting .cmd to the search made several matches per name possible for the first time.
+    # Ranked by extension-then-mtime, npm resolved to C:\Program Files\nodejs\node_modules\npm\
+    # bin\npm.cmd - npm's own internal script, newer than the launcher beside it - and the shim
+    # built from it failed with "Cannot find module ...\npm\bin\node_modules\npm\bin\
+    # npm-prefix.js", the doubled path being the internal script resolving its siblings against
+    # a prefix only the launcher sets. npx and corepack broke identically.
+    #
+    # The nested file here is deliberately NEWER, so mtime alone would pick it.
+    $fxRoot  = New-SUFixtureRoot -Prefix 'findexe-depth-'
+    $toolbox = Join-Path $fxRoot 'toolbox'
+    $pfDir   = Join-Path $fxRoot 'pf'
+    $vendor  = Join-Path $pfDir 'vendorjs'
+    $nested  = Join-Path $vendor 'node_modules\sufixture3\bin'
+    New-Item -ItemType Directory -Path (Join-Path $toolbox 'native\bin') -Force | Out-Null
+    New-Item -ItemType Directory -Path $nested -Force | Out-Null
+
+    $launcher = Join-Path $vendor 'sufixture3.cmd'
+    $internal = Join-Path $nested 'sufixture3.cmd'
+    Set-Content -LiteralPath $launcher -Value '@echo off' -Encoding ASCII
+    Set-Content -LiteralPath $internal -Value '@echo off' -Encoding ASCII
+    (Get-Item -LiteralPath $launcher).LastWriteTime = (Get-Date).AddDays(-30)
+    (Get-Item -LiteralPath $internal).LastWriteTime = (Get-Date)
+
+    $savedPf = $env:ProgramFiles
+    $savedPf86 = ${env:ProgramFiles(x86)}
+    $savedLad = $env:LOCALAPPDATA
+    try {
+        $env:ProgramFiles = $pfDir
+        ${env:ProgramFiles(x86)} = ''
+        $env:LOCALAPPDATA = Join-Path $fxRoot 'lad'
+        $Root = $toolbox
+        $CommandSearchPatterns = @{}
+        $got = Find-Executable -Name 'sufixture3'
+    } finally {
+        $env:ProgramFiles = $savedPf
+        ${env:ProgramFiles(x86)} = $savedPf86
+        $env:LOCALAPPDATA = $savedLad
+    }
+    $got -eq $launcher
 }
 
 It 'Find-Executable prefers .exe over a NEWER .cmd of the same name' {

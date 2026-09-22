@@ -77,7 +77,11 @@ if ($py) {
     # cleanup failed with "An object at the specified path does not exist".
     $logDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'logs'
     if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
-    $pyFile = Join-Path $logDir 'host-projection-probe.py'
+    # Unique per run. The docblock tells the reader to run this from two places, and a fixed
+    # name means one run's Remove-Item can fire while the other's python is opening the file -
+    # producing a python error exactly where the measurement should be, which is the failure
+    # mode the file-based probe was adopted to avoid in the first place.
+    $pyFile = Join-Path $logDir ('host-projection-probe-{0}.py' -f $PID)
     @'
 import os
 import pip._vendor.distlib as d

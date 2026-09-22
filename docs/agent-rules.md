@@ -402,6 +402,96 @@ superseded no-op. No reboot is owed for this symptom.
 
 ---
 
+## Packaged agent hosts redirect %LOCALAPPDATA%, and it breaks pip
+
+An agent host installed as an **MSIX package** has `%LOCALAPPDATA%` and
+`%APPDATA%` redirected into its own
+`%LOCALAPPDATA%\Packages\<pkg>\LocalCache\` tree, and **every process it
+launches inherits that view** - including a plain `powershell.exe` that has no
+package identity of its own. This is not vendor-specific. Claude Desktop is
+simply the host this was measured under; a Codex, Cursor or VS Code build
+packaged the same way behaves identically. Never narrow a check for this to a
+package id you happen to see.
+
+The redirection is **copy-on-write**, which is the part that costs time:
+
+- A **read** falls through to the real location when no local copy exists.
+- Anything **written** lands in `LocalCache` and shadows the real file from
+  then on.
+
+So a toolbox built once from inside such a host leaves a private copy behind.
+Every later session of that host reads the copy; every normal shell reads the
+real tree; and the two drift apart with neither side able to see the other's
+version of a file.
+
+### The symptom you will actually hit first
+
+```text
+pip._vendor.distlib.DistlibException: Resource name escapes package: 'LICENSE.txt'
+```
+
+pip 26.2.1 vendors distlib 0.4.2, whose `ResourceFinder._is_in_base` calls
+`os.path.realpath` on a package directory and on a resource inside it and
+compares them with `startswith`. Under a redirected view those two disagree - a
+FILE resolves into the package container while its own PARENT DIRECTORY does
+not - so **every** resource lookup raises and `pip install` cannot run at all.
+`scripts\build-devtoolbox.ps1` dies in its python phase, which is its first
+real phase, long before it repairs a shim.
+
+`pip install --dry-run` does **not** reach the import that breaks, so a
+dry-run probe reports a healthy pip on a box where pip cannot run. Measure with
+a real install or with the distlib import itself.
+
+### Measured on this box, 2026-09-21
+
+| | inside a packaged host | via Task Scheduler |
+|---|---|---|
+| `realpath` of a file vs its parent dir | disagree | agree |
+| `import pip._vendor.distlib.scripts` | FAILED | OK |
+| `pip install --upgrade pip` | exit 2, cannot run | works |
+| `native\bin` shim count | 137, six self-referential, dated 2026-08-07 | 162, all repaired |
+
+Ruled out first, so nobody re-derives them: there is **no reparse point** on
+any component of either path, and the shell has **no package identity**
+(`GetCurrentPackageFullName` returns `APPMODEL_ERROR_NO_PACKAGE`).
+
+### What to do
+
+```powershell
+.\scripts\test-host-projection.ps1                 # am I behind a redirected view?
+.\scripts\run-unprojected.ps1 .\bootstrap.ps1 -ScriptArgs '-RefreshToolbox'
+.\scripts\run-unprojected.ps1 .\scripts\clear-host-shadow.ps1 -ScriptArgs '-DryRun'
+.\scripts\run-unprojected.ps1 .\scripts\clear-host-shadow.ps1
+```
+
+- **Never build or `pip install` into the toolbox from a packaged host.**
+  `bootstrap.ps1` refuses outright; the detector is `Test-HostPathProjection`
+  in `lib\common.ps1`.
+- `scripts\run-unprojected.ps1` gets you a process the host did not spawn, by
+  registering a short-lived scheduled task as the current user. No elevation
+  and no password: Task Scheduler is the thing that spawns it, so it inherits
+  no redirection. A SYSTEM or TrustedInstaller helper escapes too but runs as a
+  different principal, so `%LOCALAPPDATA%` would resolve to a service profile -
+  do not use one for per-user work.
+- `scripts\clear-host-shadow.ps1` deletes the host's copy so its view falls
+  through to the real tree again. It refuses to run through the redirection it
+  is cleaning, and refuses if the real toolbox is missing. Expect it to need
+  its `robocopy` fallback: a shadow of this toolbox contains paths past
+  `MAX_PATH` (jupyterlab's bundled `node_modules`), which `Remove-Item` reports
+  misleadingly as *"Could not find a part of the path"*.
+- **`%APPDATA%\npm` shadows the same way.** That is how `markdownlint` can be
+  on PATH for the agent and absent for the user, at two different versions.
+
+**Detection does not work by looking for a reparse point or by asking
+`fsutil hardlink list`.** There is no link to find, and `fsutil` refuses
+directories (`Error 50: The request is not supported`) and also fails on a
+redirected path that resolves by fall-through. Use
+`GetFinalPathNameByHandle` - the same call `os.path.realpath` makes - on the
+path and on its parent, and compare. That is what `Get-FinalPathName` in
+`lib\common.ps1` is for.
+
+---
+
 ## Browsing the web from an agent
 
 Use `browse <url>`. It is the toolbox's read-a-web-page command

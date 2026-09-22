@@ -50,35 +50,75 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $logDir = Join-Path $repoRoot "logs"
 if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 
+# UNIQUE PER RUN, not per second. $TaskName is already keyed on $PID, but the two FILES this
+# script generates were keyed on a seconds-resolution timestamp - so two runs starting in the
+# same second shared both, and the first to finish deleted the wrapper the second was executing.
+$runId = '{0}-{1}' -f $PID, ([guid]::NewGuid().ToString('N').Substring(0, 8))
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-if (-not $LogPath) { $LogPath = Join-Path $logDir ("unprojected-{0}.log" -f $stamp) }
-$wrapper = Join-Path $logDir ("unprojected-{0}.ps1" -f $stamp)
+if (-not $LogPath) { $LogPath = Join-Path $logDir ("unprojected-{0}-{1}.log" -f $stamp, $runId) }
+
+# THE WRAPPER LIVES OUTSIDE THE REPOSITORY, and that is not tidiness.
+#
+# scripts\smoke-test.ps1's parse sweep is Get-ChildItem $REPO_ROOT -Recurse -Filter *.ps1 with
+# exactly one exclusion (.claude\worktrees\), so logs\ is swept despite being gitignored. A
+# generated wrapper sitting there makes the "all N .ps1 file(s) parse" count nondeterministic,
+# and a wrapper that FAILED to parse would mint a stable failure identity - which the failids
+# column then reports as a NEW FAILURE and hard-fails the gate, for a file no commit can fix.
+# A run killed before its finally would leave it there for every later sweep.
+$wrapper = Join-Path ([IO.Path]::GetTempPath()) ("su-unprojected-{0}.ps1" -f $runId)
+
+# A SEPARATE, FRESH sentinel file rather than a marker line inside the log. The child APPENDS
+# to the log and nothing clears a caller-supplied -LogPath, so a log already ending in a
+# sentinel from an earlier run satisfied the very first poll: this script announced success,
+# unregistered a task that had barely started, and deleted the wrapper out from under the
+# running child.
+$donePath = Join-Path ([IO.Path]::GetTempPath()) ("su-unprojected-{0}.done" -f $runId)
+Remove-Item -LiteralPath $donePath -ErrorAction SilentlyContinue
 
 $target = (Resolve-Path -LiteralPath $Script).Path
 $sentinel = "__SU_UNPROJECTED_DONE__"
 
-# The child re-runs the target and records BOTH streams plus an exit code we can trust.
+# Paths reach the generated wrapper as single-quoted PowerShell literals, so an apostrophe
+# anywhere in the repo path, the target path or the log path would end the literal early and
+# produce a wrapper that does not parse. Doubling is the escape single-quoted literals use.
+function ConvertTo-PSLiteral {
+    param([string]$Value)
+    "'" + ($Value -replace "'", "''") + "'"
+}
+
+# The child re-runs the target and records its output plus an exit code we can trust.
+#
+# START-TRANSCRIPT, NOT `*>&1 | Out-File`, AND THIS IS NOT A STYLE CHOICE. The redirection
+# version changed the SEMANTICS OF THE TARGET: under `*>&1`, PowerShell 5.1 treats a native
+# command's stderr inside the target as a redirected stream, which under the target's own
+# $ErrorActionPreference='Stop' raises a terminating NativeCommandError even on success. That
+# is the trap lib\common.ps1's Invoke-Native header documents, reached from the outside.
+#
+# Measured 2026-09-21: `bootstrap.ps1 -RefreshToolbox` died at bootstrap.ps1:564 because pip
+# printed its ordinary "dependency resolver does not currently take into account" WARNING to
+# stderr while upgrading setuptools. The build was fine; the wrapper killed it. A transcript
+# adds a banner and a footer, which is a cosmetic cost worth paying to leave the target's
+# streams exactly as they would be without this script. fresh-toolbox-setup-runner.ps1:109
+# uses a transcript for the same reason.
 #
 # $LASTEXITCODE is $null when the child ran no native command and threw nothing, which is a
 # SUCCESS, not a failure - reading it raw under StrictMode is also an error. The three-branch
 # read below is why this wrapper is generated rather than inlined into -Argument: getting it
 # wrong turns a clean run into exit 1 and there is no second place to notice.
-#
-# Out-File -Append -Encoding utf8 rather than Start-Transcript: a transcript adds a banner and
-# a footer this file's reader would have to strip, and it does not capture a native tool's
-# stderr any better.
 $wrapperBody = @"
 `$ErrorActionPreference = 'Continue'
-Set-Location -LiteralPath '$repoRoot'
+Set-Location -LiteralPath $(ConvertTo-PSLiteral $repoRoot)
+Start-Transcript -LiteralPath $(ConvertTo-PSLiteral $LogPath) -Append | Out-Null
 `$code = 0
 try {
-    & '$target' $ScriptArgs *>&1 | Out-File -FilePath '$LogPath' -Append -Encoding utf8
+    & $(ConvertTo-PSLiteral $target) $ScriptArgs
     if (`$null -ne `$LASTEXITCODE) { `$code = `$LASTEXITCODE }
 } catch {
-    `$_ | Out-String | Out-File -FilePath '$LogPath' -Append -Encoding utf8
+    Write-Host (`$_ | Out-String)
     `$code = 1
 }
-"$sentinel exit=`$code" | Out-File -FilePath '$LogPath' -Append -Encoding utf8
+Stop-Transcript | Out-Null
+"$sentinel exit=`$code" | Set-Content -LiteralPath $(ConvertTo-PSLiteral $donePath) -Encoding utf8
 "@
 Set-Content -LiteralPath $wrapper -Value $wrapperBody -Encoding UTF8
 
@@ -106,13 +146,15 @@ try {
         -Settings $settings -Force | Out-Null
     Start-ScheduledTask -TaskName $TaskName
 
+    # Poll the fresh sentinel FILE, never the log. The log is appended to and may already
+    # carry a sentinel from an earlier run against the same -LogPath.
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $done = $null
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 2
-        if (Test-Path -LiteralPath $LogPath) {
-            $tail = @(Get-Content -LiteralPath $LogPath -Tail 5 -ErrorAction SilentlyContinue)
-            $done = $tail | Where-Object { $_ -like "$sentinel*" } | Select-Object -Last 1
+        if (Test-Path -LiteralPath $donePath) {
+            $done = @(Get-Content -LiteralPath $donePath -ErrorAction SilentlyContinue |
+                Where-Object { $_ -like "$sentinel*" }) | Select-Object -Last 1
             if ($done) { break }
         }
     }
@@ -130,6 +172,7 @@ try {
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     }
     Remove-Item -LiteralPath $wrapper -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $donePath -ErrorAction SilentlyContinue
 }
 
 if (Test-Path -LiteralPath $LogPath) { Get-Content -LiteralPath $LogPath }

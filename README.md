@@ -373,6 +373,7 @@ lib/ShimPlan.ps1                    the 8-rule shim collision planner and PATH h
 lib/ShimFormat.ps1                  the one definition of the .cmd shim byte contract
 lib/AgentDiscovery.ps1              agent-block discovery and safe block rewriting
 lib/SmokeLint.ps1                   lint rules the smoke test enforces on itself
+lib/GateChecks.ps1                  the seven repo hygiene checks, one registry
 lib/SysmonConfig.ps1                Sysmon config rendering and validation
 modules/                            cli-tools, security, extras groups
 tools/browse/                       the `browse` CLI: a pip package so its shim stays in contract
@@ -390,7 +391,13 @@ scripts/ForensicsReport.Triage.ps1  triage summary and sentinel classification
 scripts/consolidate-path.ps1        collapse winget dirs into shims; PATH truncation fix
 scripts/install-whisper.ps1         whisper.cpp + a GGML model (manual only; nothing invokes it)
 scripts/uninstall-toolbox.ps1       full-reset uninstaller
+scripts/get-msu.ps1                 fetch a KB's .msu from the Microsoft Update Catalog
+scripts/run-unprojected.ps1         run a script in a process this agent host did not spawn
+scripts/test-host-projection.ps1    is this shell seeing a packaged host's redirected view?
+scripts/run-gate-checks.ps1         the hygiene-check runner CI and run-gate.ps1 share
 scripts/smoke-test.ps1              repository-level functional gate
+tests/Invoke-AgentDiscoveryTests.ps1  the agent-block extractor's AST allowlist
+tests/Invoke-GateChecksTests.ps1    every hygiene check, mutation-tested
 tests/Invoke-CoreTests.ps1          core helpers
 tests/Invoke-InstallerTests.ps1     installers, shims, PATH editing, native-stderr rules
 tests/Invoke-RenderTests.ps1        forensics report rendering and escaping
@@ -401,6 +408,8 @@ gui/toolbox-gui.ps1                 WinForms front-end
 gui/Start-ToolboxGui.cmd            GUI launcher
 docs/agent-rules.md                 contribution + install-channel rules
 docs/tools-reference.md             how to use each tool
+docs/engineering-record.md          closed work: refuted, retracted or deliberately decided
+docs/fresh-workstation-audit.md     the 2026-07-31 audit and its go/no-go gate
 tasks/fresh-toolbox-setup.md        replacement-workstation checklist
 .github/workflows/gate.yml          CI: parse sweep, control-character scan, every suite
 ```

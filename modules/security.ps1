@@ -62,7 +62,14 @@ function security_install {
 
     # WinDbg + Microsoft symbol server - the Windows crash-dump / live user+kernel
     # debugger, plus _NT_SYMBOL_PATH so !analyze can resolve OS symbols.
+    #
+    # It reports through $script:DebuggerFailed rather than a return value: this function
+    # writes to the host throughout, so a returned int would join that output stream and
+    # Invoke-Group takes the LAST [int] it sees - which is exactly the leak lib\common.ps1:190
+    # was fixed for.
+    $attempted++
     security_install_debugger
+    if ($script:DebuggerFailed) { $failed++ }
 
     # WDK (Windows Driver Kit) - provides poolmon.exe for live pool-tag analysis
     # without needing a crash dump. Machine-scope, ~1-2 GB. Opt-out: set
@@ -196,7 +203,15 @@ function security_install_debugger {
             $preexisting = ($listedR.ExitCode -eq 0) -and ($listed -match [regex]::Escape("Microsoft.WinDbg"))
         }
     }
-    Install-WingetTool -Id "Microsoft.WinDbg" -Binary "WinDbgX" -Name "WinDbg" | Out-Null
+    # COUNTED, not discarded. This is a real winget MSIX install, unlike the detect-and-wrap
+    # helpers in this module whose absence is deliberately not a failure - so its result
+    # belongs in the group tally that decides bootstrap.ps1's exit code. Before this, a failed
+    # WinDbg contributed 0 and bootstrap still exited 0; the only trace was a warning further
+    # down, and only if the launcher ALSO failed to resolve.
+    $script:DebuggerFailed = 0
+    if (-not (Install-WingetTool -Id "Microsoft.WinDbg" -Binary "WinDbgX" -Name "WinDbg")) {
+        $script:DebuggerFailed = 1
+    }
 
     # Resolve the launcher the MSIX put on PATH (a WindowsApps alias) and wrap it as
     # `windbg` in native\bin, so it is invocable by a stable name and the smoke test

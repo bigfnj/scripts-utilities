@@ -838,11 +838,30 @@ function Find-Executable {
             })
         if (-not $hits.Count) { continue }
 
-        # Extension rank first, LastWriteTime second. [array]::IndexOf rather than
-        # $runnable.IndexOf: under Set-StrictMode the latter is a method call on a plain
-        # object[] and reads as an accident, and this one is deliberate.
+        # DEPTH FIRST, and this order was paid for. Admitting .cmd made several matches per
+        # name possible for the first time, and ranking them by extension-then-mtime resolved
+        # npm to C:\Program Files\nodejs\node_modules\npm\bin\npm.cmd - npm's own INTERNAL
+        # script - instead of the launcher at C:\Program Files\nodejs\npm.cmd. Both exist, both
+        # are .cmd, and the nested one was newer. Measured 2026-09-21, the shim that produced:
+        #
+        #   npm install -g markdownlint-cli@0.48.0
+        #   Error: Cannot find module
+        #   'C:\Program Files\nodejs\node_modules\npm\bin\node_modules\npm\bin\npm-prefix.js'
+        #
+        # - the doubled path being the internal script resolving its own siblings relative to a
+        # prefix only the launcher sets. npx and corepack resolved the same wrong way.
+        #
+        # A vendor puts the entry point at the TOP of its install tree and its internals below,
+        # so the shallowest match in a root is the one meant to be called. Extension rank then
+        # breaks ties at equal depth (foo.exe beside foo.cmd), and LastWriteTime breaks ties at
+        # equal depth AND extension - which is the qpdf 12.3.2-vs-12.4.1 case that rule was
+        # added for, both at the same depth, so it still decides there.
+        #
+        # [array]::IndexOf rather than $runnable.IndexOf: under Set-StrictMode the latter is a
+        # method call on a plain object[] and reads as an accident, and this one is deliberate.
         $found = $hits |
-            Sort-Object @{ Expression = { [array]::IndexOf($runnable, $_.Extension.ToLowerInvariant()) } },
+            Sort-Object @{ Expression = { $_.FullName.Split([IO.Path]::DirectorySeparatorChar).Count } },
+                        @{ Expression = { [array]::IndexOf($runnable, $_.Extension.ToLowerInvariant()) } },
                         @{ Expression = { $_.LastWriteTime }; Descending = $true } |
             Select-Object -First 1
         if ($found) { return $found.FullName }

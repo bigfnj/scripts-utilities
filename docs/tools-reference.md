@@ -578,6 +578,57 @@ frida -n notepad.exe -l hook.js
 
 ---
 
+## Windows servicing
+
+### get-msu - fetch an update package the catalog has and Windows Update will not give you
+
+A repo script, not an installed tool: `.\scripts\get-msu.ps1`. Nothing to provision.
+
+Reach for it when Windows Update will not offer an update on this box. On a
+managed workstation that is the normal case rather than a fault - this machine
+is policy-locked to ConfigMgr (`WUServer` plus
+`SetPolicyDrivenUpdateSourceForQualityUpdates=1`), so an out-of-band fix that
+has not been approved for the ring is simply unavailable through Settings. The
+Microsoft Update Catalog always has the `.msu`.
+
+```powershell
+.\scripts\get-msu.ps1 KB5129195 -ListOnly          # show catalog rows, download nothing
+.\scripts\get-msu.ps1 KB5129195                    # this machine's arch, into ~\Downloads
+.\scripts\get-msu.ps1 KB5129195 -Product "24H2" -Arch x64
+.\scripts\get-msu.ps1 5129195 -Destination D:\patches
+```
+
+It returns an array of the files it fetched. Installing them is a separate,
+deliberate, elevated step:
+
+```powershell
+wusa.exe "C:\path\windows11.0-kb5129195-x64_ed36....msu" /quiet /norestart
+DISM /Online /Add-Package /PackagePath:"C:\path\...msu"
+```
+
+Four things that will otherwise waste your time:
+
+- **One KB can be several files.** KB5129195's single 24H2 x64 row resolved to
+  the 4.4 GB LCU *and* the 509 MB 24H2 checkpoint cumulative, which is a
+  servicing prerequisite, not a duplicate. Budget ~5 GB per KB.
+- **aria2c prints `[ERROR]` lines on a successful download.** They are IPv6
+  attempts failing over to IPv4. Judge the run by the exit code and the SHA1
+  check, never by grepping the output.
+- **aria2c pre-allocates before transferring**, so progress sits at `0%` with a
+  separate `[FileAlloc]` counter climbing. A short timeout kills a healthy
+  download.
+- **`-Product` matches the catalog's own title text**, which reads
+  `Windows 11, version 24H2` - with the comma. `-Product "Windows 11 version
+  24H2"` matches nothing. Use `-ListOnly` first.
+
+Verification is real rather than decorative: the 40-hex suffix in a catalog
+filename is Microsoft's SHA1 of that file, so the check is against a value
+Microsoft published, not a checksum of whatever bytes arrived. A mismatch
+deletes the download. Authenticode status is reported as a second, independent
+signal.
+
+---
+
 ## Toolbox venv extras
 
 These run via the dev toolbox Python - activate the toolbox first or prefix

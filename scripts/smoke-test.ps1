@@ -431,11 +431,9 @@ Test-Hdr "agent discovery blocks"
 # surgery with NO git invocation - which also keeps this file clear of the native-command lint
 # rules it is policed by.
 $adMainRoot = $REPO_ROOT
-$adIsWorktree = $false
 $adRebaseNote = $null
 $adDotGit = Join-Path $REPO_ROOT '.git'
 if (Test-Path -LiteralPath $adDotGit -PathType Leaf) {
-    $adIsWorktree = $true
     $adGitDirLine = @([IO.File]::ReadAllText($adDotGit) -split "`r?`n" |
                       Where-Object { $_ -match '^\s*gitdir:\s*(\S.*)$' })[0]
     if ($adGitDirLine -and $adGitDirLine -match '^\s*gitdir:\s*(\S.*)$') {
@@ -654,6 +652,11 @@ if (-not (Test-Path -LiteralPath $lgDir)) {
         @{ What = 'fresh-workstation transcripts'; Path = (Join-Path $lgDir 'fresh-workstation'); Filter = 'setup-*.log' }
         @{ What = 'PATH backups (INPUT: -Restore reads these)'; Path = $lgDir; Filter = 'path-backup-*.json' }
         @{ What = 'pre-elevation PATH records'; Path = $lgDir; Filter = 'machine-path-intended-*.txt' }
+        # A FIFTH pattern, added 2026-09-21 with scripts\run-unprojected.ps1. That script writes
+        # one transcript per invocation and prunes nothing, and its own header used to claim the
+        # run leaves "nothing behind" - true of the scheduled task and the generated wrapper,
+        # not of this. Three runs in, its largest file was already bigger than any pattern above.
+        @{ What = 'unprojected run transcripts'; Path = $lgDir; Filter = 'unprojected-*.log' }
     )
     foreach ($lgP in $lgPatterns) {
         if (-not (Test-Path -LiteralPath $lgP.Path)) {
@@ -880,9 +883,20 @@ $parseProbe = {
 # that is exactly why Invoke-InstallerTests.ps1's shim-regex test finds 0 hits and fails from a
 # worktree (80 passed / 1 failed) while passing from the main checkout (81 / 0). Relative, so the
 # pattern means "a worktree nested under this repo", never "this repo".
+#
+# logs\ IS EXCLUDED TOO, matching lib\GateChecks.ps1's Get-GCSourceFiles. The two sweeps had
+# drifted: that one skips .claude\worktrees\, logs\ and manifest\tools.json and argues the
+# exclusions are what make its callers agree by construction, while this one skipped only the
+# worktrees - so it parsed GENERATED .ps1 files under gitignored logs\. scripts\run-unprojected.ps1
+# writes one per run (now to TEMP, but a killed older run can have left one here), which made
+# the "all N .ps1 file(s) parse" count nondeterministic and could fail this gate for a file no
+# commit can fix.
 $parseRoot = $REPO_ROOT.TrimEnd('\') + '\'
 $fxFiles = @(Get-ChildItem -LiteralPath $REPO_ROOT -Recurse -Filter *.ps1 -File -ErrorAction SilentlyContinue |
-             Where-Object { -not ($_.FullName.Substring($parseRoot.Length) -like '.claude\worktrees\*') } |
+             Where-Object {
+                 $rel = $_.FullName.Substring($parseRoot.Length)
+                 (-not ($rel -like '.claude\worktrees\*')) -and (-not ($rel -like 'logs\*'))
+             } |
              Sort-Object FullName)
 
 # A FLOOR, and it is here for the same reason $suiteRequired is below: enumeration can never
@@ -1002,7 +1016,6 @@ foreach ($suiteFile in $suiteFiles) {
     # powershell.exe explicitly: the scheduled task runs 5.1, so the suites must pass there.
     $tOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $suiteFile.FullName 2>&1 | Out-String
     $tLines = $tOut -split "`r?`n"
-    $suiteRan += $suiteFile.Name
 
     # GUARD LIVENESS, asserted from the PARENT. tests\SUTestGuard.ps1:33-37 states its own blind
     # spot: it cannot see into a child powershell.exe, and every suite here IS a child. So it
@@ -1034,6 +1047,13 @@ foreach ($suiteFile in $suiteFiles) {
         elseif ($tPass -eq 0) { Test-Fail "$sName suite reported 0 passed, 0 failed - an emptied or aborted suite is not a pass" }
         else { Test-Ok "$sName suite: $tPass passed" }
     } else { Test-Fail "$sName suite produced no tally" }
+
+    # LAST STATEMENT IN THE BODY, not the third. Recorded at the top, this guard could only
+    # fire for a `continue` inserted into the two lines above it - and a maintainer adding one
+    # would naturally put it after the tally parse, where it would skip the suite and still be
+    # counted as run. AST-verified 2026-09-21: the loop then contained zero continue/break
+    # nodes, so $suiteSkipped was always empty and the check below could never fail.
+    $suiteRan += $suiteFile.Name
 }
 # Did the loop reach every file it enumerated? This is the one thing the from-disk derivation
 # cannot establish about itself - an added `continue`, or a filter that stops matching, skips a

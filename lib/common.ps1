@@ -102,8 +102,19 @@ function Invoke-Native {
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
+        # CLEARED FIRST, and this is load-bearing. Under 'Continue' a CommandNotFoundException is
+        # non-terminating: the call completes, the ErrorRecord lands in $out via 2>&1, and
+        # $LASTEXITCODE IS NEVER TOUCHED - so this returned the PREVIOUS native command's code.
+        # Measured under 5.1 with a seeded value of 7: a missing command still reported 7, and
+        # had the previous command succeeded it would have reported 0, i.e. SUCCESS for a command
+        # that never ran. bootstrap.ps1's git probes and install-deletion-forensics.ps1's fsutil
+        # calls read this value, and one of them guards a directory-tree delete.
+        $global:LASTEXITCODE = $null
         $out = & $FilePath @Arguments 2>&1
-        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = @($out) }
+        # $null means the command never ran far enough to set a code. That is a failure, not a
+        # success, and 127 is the conventional "command not found" so callers testing -ne 0 see it.
+        $code = if ($null -eq $LASTEXITCODE) { 127 } else { $LASTEXITCODE }
+        return [pscustomobject]@{ ExitCode = $code; Output = @($out) }
     } finally { $ErrorActionPreference = $prev }
 }
 
@@ -567,12 +578,73 @@ function ConvertTo-SmokeFailureId {
 # the shell where this was measured; a Codex, Cursor or VS Code build packaged as MSIX projects
 # the same way and breaks pip identically. Do not narrow this to a known package id.
 #
-# NOT detectable by the obvious routes, all three measured and ruled out on 2026-09-21: there is
-# NO reparse point on any component of either path, the shell has NO package identity
-# (GetCurrentPackageFullName returns APPMODEL_ERROR_NO_PACKAGE), and the two paths are not
-# separate hardlinks - fsutil reports exactly ONE name, and it is the package one. Hence asking
-# the filesystem for that one name rather than testing for a link.
+# NOT detectable by the obvious routes, all measured and ruled out on 2026-09-21: there is NO
+# reparse point on any component of either path, and the shell has NO package identity
+# (GetCurrentPackageFullName returns APPMODEL_ERROR_NO_PACKAGE).
+#
+# MEASURED WITH GetFinalPathNameByHandle, which is the same Win32 call Python's
+# os.path.realpath makes on Windows - so this reproduces distlib's comparison exactly rather
+# than approximating it.
+#
+# `fsutil hardlink list` was the first implementation and is NOT good enough, for three reasons
+# each measured on this box: it refuses directories outright ("Error 50: The request is not
+# supported"), which is the fallback probe when the venv does not exist yet; it returns
+# VOLUME-RELATIVE names with no drive letter, which were then printed to the user as if they
+# were full paths; and it returns one line per hardlink, so picking the first was arbitrary.
+# It also fails with Error 50 on a redirected path that resolves by FALL-THROUGH rather than to
+# a local copy - which is the state a host is in immediately after its shadow is cleared.
 $script:ProjectedViewPattern = '\\Packages\\[^\\]+\\LocalCache\\'
+
+function Initialize-FinalPathApi {
+    if (-not ('SU.FinalPath' -as [type])) {
+        # Lazily, not at dot-source: this costs a compile on first use and most runs of
+        # bootstrap.ps1 and smoke-test.ps1 never need it.
+        Add-Type -Namespace SU -Name FinalPath -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+public static extern IntPtr CreateFileW(string path, uint access, uint share, IntPtr sec,
+                                        uint disposition, uint flags, IntPtr template);
+[DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+public static extern uint GetFinalPathNameByHandleW(IntPtr handle, System.Text.StringBuilder buf,
+                                                    uint len, uint flags);
+[DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool CloseHandle(IntPtr handle);
+'@
+    }
+}
+
+# The resolved path Windows itself reports for $Path, or $null when it cannot be opened.
+# Works for a directory as well as a file: FILE_FLAG_BACKUP_SEMANTICS (0x02000000) is what
+# makes CreateFile accept one, and it is why .NET's File.Open cannot be used here.
+function Get-FinalPathName {
+    param([Parameter(Mandatory)][string]$Path)
+    Initialize-FinalPathApi
+    $INVALID = New-Object IntPtr -ArgumentList (-1)
+    # access 0 = query metadata only; share 7 = FILE_SHARE_READ|WRITE|DELETE, so this never
+    # blocks another process; disposition 3 = OPEN_EXISTING.
+    $h = [SU.FinalPath]::CreateFileW($Path, 0, 7, [IntPtr]::Zero, 3, 0x02000000, [IntPtr]::Zero)
+    if ($h -eq $INVALID) { return $null }
+    try {
+        $sb = New-Object System.Text.StringBuilder 32768
+        $n = [SU.FinalPath]::GetFinalPathNameByHandleW($h, $sb, 32768, 0)
+        if ($n -eq 0) { return $null }
+        # Strip the \\?\ prefix the API always returns, so callers compare like with like.
+        return ($sb.ToString() -replace '^\\\\\?\\', '')
+    } finally { [void][SU.FinalPath]::CloseHandle($h) }
+}
+
+# The predicate itself, split out so BOTH answers stay testable.
+#
+# The positive case cannot be reproduced on a machine once its shadow is cleared - which is the
+# whole point of clearing it - so a test that needs a live projection would quietly stop
+# proving anything the moment the bug was fixed. Given the two resolved strings, this is the
+# entire decision, and the test feeds it the pair measured on 2026-09-21.
+function Test-ResolvedPathDisagreement {
+    param(
+        [Parameter(Mandatory)][string]$Canonical,
+        [Parameter(Mandatory)][string]$CanonicalParent
+    )
+    return -not $Canonical.StartsWith($CanonicalParent, [System.StringComparison]::OrdinalIgnoreCase)
+}
 
 function Test-HostPathProjection {
     <#
@@ -602,56 +674,42 @@ function Test-HostPathProjection {
         }
     }
 
-    # fsutil, not Get-Item.Target: there is no reparse point to follow, and .Target is $null
-    # here. `hardlink list` is the cheapest call that reports the name the volume actually
-    # holds, and it needs no elevation. Through Invoke-Native because this file is dot-sourced
-    # by callers that set $ErrorActionPreference='Stop', under which a redirected native call
-    # raises NativeCommandError - see that wrapper's header.
-    $fsutil = Join-Path $env:SystemRoot 'System32\fsutil.exe'
-    if (-not (Test-Path -LiteralPath $fsutil)) {
+    # THE COMPARISON DISTLIB MAKES, made the same way. ResourceFinder._is_in_base calls
+    # os.path.realpath on the package directory and on a resource inside it and compares them
+    # with startswith; os.path.realpath on Windows is GetFinalPathNameByHandle. So resolve both
+    # the probe and its parent directory and test exactly that relationship.
+    $canonical = Get-FinalPathName -Path $probe
+    $parent = Split-Path -Parent $probe
+    $canonicalParent = if ($parent) { Get-FinalPathName -Path $parent } else { $null }
+
+    if (-not $canonical -or -not $canonicalParent) {
         return [pscustomobject]@{
-            IsProjected = $null; Probe = $probe; Canonical = $null; PackageRoot = $null
-            Reason = 'fsutil.exe not found, so the canonical name cannot be read'
+            IsProjected = $null; Probe = $probe; Canonical = $canonical; PackageRoot = $null
+            Reason = 'the resolved path could not be read for the probe or its parent directory'
         }
     }
 
-    $r = Invoke-Native -FilePath $fsutil -Arguments @('hardlink', 'list', $probe)
-    if ($r.ExitCode -ne 0) {
-        return [pscustomobject]@{
-            IsProjected = $null; Probe = $probe; Canonical = $null; PackageRoot = $null
-            Reason = "fsutil hardlink list exited $($r.ExitCode)"
-        }
-    }
-
-    $canonical = @($r.Output | ForEach-Object { [string]$_ } |
-        Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() }) |
-        Select-Object -First 1
-
-    if (-not $canonical) {
-        return [pscustomobject]@{
-            IsProjected = $null; Probe = $probe; Canonical = $null; PackageRoot = $null
-            Reason = 'fsutil returned no name'
-        }
-    }
-
-    # Projected when the volume's own name for the file sits under a package LocalCache but the
-    # path we reached it by does not. Both halves matter: a caller that deliberately addressed
-    # the LocalCache path is NOT projected - it asked for exactly what it got, and pip works
-    # there precisely because both realpath calls then agree.
-    $canonHit = $canonical -match $script:ProjectedViewPattern
-    $probeHit = $probe -match $script:ProjectedViewPattern
     $packageRoot = $null
-    if ($canonHit -and -not $probeHit) {
-        if ($canonical -match '^(.*\\Packages\\[^\\]+)\\LocalCache\\') { $packageRoot = $Matches[1] }
+    foreach ($candidate in @($canonical, $canonicalParent)) {
+        if ($candidate -match '^(.*\\Packages\\[^\\]+)\\LocalCache\\') { $packageRoot = $Matches[1]; break }
+    }
+
+    # DISAGREEMENT is the defect, not the mere presence of a package path. A caller that
+    # deliberately addressed the LocalCache path is NOT projected: it asked for exactly what it
+    # got, both resolutions agree, and pip works there. The break is when a file resolves into
+    # a package container while its own parent directory does not.
+    if (Test-ResolvedPathDisagreement -Canonical $canonical -CanonicalParent $canonicalParent) {
         return [pscustomobject]@{
             IsProjected = $true; Probe = $probe; Canonical = $canonical; PackageRoot = $packageRoot
-            Reason = "the filesystem's only name for this file is under $packageRoot, so realpath of a file and of its parent directory disagree and pip cannot install"
+            Reason = ("this path resolves to '{0}' while its own parent directory resolves to '{1}' - " +
+                      "distlib compares exactly those two with startswith, so pip cannot install from here") -f
+                     $canonical, $canonicalParent
         }
     }
 
     return [pscustomobject]@{
         IsProjected = $false; Probe = $probe; Canonical = $canonical; PackageRoot = $null
-        Reason = 'the canonical name matches the path used to reach it'
+        Reason = 'the probe and its parent directory resolve consistently'
     }
 }
 
@@ -909,7 +967,11 @@ function Add-WinManifest {
     $idx  = $list.FindIndex({ param($e) $e.name -eq $Name })
     if ($idx -ge 0) { $list[$idx] = $entry } else { $list.Add($entry) }
 
-    $list | ConvertTo-Json -Depth 4 | Set-Content $manifestPath -Encoding UTF8
+    # -InputObject, NOT the pipeline. Piping a List UNROLLS it, so a manifest holding exactly
+    # one tool was written as a JSON object {...} rather than a one-element array [{...}].
+    # Survivable internally because the reader re-wraps with @(), but any consumer reading
+    # .Count off the parsed file gets $null.
+    ConvertTo-Json -InputObject $list -Depth 4 | Set-Content $manifestPath -Encoding UTF8
 }
 
 # -- Agent discovery -----------------------------------------------------------

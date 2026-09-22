@@ -149,7 +149,8 @@ function Write-Warn2($t) { Write-Host "  [!]    $t" -ForegroundColor Yellow }
 $NeverForward = @(
     'ElevatedFor',   # the child computes its own; forwarding the parent's would defeat the same-SID guard
     'TargetMax',     # forwarded explicitly by Get-SelfElevateArgs, and -File rejects a repeated parameter
-    'DryRun',        # a dry run writes nothing, so it never reaches the elevation gate
+    'DryRun',        # a dry run writes nothing - true of the consolidate path, and true of
+                     # -Restore only since it grew its own -DryRun branch on 2026-09-21
     'NoElevate',     # -NoElevate exits 2 at the gate instead of launching a child
     'Restore'        # -Restore returns before the gate and needs its own elevated invocation
 )
@@ -253,7 +254,32 @@ if ($Restore) {
     if (-not (Test-Path $file)) { throw "backup not found: $file" }
     $b = Get-Content $file -Raw | ConvertFrom-Json
     Write-Head "Restoring PATH from $file (captured $($b.captured_at))"
+
+    # VALIDATE BEFORE WRITING. Backup-PathRegistry declares [AllowEmptyString()] on both fields
+    # and Get-RawPath returns '' for a hive with no Path value, so an empty string is a legal
+    # thing to have recorded - and restoring it writes an EMPTY REG_EXPAND_SZ machine PATH.
+    # That is not a recovery, it is the outage this file exists to undo.
+    foreach ($scope in @('machine', 'user')) {
+        if ([string]::IsNullOrWhiteSpace([string]$b.$scope)) {
+            throw ("backup's '$scope' PATH is empty or missing - refusing to restore. " +
+                   "Writing it would blank that hive. File: $file")
+        }
+    }
+
+    if ($DryRun) {
+        Write-Info "[DRY-RUN] would restore machine PATH ($($b.machine.Length) chars) and user PATH ($($b.user.Length) chars)"
+        return
+    }
+
     if (-not (Test-PathAdmin)) { throw 'Restoring the machine PATH needs an elevated session.' }
+
+    # BACK UP WHAT IS ABOUT TO BE DESTROYED. Backup-PathRegistry is otherwise only reached in
+    # the $needsRegistry branch far below, which this path returns long before - so a -Restore
+    # aimed at the wrong file was unrecoverable, on the one code path people reach during an
+    # incident.
+    $preRestore = Backup-PathRegistry -LogDir (Join-Path $RepoRoot 'logs')
+    Write-Ok "current PATH backed up to $preRestore before restoring"
+
     Set-RawPath -Scope Machine -Value $b.machine
     Set-RawPath -Scope User -Value $b.user
     Write-Ok "machine PATH restored ($($b.machine.Length) chars)"
