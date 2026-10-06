@@ -9,7 +9,7 @@
 # while the catalog group held 15, quietly omitting pwsh (a MACHINE-scope install
 # that needs elevation) and curl-libressl. Invoke-InstallerTests.ps1 now fails if
 # this string and the catalog group drift apart again.
-function cli-tools_desc { "gh, pwsh, fzf, bat, delta, just, hyperfine, sops, age, tokei, podman, docker-compose, curl-libressl, yt-dlp, deno" }
+function cli-tools_desc { "gh, pwsh, fzf, bat, delta, just, hyperfine, sops, age, tokei, podman, docker-compose, curl-libressl, yt-dlp, deno, unison" }
 
 function cli-tools_install {
     $failed = Install-CatalogGroup -Group "cli-tools"

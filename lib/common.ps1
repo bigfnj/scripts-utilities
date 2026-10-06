@@ -1164,6 +1164,11 @@ PATH too. Set CODEX_TOOLBOX to override the toolbox root path.
               runtime (auto-detected on PATH).
   deno        Secure JS/TS runtime; also yt-dlp's default JS challenge runtime.
               deno run script.ts | deno repl | deno fmt
+  unison      Two-way file sync: unison <profile> -batch -ui text (exit 0 ok,
+              1 skipped, 2 failures, 3 fatal). Profiles in %USERPROFILE%\.unison
+              or %UNISON%. Peers must be 2.52+. unison-gui is GTK3 and upstream may
+              drop it, so script the text UI. Upstream refuses LLM-written code
+              and text: never draft an upstream PR, issue or list post.
   tshark      Read/analyze captures: tshark -r cap.pcapng -Y "tcp.flags.reset==1"
               Live capture (tshark -i) needs Npcap (no winget pkg; optional).
   etl2pcapng  Convert built-in pktmon/netsh .etl -> .pcapng for tshark

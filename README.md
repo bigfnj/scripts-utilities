@@ -231,7 +231,7 @@ anything.
 
 | Group | Tools |
 |---|---|
-| **cli-tools** (15) | `gh` GitHub CLI · `pwsh` PowerShell 7, machine-scope MSI beside 5.1 · `fzf` fuzzy finder · `bat` syntax-highlighted cat · `delta` git diff pager · `just` task runner · `hyperfine` benchmarking · `sops` encrypted secrets · `age` file encryption · `tokei` LOC stats · `podman` per-user containers, no elevation · `docker-compose` · `curl-libressl` curl built on LibreSSL, for the agent sandboxes where the bundled Schannel curl fails · `yt-dlp` media downloader · `deno` secure JS/TS runtime, also yt-dlp's JS challenge runtime |
+| **cli-tools** (16) | `gh` GitHub CLI · `pwsh` PowerShell 7, machine-scope MSI beside 5.1 · `fzf` fuzzy finder · `bat` syntax-highlighted cat · `delta` git diff pager · `just` task runner · `hyperfine` benchmarking · `sops` encrypted secrets · `age` file encryption · `tokei` LOC stats · `podman` per-user containers, no elevation · `docker-compose` · `curl-libressl` curl built on LibreSSL, for the agent sandboxes where the bundled Schannel curl fails · `yt-dlp` media downloader · `deno` secure JS/TS runtime, also yt-dlp's JS challenge runtime · `unison` two-way file sync, upstream zip with GTK3 GUI |
 | **security** (3+) | `tshark` Wireshark CLI · `etl2pcapng` driver-free capture conversion · `frida` dynamic instrumentation · plus WinDbg, `cdb`/`kd`/`ntsd`, `gflags`, `dumpchk` and `poolmon` from the WDK when present, and optional Ghidra |
 | **extras** (5) | `markdownlint` · `jupyter-lab` · `sqlite-utils` · `csvkit` (`csvlook`) · `pytoshop` |
 

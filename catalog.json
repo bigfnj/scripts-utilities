@@ -96,6 +96,12 @@
       "notes": "secure JavaScript/TypeScript runtime. Also serves as yt-dlp's JS challenge runtime: yt-dlp enables deno by DEFAULT, auto-detects it on PATH, and runs its bundled EJS scripts under Deno's restricted permissions to solve YouTube nsig/PO-token challenges. Without a JS runtime, YouTube downloads are blocked. yt-dlp requires deno >=2.3. Node (already in the toolbox, >=22) also works but is not default - opt in per-call/config with `--js-runtimes node`."
     },
     {
+      "name": "unison", "group": "cli-tools", "channel": "winget-user",
+      "id": "bcpierce00.unison", "binary": "unison", "detect": "unison -version",
+      "default": true,
+      "notes": "two-way file synchronizer (bcpierce00/unison). The winget package is the upstream CI-built portable zip, unmodified (same SHA-256 as the GitHub release asset); it ships unison.exe, unison-gui.exe (GTK3, bundled DLLs) and unison-fsmonitor.exe for -repeat watch. Executables are UNSIGNED. Both ends of a sync must run 2.52 or newer: 2.54 refuses older peers and older archives. Profiles and archives live in %USERPROFILE%\\.unison unless the UNISON env var points elsewhere. Upstream warns the GTK GUI may be dropped in any release, so script against the text UI (-batch exits 0 ok, 1 skipped, 2 non-fatal failure, 3 fatal)."
+    },
+    {
       "name": "tshark", "group": "security", "channel": "winget-machine",
       "id": "WiresharkFoundation.Wireshark", "binary": "tshark", "detect": "tshark --version",
       "default": true,

@@ -193,6 +193,33 @@ deno repl                          # interactive REPL
 deno fmt  /  deno lint             # format / lint
 ```
 
+### unison - two-way file synchronizer
+
+Keeps two replicas of a directory tree in step, propagating changes from both
+sides and flagging files changed on both as conflicts. The winget package is the
+upstream CI-built zip, unmodified: `unison.exe` (text UI), `unison-gui.exe`
+(GTK3) and `unison-fsmonitor.exe` (used by `-repeat watch`).
+
+```powershell
+unison -version                                   # 2.54.0 from winget
+unison work -batch -ui text                       # run profile work.prf non-interactively
+unison C:\data ssh://user@host//srv/data -batch   # ad-hoc pair, no profile
+unison work -repeat watch                         # keep syncing as files change
+unison-gui work                                   # GTK3 GUI on the same profile
+```
+
+`-batch` exit codes: `0` everything synced, `1` something skipped (usually a
+conflict), `2` non-fatal failures, `3` fatal error. Profiles (`<name>.prf`) and
+the archives live in `%USERPROFILE%\.unison`, or in `%UNISON%` when that is set.
+`include <name>` inside a profile pulls in `<name>.prf` from the same directory;
+it does not accept an absolute path.
+
+Both ends must run 2.52 or newer: 2.54 refuses older peers and older archives,
+and many Linux distributions still ship 2.51 or 2.48. Upstream warns the GTK GUI
+may be dropped in any release, so script against the text UI. The executables
+are unsigned. Upstream refuses LLM-generated code and text in PRs, issues and on
+its mailing lists, so an agent must not draft anything for upstream.
+
 ## Security / RE tools
 
 ### tshark - CLI packet analysis
@@ -754,6 +781,7 @@ for Mistral-native workflows, `qwen2.5:3b` as the light everyday model.
 | Read a web page (incl. one that blocks agents) | `browse <url>` - never Playwright by hand |
 | Drive a real browser for a blocked site | `scripts\start-browse-chrome.ps1` then `browse --rung chrome` |
 | Run a JS/TS script (sandboxed) | `deno` (also yt-dlp's JS challenge runtime) |
+| Keep two folders or machines in two-way sync | `unison` (text UI for scripts; peers must be 2.52+) |
 | Analyze a network capture | `tshark` |
 | Identify top pool consumers (live, no crash) | `poolmon` (WDK, elevated) |
 | Scripted / headless crash-dump analysis | `cdb -z dump.dmp -c "..."` |
