@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "ghidra": {
+    "release_tag": "Ghidra_12.1.4_build",
+    "jdk_major": 21
+  },
+  "watcom": {
+    "release": "2026-10-01-Build",
+    "url": "https://github.com/open-watcom/open-watcom-v2/releases/download/2026-10-01-Build/ow-snapshot.tar.xz",
+    "sha256": "e6aa1b1e40ac8bbf97658d2c70fff8a4242d6ca4a1c60806f2baa5317083d4fe",
+    "format": "tar.xz",
+    "marker": "binnt64/wcl386.exe",
+    "required": [
+      "binnt64/wcl386.exe",
+      "binnt64/wlink.exe",
+      "binnt64/wdis.exe",
+      "binnt64/wmake.exe",
+      "h/stdio.h"
+    ]
+  },
+  "dosbox": {
+    "release": "2026.08.02",
+    "url": "https://github.com/joncampbell123/dosbox-x/releases/download/dosbox-x-v2026.08.02/dosbox-x-vsbuild-win64-2026.08.02-portable.zip",
+    "sha256": "ca28208f5fee25a74caf3a02cc0189c7f7943a42ce37c02848f5fc03450a96cf",
+    "format": "zip",
+    "marker": "Release SDL2/dosbox-x.exe",
+    "required": [
+      "Release SDL2/dosbox-x.exe"
+    ]
+  }
+}

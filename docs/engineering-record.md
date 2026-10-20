@@ -610,3 +610,27 @@ Deliberately NOT fixed: the remaining one-shot `[WindowsIdentity]::GetCurrent()`
 Each is called once in a script that then exits, and process teardown releases the handle. The
 prize is one handle for a few seconds; the cost is a `try/finally` around a one-line elevation
 check in six files. The two above were different because they repeat.
+
+## 2026-10-20: optional DOS reconstruction tools
+
+Added explicitly selected Capstone, Unicorn, DOSBox-X, Ghidra and Open Watcom
+provisioning. Default bootstrap installs none of them. Python libraries stay in
+the existing shared environment, use exact catalog pins and isolated pip, and
+verify installed distribution versions. Portable archives use official release
+URLs, pinned digests, complete member preflight, staging and provenance receipts.
+
+Functional checks exercise a compiled DOS fixture, actual Ghidra decompilation,
+original x86 instruction emulation and a fresh guest-written DOSBox nonce.
+A GUI executable producing no version text was a false failure, so the DOSBox
+check now verifies guest behavior. It does not assert debugger or game parity.
+
+Source sweeps now prune protected names and reparse points before descending.
+Tests use injected metadata rather than creating protected fixtures. The new
+suite is required by local smoke and CI. Separate child-window placement is
+optional, explicit, limited to the live launched process, and preserves focus
+and visibility. It stores no desktop profile.
+
+Offline regressions cover traversal, links, collisions, missing archive members,
+hash/provenance failures, inventory merging, false guest-boot success, library
+pin enforcement and child-process scope. Removed unused extraction lookup and
+redundant exception handling found during review. No new open toolbox finding.

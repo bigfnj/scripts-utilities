@@ -792,3 +792,21 @@ for Mistral-native workflows, `qwen2.5:3b` as the light everyday model.
 | Query/transform CSV | `csvkit` |
 | Lightweight SQL on files | `sqlite-utils` or `duckdb` |
 | Offline/sensitive inference or RAG | local Ollama (`install-llm.ps1`) |
+
+## Optional legacy DOS reverse engineering
+
+Run scripts/install-legacy-dos.ps1 -Component All -DryRun to review the plan.
+After a clean host-projection preflight, select only the components needed:
+Capstone, Unicorn, Ghidra, Dosbox, or Watcom. Normal bootstrap leaves these tools optional.
+
+- Capstone and Unicorn use shared toolbox Python, not bare Python or global pip.
+- Ghidra uses the pinned official release and a private matching JDK.
+- DOSBox-X uses the official portable x64 SDL2 build. Inspect the running debugger
+  HELP response before relying on breakpoints or MCP control. Its functional smoke
+  checks a fresh guest nonce and exit, independently of GUI console output.
+- Open Watcom exposes wcl386, wcc386, wlink, wdis, wmake, and wasm through existing
+  toolbox shims. Compiler environment variables exist only inside those shims.
+
+The DOSBox-X installer is not used by this workflow: its advertised Winget user
+scope conflicts with the tagged installer's administrator setting. Official
+portable archives are pinned by URL and SHA-256 in config/legacy-dos-tools.json.

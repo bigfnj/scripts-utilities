@@ -46,6 +46,8 @@ $script:GCBannedWriters = @('Write-AgentDiscovery', 'Remove-AgentBlocks', 'Remov
 # every Read; only a byte scan shows it.
 $script:GCControlByteRegex = [regex]::new('[\x00-\x08\x0B\x0C\x0E-\x1F]')
 
+. (Join-Path $PSScriptRoot 'SourceFiles.ps1')
+
 $script:GCSourceExtensions = @('.ps1', '.psm1', '.json', '.yml', '.md', '.xml', '.cmd')
 
 # There is deliberately NO second list of check names here. One was added with this file and had
@@ -111,7 +113,7 @@ function Get-GCSourceFiles {
     )
     $root = ([IO.Path]::GetFullPath($RepoRoot)).TrimEnd('\')
     $prefix = $root + '\'
-    Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
+    Get-SUSourceFiles -Root $root -Recurse -ExcludeRelative @('.claude\worktrees\*', 'logs\*', 'manifest\tools.json') |
         Where-Object { $Extension -contains $_.Extension } |
         Where-Object {
             $full = $_.FullName
@@ -383,7 +385,7 @@ function Get-GCWriterResult {
     )
     $findings = @()
     $testsDir = Join-Path $RepoRoot 'tests'
-    $files = @(Get-ChildItem -LiteralPath $testsDir -Filter '*.ps1' -File -ErrorAction SilentlyContinue)
+    $files = @(Get-SUSourceFiles -Root $testsDir -Filter '*.ps1')
 
     foreach ($f in $files) {
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)

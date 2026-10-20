@@ -121,6 +121,24 @@
       "notes": "dynamic instrumentation toolkit (toolbox venv)"
     },
     {
+      "name": "capstone", "group": "security", "channel": "pip-toolbox",
+      "id": "capstone==5.0.6", "binary": null, "import": "capstone", "detect": null,
+      "register_manifest": false, "default": false,
+      "notes": "Optional x86 disassembly library. Install explicitly with scripts/install-legacy-dos.ps1 -Component Capstone; uses the shared toolbox venv."
+    },
+    {
+      "name": "unicorn", "group": "security", "channel": "pip-toolbox",
+      "id": "unicorn==2.1.4", "binary": null, "import": "unicorn", "detect": null,
+      "register_manifest": false, "default": false,
+      "notes": "Optional bounded x86 emulation for original-code differential tests. Install explicitly with scripts/install-legacy-dos.ps1 -Component Unicorn; uses the shared toolbox venv."
+    },
+    {
+      "name": "dosbox-x", "group": "security", "channel": "winget-user",
+      "id": "joncampbell123.DOSBox-X", "binary": "dosbox-x", "detect": "dosbox-x -version",
+      "default": false,
+      "notes": "Optional Winget user-scope declaration; vendor installer source currently requires admin, so no no-admin guarantee is made. The approved legacy DOS workflow uses the pinned official portable archive instead."
+    },
+    {
       "name": "markdownlint-cli", "group": "extras", "channel": "npm-global",
       "id": "markdownlint-cli@0.48.0", "binary": "markdownlint", "detect": "markdownlint --version",
       "default": true,

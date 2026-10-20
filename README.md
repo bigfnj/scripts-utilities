@@ -476,6 +476,31 @@ Winget IDs resolve against current manifests and Python requirements resolve at 
 the actual result recorded locally. That favours current security fixes over bit-for-bit
 historical reproduction, which is a deliberate trade.
 
+## Optional legacy DOS toolchain
+
+scripts/install-legacy-dos.ps1 provisions explicitly selected tools for DOS reverse
+engineering: Capstone and Unicorn in the shared toolbox venv, Ghidra with a compatible private
+JDK, and official portable DOSBox-X/Open Watcom archives. It is separate from
+normal bootstrap and installs nothing without a component selection.
+
+1. Review: scripts/install-legacy-dos.ps1 -Component All -DryRun
+2. Preflight: scripts/test-host-projection.ps1
+3. Install only needed tools: scripts/install-legacy-dos.ps1 -Component All
+4. Verify: scripts/smoke-test-legacy-dos.ps1
+5. Run the cumulative gate: run-gate.ps1 -Phase legacy-dos
+
+Native versions and hashes are pinned in config/legacy-dos-tools.json. Import-only
+library pins come from catalog.json; provisioning verifies installed versions and
+uses isolated pip in the existing interpreter. Protected archive
+members are excluded before their contents are read. Extraction rejects traversal,
+links, duplicate destinations, and overwrites. Watcom environment changes remain
+local to its wrappers. No administrator installation or second Python environment
+is needed. The portable DOSBox-X route avoids a conflict between the Winget user
+scope declaration and the vendor installer's admin setting. Probe the installed
+debugger capabilities before relying on automated game tracing. The optional
+smoke parameter -WindowMonitorDevice accepts an explicit Windows display device,
+preserves hidden state, and moves only that invocation's live DOSBox process windows.
+
 ## Licence
 
 [MIT](LICENSE).

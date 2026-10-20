@@ -16,6 +16,10 @@ them at the JDK via JAVA_HOME (for Ghidra only).
 [CmdletBinding()]
 param(
     [string]$Root = $(if ($env:CODEX_TOOLBOX) { $env:CODEX_TOOLBOX } else { "$env:LOCALAPPDATA\DevToolbox" }),
+    [ValidatePattern('^(latest|Ghidra_[0-9]+\.[0-9]+(?:\.[0-9]+)?_build)$')]
+    [string]$ReleaseTag = 'latest',
+    [ValidateSet(21, 25)]
+    [int]$JdkMajor = 21,
     [switch]$SkipGhidra,
     [switch]$SkipJdk,
     [switch]$DryRun
@@ -35,11 +39,6 @@ if (-not $DryRun) {
     New-Item -ItemType Directory -Path $native -Force | Out-Null
     New-Item -ItemType Directory -Path $dl -Force | Out-Null
 }
-$sevenZip = @(
-    (Join-Path $Root "native\bin\7z.cmd"),
-    (Join-Path $env:ProgramFiles "7-Zip\7z.exe")
-) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-
 function Invoke-Native {
     <#
         Run a native command with its output captured and its stderr survivable, returning the
@@ -66,19 +65,15 @@ function Invoke-Native {
 
 function Expand-ZipTo {
     param([string]$Zip, [string]$Dest)
-    if ($sevenZip) {
-        # The exit code was never read. 7z reports a partial extraction as exit 1 (WARNING) and a
-        # refusal as 2, on stderr, and the caller then installed whatever landed on disk and
-        # called it Ghidra - so a truncated archive became a broken RE suite rather than an error.
-        # Fixing only the stderr throw here would have left that silence in place, which is why
-        # this grew a check rather than just a wrapper.
-        $x = Invoke-Native -FilePath $sevenZip -Arguments @('x', $Zip, "-o$Dest", '-y')
-        if ($x.ExitCode -ne 0) {
-            foreach ($line in $x.Output) { Write-Host "    $line" -ForegroundColor DarkGray }
-            throw "7z extraction failed (exit $($x.ExitCode)): $Zip -> $Dest"
-        }
-    }
-    else { Expand-Archive -LiteralPath $Zip -DestinationPath $Dest -Force }
+    # Metadata exclusions happen before member contents are read. Public certificates
+    # and synthetic fixture keys are excluded too; filename rules do not inspect secrets.
+    $python = Join-Path $Root "python\.venv\Scripts\python.exe"
+    $extractor = Join-Path (Split-Path -Parent $PSScriptRoot) "tools\vendor_archive.py"
+    if (-not (Test-Path -LiteralPath $python)) { throw "Shared toolbox Python is required for safe vendor archive extraction." }
+    $result = Invoke-Native -FilePath $python -Arguments @('-X', 'utf8', $extractor, $Zip, $Dest)
+    if ($result.ExitCode -ne 0) { throw "Safe vendor ZIP extraction failed: $($result.Output -join ' ')" }
+    $verdict = ($result.Output -join [Environment]::NewLine) | ConvertFrom-Json
+    Write-Info ("Extracted {0} files; excluded {1} protected archive members (H01-H09/H20, W01-W10)." -f $verdict.extracted, @($verdict.excluded_protected).Count)
 }
 
 function Get-Download {
@@ -186,15 +181,20 @@ function Get-Json {
 }
 
 if (-not $SkipGhidra) {
-    $have = Get-ChildItem $native -Filter "ghidra_*" -Directory -ErrorAction SilentlyContinue |
+    $ghidraFilter = if ($ReleaseTag -eq 'latest') { 'ghidra_*' } else { ($ReleaseTag -replace '^Ghidra_', 'ghidra_' -replace '_build$', '_PUBLIC*') }
+    $have = Get-ChildItem $native -Filter $ghidraFilter -Directory -ErrorAction SilentlyContinue |
             Where-Object { Test-Path (Join-Path $_.FullName "ghidraRun.bat") } | Select-Object -First 1
     if ($have) {
+        foreach ($required in @('support\analyzeHeadless.bat', 'Ghidra\application.properties', 'Ghidra\Features\Decompiler\os\win_x86_64\decompile.exe')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $have.FullName $required))) { throw "Ghidra installation is incomplete ($required); preserve it for inspection before repair." }
+        }
         Write-Ok "Ghidra already present: $($have.FullName)"
     } elseif ($DryRun) {
-        Write-Info "[DRY-RUN] would resolve, verify, download, and extract the latest Ghidra release"
+        Write-Info "[DRY-RUN] would resolve, verify, download, and extract Ghidra release $ReleaseTag"
     } else {
-        Write-Info "resolve latest Ghidra release"
-        $rel   = Get-Json "https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest"
+        Write-Info "resolve Ghidra release $ReleaseTag"
+        $releasePath = if ($ReleaseTag -eq 'latest') { 'latest' } else { "tags/$ReleaseTag" }
+        $rel   = Get-Json "https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/$releasePath"
         $asset = $rel.assets | Where-Object { $_.name -like "ghidra_*_PUBLIC_*.zip" } | Select-Object -First 1
         if (-not $asset) { throw "no Ghidra *_PUBLIC_*.zip asset in the latest release" }
         $zip = Join-Path $dl $asset.name
@@ -212,15 +212,17 @@ if (-not $SkipGhidra) {
 }
 
 if (-not $SkipJdk) {
-    $have = Get-ChildItem $native -Filter "jdk-*" -Directory -ErrorAction SilentlyContinue |
+    $have = Get-ChildItem $native -Filter "jdk-$JdkMajor*" -Directory -ErrorAction SilentlyContinue |
             Where-Object { Test-Path (Join-Path $_.FullName "bin\java.exe") } | Select-Object -First 1
     if ($have) {
+        $javaProbe = Invoke-Native -FilePath (Join-Path $have.FullName 'bin\java.exe') -Arguments @('-version')
+        if ($javaProbe.ExitCode -ne 0 -or ($javaProbe.Output -join ' ') -notmatch ('version "' + $JdkMajor + '\.')) { throw "Existing JDK did not report Java $JdkMajor; preserve it for inspection." }
         Write-Ok "JDK already present: $($have.FullName)"
     } elseif ($DryRun) {
-        Write-Info "[DRY-RUN] would resolve, verify, download, and extract the latest Temurin JDK 21"
+        Write-Info "[DRY-RUN] would resolve, verify, download, and extract the latest Temurin JDK $JdkMajor"
     } else {
-        Write-Info "download Eclipse Temurin JDK 21 (portable)"
-        $assets = Get-Json "https://api.adoptium.net/v3/assets/latest/21/hotspot?architecture=x64&image_type=jdk&os=windows&vendor=eclipse"
+        Write-Info "download Eclipse Temurin JDK $JdkMajor (portable)"
+        $assets = Get-Json "https://api.adoptium.net/v3/assets/latest/$JdkMajor/hotspot?architecture=x64&image_type=jdk&os=windows&vendor=eclipse"
         $package = $assets | Select-Object -First 1 -ExpandProperty binary | Select-Object -ExpandProperty package
         if (-not $package.link -or -not $package.checksum) { throw "Adoptium API returned no JDK package/checksum" }
         $zip = Join-Path $dl $package.name

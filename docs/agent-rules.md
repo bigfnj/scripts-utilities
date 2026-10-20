@@ -209,6 +209,40 @@ The Ghidra helper resolves current vendor metadata and verifies the published
 SHA-256 digests for both Ghidra and the JDK before extraction. Do not bypass
 that verification.
 
+### Optional legacy DOS tools
+
+The explicit entrypoint is scripts/install-legacy-dos.ps1 -Component NAME.
+It accepts Capstone, Unicorn, Dosbox, Ghidra, Watcom, or All; it installs nothing without
+a selection and is never called by normal bootstrap. Capstone and Unicorn are
+optional pip-toolbox catalog libraries in the existing shared venv. Their narrow
+installer reads the exact catalog pin, verifies the installed distribution version,
+and invokes that interpreter's pip with --isolated so user pip configuration is ignored.
+
+Open Watcom and DOSBox-X portable archives are a narrow vendor-download exception,
+like the existing Ghidra/JDK helper. Official release URLs and SHA-256 digests are
+pinned in config/legacy-dos-tools.json. The shared Python standard library extracts
+beneath toolbox native, records provenance, and writes wrappers into the existing
+native/bin directory. Watcom's WATCOM, INCLUDE, and compiler PATH are wrapper-local.
+No administrator token, new Python environment, machine PATH edit, or global
+JAVA_HOME is needed.
+
+The DOSBox-X catalog retains an optional winget-user entry, but the portable
+helper does not run its installer. The 2026.08.02 Winget manifest advertises
+/CURRENTUSER while the tagged installer requires admin and disables privilege
+overrides. Do not turn this unresolved conflict into automatic elevation.
+
+All vendor ZIP extraction, including Ghidra/JDK, goes through
+tools/vendor_archive.py: it checks all member metadata before reading member
+contents, excludes protected paths without opening them, and rejects traversal,
+links, Windows aliases, duplicate destinations, and overwrites. Required protected
+tool files fail closed. Public certificates and test fixtures use the same
+exclusions. Do not weaken the exclusions to complete an installation.
+
+Run scripts/test-host-projection.ps1 before agent package changes or AppData
+writes. Use -DryRun to review component selection without downloads or writes.
+Verify the installed DOSBox-X debugger commands separately: current development
+documentation does not prove an older release has MCP control.
+
 ### 2. Python libraries -> dev toolbox venv (`pip` into venv)
 
 For things you `import` in Python scripts (pandas, requests, frida, ...).

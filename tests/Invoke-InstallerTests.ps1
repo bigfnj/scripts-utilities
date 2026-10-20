@@ -708,9 +708,9 @@ It 'the projection predicate fires on the pair actually measured under a package
     # THE POSITIVE CASE, kept testable on a healthy machine. Once a host's shadow is cleared
     # the condition cannot be reproduced locally - that is what clearing it means - so a test
     # needing a live projection would silently stop proving anything the day the bug was fixed.
-    # These two strings are the measurement from 2026-09-21, verbatim.
-    $file = 'C:\Users\justin.lowe\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\DevToolbox\python\.venv\Lib\site-packages\pip\_vendor\distlib\scripts.py'
-    $dir = 'C:\Users\justin.lowe\AppData\Local\DevToolbox\python\.venv\Lib\site-packages\pip\_vendor\distlib'
+    # These two strings retain the measured 2026-09-21 layout with an anonymized username.
+    $file = 'C:\Users\example.user\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\DevToolbox\python\.venv\Lib\site-packages\pip\_vendor\distlib\scripts.py'
+    $dir = 'C:\Users\example.user\AppData\Local\DevToolbox\python\.venv\Lib\site-packages\pip\_vendor\distlib'
     (Test-ResolvedPathDisagreement -Canonical $file -CanonicalParent $dir) -and
         -not (Test-ResolvedPathDisagreement -Canonical "$dir\scripts.py" -CanonicalParent $dir)
 }
@@ -1253,7 +1253,7 @@ It 'every file that reads a wrapper uses the character-identical regex, and Shim
     # sweep: the filter has to be applied to the path BELOW the root being scanned.
     $wtPrefix = '.claude' + [IO.Path]::DirectorySeparatorChar + 'worktrees'
     $rootLen = (Resolve-Path -LiteralPath $repoRoot).Path.TrimEnd('\').Length + 1
-    foreach ($f in (Get-ChildItem -LiteralPath $repoRoot -Recurse -Filter *.ps1 -File |
+    foreach ($f in (Get-SUSourceFiles -Root $repoRoot -Recurse -Filter '*.ps1' -ExcludeRelative @('.claude\worktrees\*') |
                     Where-Object { -not $_.FullName.Substring($rootLen).StartsWith($wtPrefix, [StringComparison]::OrdinalIgnoreCase) })) {
         if ((Get-Content -LiteralPath $f.FullName -Raw) -match $pat) {
             $hits += $f.FullName.Substring($repoRoot.Length + 1)
@@ -1914,7 +1914,7 @@ $builderAst = [System.Management.Automation.Language.Parser]::ParseFile($builder
 # carrying a fourth copy of a filter whose wrong form silently greens the whole sweep.
 $suRepoPrefix = $repoRoot.TrimEnd('\') + '\'
 function Get-SURepoScripts {
-    Get-ChildItem -LiteralPath $repoRoot -Recurse -Filter *.ps1 -File -ErrorAction SilentlyContinue |
+    Get-SUSourceFiles -Root $repoRoot -Recurse -Filter '*.ps1' -ExcludeRelative @('.claude\worktrees\*') |
         Where-Object { -not ($_.FullName.Substring($suRepoPrefix.Length) -like '.claude\worktrees\*') }
 }
 

@@ -892,7 +892,7 @@ $parseProbe = {
 # the "all N .ps1 file(s) parse" count nondeterministic and could fail this gate for a file no
 # commit can fix.
 $parseRoot = $REPO_ROOT.TrimEnd('\') + '\'
-$fxFiles = @(Get-ChildItem -LiteralPath $REPO_ROOT -Recurse -Filter *.ps1 -File -ErrorAction SilentlyContinue |
+$fxFiles = @(Get-SUSourceFiles -Root $REPO_ROOT -Recurse -Filter '*.ps1' -ExcludeRelative @('.claude\worktrees\*', 'logs\*') |
              Where-Object {
                  $rel = $_.FullName.Substring($parseRoot.Length)
                  (-not ($rel -like '.claude\worktrees\*')) -and (-not ($rel -like 'logs\*'))
@@ -1000,7 +1000,7 @@ if (-not (Test-Path -LiteralPath $smokeLintLib)) {
 $suiteRequired = @('Invoke-CoreTests.ps1', 'Invoke-InstallerTests.ps1',
                    'Invoke-TriageTests.ps1', 'Invoke-RenderTests.ps1',
                    'Invoke-SmokeLintTests.ps1', 'Invoke-GateChecksTests.ps1',
-                   'Invoke-AgentDiscoveryTests.ps1')
+                   'Invoke-AgentDiscoveryTests.ps1', 'Invoke-LegacyDosTests.ps1')
 $suiteFiles = @(Get-ChildItem -LiteralPath (Join-Path $REPO_ROOT 'tests') -Filter 'Invoke-*Tests.ps1' `
                     -File -ErrorAction SilentlyContinue | Sort-Object Name)
 foreach ($suiteReq in $suiteRequired) {

@@ -18,6 +18,9 @@ $script:MANIFEST = Join-Path $PSScriptRoot "..\manifest\tools.json"
 # trade, and build-devtoolbox.ps1 - which dot-sources nothing else at all - needs it too.
 . (Join-Path $PSScriptRoot "ShimFormat.ps1")
 
+# Safe source sweeps prune protected names before traversing directories.
+. (Join-Path $PSScriptRoot "SourceFiles.ps1")
+
 # -- Logging -------------------------------------------------------------------
 function Write-Info  { param([string]$Msg) Write-Host "  $Msg" -ForegroundColor Cyan }
 function Write-Ok    { param([string]$Msg) Write-Host "OK $Msg" -ForegroundColor Green }
