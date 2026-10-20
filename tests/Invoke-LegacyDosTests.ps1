@@ -73,4 +73,3 @@ Show-SUGuardSummary
 Write-Host ("{0} passed, {1} failed" -f $script:Pass, $script:Fail)
 if ($script:Fail) { exit 1 }
 exit 0
-

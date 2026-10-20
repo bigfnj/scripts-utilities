@@ -81,4 +81,3 @@ int main(void) { puts("TOOLBOX_DOS_SMOKE"); return 0; }' -Encoding ASCII
 Write-Host ("{0} passed, {1} failed" -f $pass, $fail)
 if ($fail) { exit 1 }
 exit 0
-
