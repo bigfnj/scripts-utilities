@@ -12,6 +12,8 @@
     "marker": "binnt64/wcl386.exe",
     "required": [
       "binnt64/wcl386.exe",
+      "binnt64/wcc386.exe",
+      "binnt64/wasm.exe",
       "binnt64/wlink.exe",
       "binnt64/wdis.exe",
       "binnt64/wmake.exe",

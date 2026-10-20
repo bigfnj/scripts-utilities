@@ -1,4 +1,4 @@
-﻿# Backlog - scripts-utilities
+# Backlog - scripts-utilities
 
 ## How to work this list
 
@@ -150,8 +150,10 @@ fail locally. If you add a test, ask what on this box it is quietly reading.
 
 ## Open items: NONE
 
-Empty on purpose, and stated rather than left to inference: an empty file and a file whose sections
-happen to be blank read the same, which is how the handoff above gets mistaken for a task list.
+Empty on purpose. The six optional DOS tool integration findings from the
+2026-10-20 post-push audit are closed after focused regressions, actual tool
+checks and the cumulative gate. Their causes, fixes and evidence are recorded in
+docs/engineering-record.md.
 
 The nine items here on 2026-09-21 are all closed. Seven were fixed; two were closed as DECISIONS
 and live in `docs/engineering-record.md` rather than here, because "do not do this, and here is the

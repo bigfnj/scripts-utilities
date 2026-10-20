@@ -633,4 +633,31 @@ and visibility. It stores no desktop profile.
 Offline regressions cover traversal, links, collisions, missing archive members,
 hash/provenance failures, inventory merging, false guest-boot success, library
 pin enforcement and child-process scope. Removed unused extraction lookup and
-redundant exception handling found during review. No new open toolbox finding.
+redundant exception handling found during review.
+
+### Post-push integration audit, fixed and verified
+
+Six findings were fixed forward after the first green public commit:
+
+- Pinned Ghidra provisioning now registers the exact release folder and selected
+  JDK major, validating both launchers and actual Java version before mutations.
+  General bootstrap discovery retains its existing override behavior.
+- Host projection measures the explicitly selected shared interpreter under
+  -Root, independently of the inherited CODEX_TOOLBOX value.
+- The nested Python suite requires at least 28 real tests, a successful exit and
+  no skips or expected failures. Zero tests, missing/duplicate summaries,
+  under-floor runs and nonzero exits have negative regressions.
+- Source enumeration checks root metadata and refuses root junctions before
+  listing children. Injected metadata tests avoid protected fixtures.
+- Watcom requires all six published executables and stdio.h. Wrapper planning
+  validates every executable before emitting the first registration item.
+- ZIP and TAR reader ownership starts immediately after opening, so metadata
+  failures close the archive. Mock error regressions assert one close each.
+
+Verified on 2026-10-20: nine PowerShell cases and 28 Python tests passed. The full
+worktree gate passed seven checks, 90 workstation smoke successes with zero
+failures, and all eight suites in both isolated and in-session modes. All five
+optional functional probes passed, including actual corrected Ghidra
+registration, headless decompilation, DOS compilation and guest-written DOSBox
+nonce. These are workstation measurements, not fixed counts for other hosts.
+No open toolbox finding remains from this audit.

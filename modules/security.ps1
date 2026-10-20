@@ -286,11 +286,26 @@ function security_configure_symbols {
 }
 
 function security_install_ghidra {
+    param([string]$InstallPath = '', [string]$JdkPath = '', [int]$JdkMajor = 0)
     # Ghidra has no winget package - it ships as a GitHub release ZIP (needs JDK 21+)
     # and can be extracted anywhere, so we don't hard-code Program Files. Find-GhidraInstall
     # honors $GHIDRA_INSTALL_DIR then searches common roots, validating by ghidraRun.bat.
     # We don't auto-download it from bootstrap; the explicit verified helper does.
-    $existing = Find-GhidraInstall
+    # Explicit callers must not inherit a previously registered version or JDK.
+    if ($InstallPath -or $JdkPath) {
+        if (-not $InstallPath -or -not $JdkPath -or $JdkMajor -lt 1) { throw 'Explicit Ghidra registration requires installation, JDK, and major version together.' }
+        foreach ($required in @('ghidraRun.bat', 'support\analyzeHeadless.bat')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $InstallPath $required) -PathType Leaf)) { throw "Explicit Ghidra launcher missing: $required" }
+        }
+        foreach ($required in @('bin\java.exe', 'bin\javac.exe')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $JdkPath $required) -PathType Leaf)) { throw "Explicit portable JDK file missing: $required" }
+        }
+        $java = Invoke-Native -FilePath (Join-Path $JdkPath 'bin\java.exe') -Arguments @('-version')
+        if ($java.ExitCode -ne 0 -or ($java.Output -join ' ') -notmatch ('version "' + $JdkMajor + '\.')) { throw "Explicit Ghidra JDK did not report Java $JdkMajor." }
+        $existing = Get-Item -LiteralPath $InstallPath
+    } else {
+        $existing = Find-GhidraInstall
+    }
     if ($existing) {
         Write-Skip "Ghidra found at $($existing.FullName)"
 
@@ -312,10 +327,13 @@ function security_install_ghidra {
         # (native\jdk-*), else an existing JAVA_HOME. The wrappers set JAVA_HOME for
         # Ghidra ONLY (no global change), so Ghidra never depends on a system/registered
         # JDK - keeping the toolbox self-contained and compliance-clean.
-        $jdk = Get-ChildItem (Join-Path $root "native") -Filter "jdk-*" -Directory -ErrorAction SilentlyContinue |
-               Where-Object { Test-Path (Join-Path $_.FullName "bin\java.exe") } |
-               Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty FullName
-        if (-not $jdk -and $env:JAVA_HOME -and (Test-Path (Join-Path $env:JAVA_HOME "bin\java.exe"))) { $jdk = $env:JAVA_HOME }
+        $jdk = $JdkPath
+        if (-not $jdk) {
+            $jdk = Get-ChildItem (Join-Path $root "native") -Filter "jdk-*" -Directory -ErrorAction SilentlyContinue |
+                   Where-Object { Test-Path (Join-Path $_.FullName "bin\java.exe") } |
+                   Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty FullName
+            if (-not $jdk -and $env:JAVA_HOME -and (Test-Path (Join-Path $env:JAVA_HOME "bin\java.exe"))) { $jdk = $env:JAVA_HOME }
+        }
         # A LIST OF WHOLE LINES now, not a pre-terminated string spliced into the middle of a
         # format literal. That splice is what made this the only writer whose shape could drift
         # independently: the CRLF lived in $jdkLine, so the three-line and two-line cases were two

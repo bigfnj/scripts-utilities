@@ -21,6 +21,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $repoRoot 'lib\common.ps1')
+. (Join-Path $repoRoot 'lib\LegacyDos.ps1')
 $script:DryRun = [bool]$DryRun
 if (-not $Component.Count) { throw 'Select -Component Capstone, Unicorn, Dosbox, Ghidra, Watcom, or All. Nothing is installed by default.' }
 $selected = if ($Component -contains 'All') { @('Capstone', 'Unicorn', 'Dosbox', 'Ghidra', 'Watcom') } else { @($Component | Select-Object -Unique) }
@@ -35,7 +36,7 @@ if ($DryRun) {
 
 # This is also required operationally before calling this script from an agent.
 # Refuse projected and unmeasurable views before the first download or package write.
-$projection = Test-HostPathProjection
+$projection = Test-SULegacyHostProjection -Root $Root
 if ($null -eq $projection.IsProjected -or $projection.IsProjected) {
     throw "Toolbox view is projected or unknown: $($projection.Reason). Run scripts\test-host-projection.ps1 from a normal user shell."
 }
@@ -85,7 +86,8 @@ try {
             'Ghidra' {
                 & (Join-Path $PSScriptRoot 'install-ghidra.ps1') -Root $Root -ReleaseTag $config.ghidra.release_tag -JdkMajor $config.ghidra.jdk_major
                 . (Join-Path $repoRoot 'modules\security.ps1')
-                security_install_ghidra
+                $pinned = Get-SUPinnedGhidraSelection -Root $Root -ReleaseTag $config.ghidra.release_tag -JdkMajor $config.ghidra.jdk_major
+                security_install_ghidra -InstallPath $pinned.InstallPath -JdkPath $pinned.JdkPath -JdkMajor $config.ghidra.jdk_major
             }
             default {
                 $key = $name.ToLowerInvariant()
@@ -98,8 +100,9 @@ try {
                 } else {
                     $toolRoot = [string]$receipt.root
                     $localEnvironment = @('setlocal', ('set "WATCOM={0}"' -f $toolRoot), ('set "INCLUDE={0}\h"' -f $toolRoot), ('set "PATH={0}\binnt64;%PATH%"' -f $toolRoot))
-                    foreach ($binary in @('wcl386', 'wcc386', 'wlink', 'wdis', 'wmake', 'wasm')) {
-                        Register-LegacyDosShim -Name $binary -Target (Join-Path $toolRoot ("binnt64\" + $binary + '.exe')) -Prologue $localEnvironment
+                    $shimPlan = @(Get-SUWatcomShimPlan -InstallRoot $toolRoot)
+                    foreach ($item in $shimPlan) {
+                        Register-LegacyDosShim -Name $item.Name -Target $item.Target -Prologue $localEnvironment
                     }
                     Add-WinManifest -Name 'open-watcom' -Binary 'wcl386' -Group 'security' -Method 'vendor-archive' -Scope 'toolbox' -Detect 'wcl386 -?' -Notes "Official portable Open Watcom $($receipt.release), SHA-256 $($receipt.sha256); WATCOM/INCLUDE/PATH remain wrapper-local."
                 }

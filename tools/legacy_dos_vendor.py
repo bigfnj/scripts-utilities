@@ -69,25 +69,24 @@ def download(spec: dict, destination: Path) -> None:
 
 def extract(archive: Path, spec: dict, staging: Path) -> list[dict]:
     """Prevalidate the complete member list, then copy regular files without extractall."""
-    if spec["format"] == "zip":
-        source = zipfile.ZipFile(archive)
-        raw = source.infolist()
-        entries = [(x.filename, x.is_dir(), x) for x in raw]
-        for _, _, member in entries:
-            if stat.S_ISLNK(member.external_attr >> 16):
-                source.close()
-                raise ValueError("archive links are not supported")
-        opener = source.open
-    else:
-        source = tarfile.open(archive, "r:xz")
-        raw = source.getmembers()
-        entries = [(x.name, x.isdir(), x) for x in raw]
-        for _, _, member in entries:
-            if not (member.isdir() or member.isfile()):
-                source.close()
-                raise ValueError("archive links and special files are not supported")
-        opener = source.extractfile
+    source = None
     try:
+        if spec["format"] == "zip":
+            source = zipfile.ZipFile(archive)
+            raw = source.infolist()
+            entries = [(x.filename, x.is_dir(), x) for x in raw]
+            for _, _, member in entries:
+                if stat.S_ISLNK(member.external_attr >> 16):
+                    raise ValueError("archive links are not supported")
+            opener = source.open
+        else:
+            source = tarfile.open(archive, "r:xz")
+            raw = source.getmembers()
+            entries = [(x.name, x.isdir(), x) for x in raw]
+            for _, _, member in entries:
+                if not (member.isdir() or member.isfile()):
+                    raise ValueError("archive links and special files are not supported")
+            opener = source.extractfile
         checked = []
         excluded = []
         seen = set()
@@ -132,7 +131,8 @@ def extract(archive: Path, spec: dict, staging: Path) -> list[dict]:
                     shutil.copyfileobj(src, out)
         return excluded
     finally:
-        source.close()
+        if source is not None:
+            source.close()
 
 
 def install(root: Path, config: Path, component: str) -> dict:

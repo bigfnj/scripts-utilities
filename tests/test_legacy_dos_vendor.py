@@ -113,6 +113,46 @@ class VendorTests(unittest.TestCase):
 
 
 
+
+    def test_tar_metadata_error_closes_reader_before_propagating(self):
+        source = mock.Mock()
+        source.getmembers.side_effect = tarfile.ReadError("metadata failure")
+        with mock.patch.object(vendor.tarfile, "open", return_value=source):
+            with self.assertRaises(tarfile.ReadError):
+                vendor.extract(Path("unused.tar.xz"), {"format": "tar.xz"}, Path("unused-stage"))
+        source.close.assert_called_once_with()
+
+    def test_zip_metadata_error_closes_reader_before_propagating(self):
+        source = mock.Mock()
+        source.infolist.side_effect = zipfile.BadZipFile("metadata failure")
+        with mock.patch.object(vendor.zipfile, "ZipFile", return_value=source):
+            with self.assertRaises(zipfile.BadZipFile):
+                vendor.extract(Path("unused.zip"), {"format": "zip"}, Path("unused-stage"))
+        source.close.assert_called_once_with()
+
+    def test_watcom_configuration_requires_every_published_compiler_tool(self):
+        spec = vendor.load_spec(SOURCE.parents[1] / "config/legacy-dos-tools.json", "watcom")
+        expected = {f"binnt64/{name}.exe" for name in
+                    ("wcl386", "wcc386", "wlink", "wdis", "wmake", "wasm")}
+        self.assertTrue(expected.issubset(set(spec["required"])))
+
+    def test_incomplete_existing_receipt_never_downloads_or_extracts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "native/watcom-fixture"
+            target.mkdir(parents=True)
+            spec = {"release": "fixture", "url": "https://example.invalid/unused",
+                    "sha256": "0" * 64, "required": ["binnt64/wasm.exe"]}
+            receipt = {"component": "watcom", **{key: spec[key] for key in
+                       ("release", "url", "sha256")}}
+            (target / "toolbox-install.json").write_text(json.dumps(receipt), encoding="utf-8")
+            with mock.patch.object(vendor, "load_spec", return_value=spec), \
+                 mock.patch.object(vendor, "download", side_effect=AssertionError("network used")), \
+                 mock.patch.object(vendor, "extract", side_effect=AssertionError("extraction used")):
+                with self.assertRaisesRegex(ValueError, "incomplete"):
+                    vendor.install(root, Path("unused-config.json"), "watcom")
+
+
 class ManifestMergeTests(unittest.TestCase):
     def setUp(self):
         source = SOURCE.parent / "merge_tool_manifests.py"

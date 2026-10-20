@@ -23,6 +23,10 @@ function Get-SUSourceFiles {
         [string]$Filter = '*',
         [switch]$Recurse,
         [string[]]$ExcludeRelative = @(),
+        [scriptblock]$RootMetadata = {
+            param($Directory)
+            Get-Item -LiteralPath $Directory -Force -ErrorAction Stop
+        },
         [scriptblock]$ListDirectory = {
             param($Directory)
             Get-ChildItem -LiteralPath $Directory -ErrorAction SilentlyContinue
@@ -30,6 +34,9 @@ function Get-SUSourceFiles {
     )
     $rootPath = ([IO.Path]::GetFullPath($Root)).TrimEnd('\')
     if (-not (Test-SUSourcePath -Path $rootPath)) { throw 'Source root has a protected path component.' }
+    $rootItem = $RootMetadata.Invoke($rootPath)
+    if ($null -eq $rootItem -or -not $rootItem.PSIsContainer) { throw 'Source root must be an existing directory.' }
+    if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Source root is a link or junction; refusing enumeration.' }
     $prefix = $rootPath + '\'
     $pending = New-Object 'System.Collections.Generic.Stack[string]'
     $pending.Push($rootPath)
