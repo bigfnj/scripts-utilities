@@ -601,11 +601,14 @@ nobody re-derives them, and so a later regression is visible:
   ChatGPT agent, Goose, Browserbase and Anchor Browser), and the `WebFetch`
   user-agent is not configurable - anthropics/claude-code#7696 was closed as a
   duplicate. When `WebFetch` is blocked, use `browse`.
-- **From a Bash tool call, a toolbox `.cmd` shim needs its extension.** Git
-  Bash appends `.exe` when searching PATH, not `.cmd`, so `browse` and
-  `ffmpeg` both come back "command not found" while `browse.cmd` and
-  `ffmpeg.cmd` work. From PowerShell the bare name resolves normally. This
-  applies to every wrapped tool in `native\bin`, not just this one.
+- **Use bare tool names for EXE-backed wrappers.** Native `.exe` companions
+  forward the exact command-line tail without `cmd.exe`, preserving regex
+  metacharacters, quotes and empty arguments. Explicit `.cmd` calls still use
+  cmd parsing. Batch targets such as npm and Ghidra remain explicit batch
+  wrappers; from Bash use their `.cmd` extension and cmd-specific escaping.
+  To migrate an existing toolbox, run `scripts\test-host-projection.ps1`,
+  inspect `scripts\repair-native-shims.ps1 -DryRun`, then apply without
+  `-DryRun`. This keeps selected targets, PATH and the shared venv unchanged.
 
 ---
 
@@ -648,3 +651,11 @@ nobody re-derives them, and so a later regression is visible:
 - Don't modify the dev toolbox's `requirements-core.txt` or `requirements-ml.txt`
   from here - the toolbox has its own replication prompt for that.
 - Don't push without a passing `smoke-test.ps1`.
+
+## Resolving a single native command
+
+EXE-backed tools have adjacent EXE and CMD entrypoints. PowerShell
+`Get-Command -CommandType Application` can return multiple matches. When a
+script needs one executable path, explicitly select the first returned command
+in PATH order before reading its `Source`. Default exact-name lookup and
+existence checks need no blanket rewrite. Verify with an actual tool invocation.

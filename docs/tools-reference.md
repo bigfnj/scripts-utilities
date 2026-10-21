@@ -6,6 +6,21 @@ tshark) work in practice.
 
 ---
 
+## Wrapper invocation
+
+Use bare names for EXE-backed tools, for example `rg 'pf->numpos' file.c`.
+Their native companions forward arguments directly to the selected executable,
+including redirected stdin/stdout/stderr, exit codes, current directory and local
+environment initialization. Avoid explicit `.cmd` calls for arbitrary regex
+arguments. Explicit batch targets such as npm and Ghidra still use CMD semantics;
+Bash callers use their `.cmd` extension with CMD escaping.
+
+Migrate existing wrappers with `scripts\repair-native-shims.ps1 -DryRun`,
+then check host projection and apply without `-DryRun`. The migration adds
+companions, preserves the original wrappers and never installs tools or changes
+PATH. Only literal EXE targets with SETLOCAL and ordinary quoted SET assignments
+are translated; control flow and special CMD substitutions remain batch-only.
+
 ## Developer CLI tools
 
 ### gh - GitHub CLI

@@ -810,6 +810,7 @@ function New-VenvCliWrappers {
         # treat it as a wildcard and silently write nothing at all.
         New-ShimBody -Target $exe.FullName |
             Set-Content -LiteralPath (Join-Path $binDir "$($exe.BaseName).cmd") -Encoding ASCII -NoNewline
+        [void](Install-NativeShim -Wrapper (Join-Path $binDir "$($exe.BaseName).cmd"))
     }
 }
 
@@ -1134,11 +1135,13 @@ PATH too. Set CODEX_TOOLBOX to override the toolbox root path.
               Use browse instead.
               Install: $RepoRoot\scripts\install-browse.ps1
               Rules, exit codes, measurements: $RepoRoot\docs\agent-rules.md
-              FROM A POSIX-SHELL TOOL CALL a .cmd shim needs its extension -
-              browse.cmd, ffmpeg.cmd - because Git Bash and similar POSIX
-              shells append .exe and not .cmd when searching PATH. From
-              PowerShell the bare name works.
-              True of every wrapped tool in native\bin, not just this one.
+              EXE-backed tools have native .exe companions. Use bare names
+              from PowerShell or Bash to preserve literal regex characters,
+              quotes and empty arguments. Explicit .cmd calls use cmd parsing.
+              Batch targets such as npm/Ghidra still need .cmd from Bash and
+              cmd-specific escaping. Migrate old shims with:
+                scripts\repair-native-shims.ps1 -DryRun
+              Inspect the plan, check host projection, then apply without -DryRun.
 
 ### Developer CLI tools - on PATH (winget; user scope unless noted)
 

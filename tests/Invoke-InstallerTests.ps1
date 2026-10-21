@@ -2956,6 +2956,9 @@ It "New-CmdWrapper carries no here-string of its own, and writes New-ShimBody's 
         param($Defs, $Root, $Target)
         $DryRun = $false
         . $Defs
+        # This test pins CMD bytes using a deliberately missing synthetic target.
+        # Real publisher execution is covered by Invoke-NativeShimTests.ps1.
+        function Install-NativeShim { param([string]$Wrapper) }
         New-CmdWrapper -Name 'zzprobe' -Target $Target
     } $defs $wrapRoot $target
     $wrapper = Join-Path $wrapRoot 'native\bin\zzprobe.cmd'

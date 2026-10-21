@@ -62,6 +62,7 @@ function Register-LegacyDosShim {
     $shim = Join-Path $bin ($Name + '.cmd')
     $body = New-ShimBody -Target $Target -Prologue $Prologue
     Set-Content -LiteralPath $shim -Value $body -Encoding ASCII -NoNewline
+    [void](Install-NativeShim -Wrapper $shim)
     $actual = Get-ShimTarget -Lines @(Get-Content -LiteralPath $shim)
     if ($actual -ne $Target) { throw "The $Name shim failed the shared shim contract." }
 }

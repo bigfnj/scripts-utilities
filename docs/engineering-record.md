@@ -661,3 +661,30 @@ optional functional probes passed, including actual corrected Ghidra
 registration, headless decompilation, DOS compilation and guest-written DOSBox
 nonce. These are workstation measurements, not fixed counts for other hosts.
 No open toolbox finding remains from this audit.
+
+## Native launcher argument preservation, 2026-10-21
+
+The old EXE-backed CMD wrappers reparsed literal caller arguments through
+`cmd.exe`. A quoted `>` in a C expression could create an unintended output
+file, and a regex pipe could start another command. Native EXE companions now
+forward the untouched Windows command-line tail with `CreateProcessW`. The CMD
+compatibility bytes, package target selection, PATH and shared Python venv
+remain unchanged. Batch-only targets retain their explicit CMD contract.
+
+Migration deployed165 companions and retained6 batch wrappers after the host
+projection preflight. The real invocation suite passes13 tests on both
+PowerShell hosts, including quotes, empty arguments, Unicode, environment,
+working directory, redirected streams, exit codes and console control events.
+Both complete gates pass7 repository checks and94 smoke checks with no failures;
+all9 suites agree between standalone and CI-style invocation. Four existing
+optional environment warnings remain recorded by the gate.
+
+A real Watcom build then exposed a consumer assumption: `Get-Command` with
+`-CommandType Application` can return both EXE and CMD matches. The decompilation
+build consumers now explicitly take the first resolved command. The toolbox's
+own single-command consumers use default exact-name lookup; its Application
+resolver already selects one candidate. A new helper was unnecessary.
+
+Run `scripts/repair-native-shims.ps1 -DryRun` before migrating an older toolbox.
+Use `scripts/refresh-agent-discovery.ps1` to update only managed discovery blocks.
+No dependency installation, global Python change or PATH rewrite is needed.

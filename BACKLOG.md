@@ -148,9 +148,19 @@ fail locally. If you add a test, ask what on this box it is quietly reading.
 
 ---
 
-## Open items: NONE
+## Open items
 
-Empty on purpose. The six optional DOS tool integration findings from the
+- **Native EXE wrapper argument preservation, confirmed 2026-10-21.**
+  The shared `New-ShimBody` contract forwards through `cmd.exe` with `%*`.
+  Bare PowerShell `rg 'pf->numpos'` can therefore become output redirection,
+  and literal regex pipes can execute another command. Add native EXE companions
+  without changing target selection or process-local initialization. Focused
+  real subprocess smoke: 13 passed, including writer integration and real
+  console control events. All165 companions are deployed; full gates on
+  PowerShell5.1 and7 pass7 checks,94 smoke checks and all9 suites, including
+  in-session parity. Post-push audit is pending.
+
+The six optional DOS tool integration findings from the
 2026-10-20 post-push audit are closed after focused regressions, actual tool
 checks and the cumulative gate. Their causes, fixes and evidence are recorded in
 docs/engineering-record.md.

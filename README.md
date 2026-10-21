@@ -64,6 +64,15 @@ An agent that reads the discovery block knows this and stops guessing.
 whether the toolbox installed it. "Check this file before installing anything" is a cheap
 instruction that prevents the most common and most annoying agent failure mode.
 
+**Native arguments stay native.** EXE-backed tools have an adjacent native launcher,
+so bare names preserve literal regex characters, quotes and empty arguments without
+passing through CMD. Explicit batch targets such as npm and Ghidra keep their
+batch wrappers. Existing installations can inspect and apply
+[scripts/repair-native-shims.ps1](scripts/repair-native-shims.ps1); check host
+projection before applying. Selected tools, package provenance, PATH and the shared
+Python environment stay the same. PowerShell 5.1 retains its own native argument
+limitations, which are also present when calling the real executable directly.
+
 ### The PATH problem this had to solve
 
 Two failures make a correctly installed tool report "not found" in an agent shell, and both are

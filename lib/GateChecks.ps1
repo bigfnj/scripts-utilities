@@ -48,7 +48,7 @@ $script:GCControlByteRegex = [regex]::new('[\x00-\x08\x0B\x0C\x0E-\x1F]')
 
 . (Join-Path $PSScriptRoot 'SourceFiles.ps1')
 
-$script:GCSourceExtensions = @('.ps1', '.psm1', '.json', '.yml', '.md', '.xml', '.cmd')
+$script:GCSourceExtensions = @('.ps1', '.psm1', '.json', '.yml', '.md', '.xml', '.cmd', '.cs')
 
 # There is deliberately NO second list of check names here. One was added with this file and had
 # zero readers - dead metadata that would have drifted from the registry the first time a check was

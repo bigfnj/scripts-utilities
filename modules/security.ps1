@@ -248,6 +248,7 @@ function security_install_debugger {
             # all four writers, and the live native\bin\windbg.cmd on this box - the only one of
             # the four whose target is installed - reproduces at 80 B exactly.
             New-ShimBody -Target $dbg | Set-Content -Path (Join-Path $binDir "windbg.cmd") -Encoding ASCII -NoNewline
+            [void](Install-NativeShim -Wrapper (Join-Path $binDir "windbg.cmd"))
             Write-Ok "windbg -> $dbg"
         }
         Sync-EnvPath
@@ -360,6 +361,7 @@ function security_install_ghidra {
                 # emitted: identical, byte for byte.
                 New-ShimBody -Target $target -Prologue $jdkPrologue |
                     Set-Content -Path (Join-Path $binDir "$name.cmd") -Encoding ASCII -NoNewline
+                [void](Install-NativeShim -Wrapper (Join-Path $binDir "$name.cmd"))
                 Write-Ok "$name -> $target"
             }
         }
@@ -472,6 +474,7 @@ function security_wrap_poolmon {
     } else {
         # -NoNewline: see the note at the windbg writer. Measured identical at 91 B.
         New-ShimBody -Target $poolmonPath | Set-Content -Path (Join-Path $binDir "poolmon.cmd") -Encoding ASCII -NoNewline
+        [void](Install-NativeShim -Wrapper (Join-Path $binDir "poolmon.cmd"))
         Write-Ok "poolmon -> $poolmonPath"
     }
     Sync-EnvPath
@@ -535,6 +538,7 @@ function security_install_console_debuggers {
         } else {
             # -NoNewline: see the note at the windbg writer. Measured identical at 78 B for cdb.
             New-ShimBody -Target $src | Set-Content -Path (Join-Path $binDir "$tool.cmd") -Encoding ASCII -NoNewline
+            [void](Install-NativeShim -Wrapper (Join-Path $binDir "$tool.cmd"))
             Write-Ok "$tool -> $src"
         }
     }

@@ -915,6 +915,7 @@ function New-CmdWrapper {
     # column loses is the CR, and 28 B is what the byte-exact test in tests\Invoke-InstallerTests.ps1
     # pins. The difference is no longer reachable: the bytes now come from the code.
     Set-Content -Path $wrapper -Value (New-ShimBody -Target $Target) -Encoding ASCII -NoNewline
+    [void](Install-NativeShim -Wrapper $wrapper)
     return $true
 }
 

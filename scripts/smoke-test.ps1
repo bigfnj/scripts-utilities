@@ -312,7 +312,10 @@ if (Test-Path $tbRoot) {
         # be rewritten from the real binary. See scripts\build-devtoolbox.ps1's Find-Executable
         # for the guard that stops it being re-created.
         $selfRef = @()
-        foreach ($w in Get-ChildItem -LiteralPath $nativeBin -Filter '*.cmd' -File -ErrorAction SilentlyContinue) {
+        $nativeProblems = @()
+        foreach ($w in Get-SUSourceFiles -Root $nativeBin -Filter '*.cmd') {
+            $nativeFailure = Test-NativeShim -Wrapper $w.FullName
+            if ($nativeFailure) { $nativeProblems += "$($w.BaseName): $nativeFailure" }
             # Get-ShimTarget (lib\ShimFormat.ps1) rather than a local copy of the regex. Already in
             # scope with no new dot-source: :15 loads lib\common.ps1, which loads ShimFormat.ps1 at
             # its :19. A second load path for the same two functions is the drift this consolidates.
@@ -354,6 +357,11 @@ if (Test-Path $tbRoot) {
             } catch { $isSelf = $false }
             if ($isSelf) { $selfRef += "$($w.BaseName) -> itself" }
             elseif (-not (Test-Path -LiteralPath $target)) { $stale += "$($w.BaseName) -> $target" }
+        }
+        if ($nativeProblems.Count -eq 0) { Test-Ok "all understood EXE-backed shims have current argument-preserving native companions" }
+        else {
+            Test-Fail "$($nativeProblems.Count) native companion problem(s), run scripts\repair-native-shims.ps1:"
+            $nativeProblems | Select-Object -First 8 | ForEach-Object { Write-Host "     $_" -ForegroundColor Red }
         }
         if ($stale.Count -eq 0) { Test-Ok "all native\bin shims resolve to an existing target" }
         else {
@@ -1000,7 +1008,8 @@ if (-not (Test-Path -LiteralPath $smokeLintLib)) {
 $suiteRequired = @('Invoke-CoreTests.ps1', 'Invoke-InstallerTests.ps1',
                    'Invoke-TriageTests.ps1', 'Invoke-RenderTests.ps1',
                    'Invoke-SmokeLintTests.ps1', 'Invoke-GateChecksTests.ps1',
-                   'Invoke-AgentDiscoveryTests.ps1', 'Invoke-LegacyDosTests.ps1')
+                   'Invoke-AgentDiscoveryTests.ps1', 'Invoke-LegacyDosTests.ps1',
+                   'Invoke-NativeShimTests.ps1')
 $suiteFiles = @(Get-ChildItem -LiteralPath (Join-Path $REPO_ROOT 'tests') -Filter 'Invoke-*Tests.ps1' `
                     -File -ErrorAction SilentlyContinue | Sort-Object Name)
 foreach ($suiteReq in $suiteRequired) {
