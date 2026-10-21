@@ -3536,53 +3536,38 @@ Remove-Item -LiteralPath $ownRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host "`n== the shim writers and the gates that notice when one stops running ==" -ForegroundColor Cyan
 
-It 'every pipeline that starts with New-ShimBody ends in Set-Content -NoNewline' {
-    # THE byte guard, and the only new check here with teeth on live machine state.
-    #
-    # New-ShimBody's string ALREADY ends in CRLF, and Set-Content without -NoNewline appends one
-    # of its own - measured under 5.1: the four inline literals this commit replaced ended in
-    # `" %*` with no newline and the file on disk ended 22 20 25 2A 0D 0A, i.e. Set-Content added
-    # it. So -NoNewline is not tidiness, it is the difference between an unchanged wrapper and
-    # every wrapper gaining a THIRD line. windbg / ghidraRun / analyzeHeadless / poolmon /
-    # cdb / kd / ntsd / gflags / dumpchk would keep resolving by name while the smoke test's
-    # stale-shim check - which anchors on $ - lost the ability to tell healthy from stale.
-    #
-    # PIPELINES ONLY, so lib\ShimPlan.ps1:558, which hands the body to a $WriteFile scriptblock as
-    # an ARGUMENT, is out of scope by shape rather than by an exception list that would need
-    # editing the next time a writer changes hands.
-    $bad = @(); $sites = 0
-    foreach ($f in (Get-SURepoScripts)) {
-        $a = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
-        if (-not $a) { continue }
-        foreach ($pipe in $a.FindAll({ param($n)
-                $n -is [System.Management.Automation.Language.PipelineAst] }, $true)) {
-            $els = @($pipe.PipelineElements)
-            if ($els.Count -lt 2) { continue }
-            if (-not ($els[0] -is [System.Management.Automation.Language.CommandAst])) { continue }
-            if ($els[0].GetCommandName() -ne 'New-ShimBody') { continue }
-            $sites++
-            $last = $els[-1]
-            # Parameter names by PREFIX, because PowerShell resolves them that way: -NoNew binds
-            # -NoNewline just as well, and Set-Content has no other parameter starting "No".
-            $hasNoNewline = $false
-            if ($last -is [System.Management.Automation.Language.CommandAst]) {
-                if ($last.GetCommandName() -eq 'Set-Content') {
-                    foreach ($e in $last.CommandElements) {
-                        if ($e -is [System.Management.Automation.Language.CommandParameterAst] -and
-                            $e.ParameterName -and ('NoNewline' -like ($e.ParameterName + '*'))) { $hasNoNewline = $true }
-                    }
-                }
-            }
-            if (-not $hasNoNewline) {
-                $bad += ('{0}:{1}' -f $f.FullName.Substring($suRepoPrefix.Length), $pipe.Extent.StartLineNumber)
+It 'production shim writers use the shared complete transaction and preserve the single ASCII newline contract' {
+    # Complete transactions keep another cooperating publisher out of the gaps
+    # between preparation, CMD bytes and native installation. Byte-exact runtime
+    # cases below still exercise the real builder and venv writers.
+    $files = @('lib\common.ps1', 'lib\ShimPlan.ps1', 'modules\security.ps1',
+        'scripts\build-devtoolbox.ps1', 'scripts\install-legacy-dos.ps1')
+    $sites = 0
+    $bad = @()
+    foreach ($relative in $files) {
+        $path = Join-Path $repoRoot $relative
+        $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$null)
+        foreach ($command in $ast.FindAll({ param($node)
+                $node -is [Management.Automation.Language.CommandAst] }, $true)) {
+            $name = $command.GetCommandName()
+            if ($name -eq 'Write-NativeShim') { $sites++ }
+            if ($name -in @('Prepare-NativeShimWrite', 'Install-NativeShim')) {
+                $bad += ($relative + ':' + $command.Extent.StartLineNumber)
             }
         }
     }
-    if ($bad.Count) { Write-Host "     writes a third line: $($bad -join ', ')" -ForegroundColor Red }
-    if ($sites -lt 4) { Write-Host "     only $sites New-ShimBody pipeline(s) found - expected at least the four in modules\security.ps1" -ForegroundColor Red }
-    ($sites -ge 4) -and ($bad.Count -eq 0)
+    $format = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repoRoot 'lib\ShimFormat.ps1'), [ref]$null, [ref]$null)
+    $writer = $format.Find({ param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Write-NativeShim' }, $true)
+    $writes = @($writer.FindAll({ param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Set-Content' }, $true))
+    $parameters = @($writes[0].CommandElements | Where-Object {
+        $_ -is [Management.Automation.Language.CommandParameterAst] } | ForEach-Object { $_.ParameterName })
+    if ($bad.Count) { Write-Host ('     split native publication: ' + ($bad -join ', ')) -ForegroundColor Red }
+    ($sites -ge 8) -and ($bad.Count -eq 0) -and ($writes.Count -eq 1) -and
+        ($parameters -contains 'NoNewline') -and ($parameters -contains 'LiteralPath') -and
+        ($writes[0].Extent.Text -match '-Encoding ASCII')
 }
-
 It 'the three-line Ghidra wrapper is byte-identical to what the inline literal emitted' {
     # The -Prologue case pinned at BYTE level, because Ghidra's is the only wrapper whose SHAPE
     # can drift. The CRLF used to live inside $jdkLine and be spliced into the middle of a format

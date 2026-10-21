@@ -592,9 +592,7 @@ function Invoke-ShimWrite {
         [scriptblock]$FileExists = { param($p) Test-Path -LiteralPath $p -PathType Leaf },
         [scriptblock]$WriteFile = {
             param($p, $body)
-            Prepare-NativeShimWrite -Wrapper $p -Body $body
-            Set-Content -LiteralPath $p -Value $body -Encoding ASCII -NoNewline
-            [void](Install-NativeShim -Wrapper $p)
+            Write-NativeShim -Wrapper $p -Body $body
         }
     )
     if (-not $Plan.ContainsKey('Write')) { throw 'plan has no Write list - Get-ShimPlan always supplies one, so this is a caller bug.' }

@@ -751,3 +751,104 @@ environment warnings and zero failures. All nine suites passed independently
 and in the CI-style shared session: agent discovery 21, core 27, gate checks
 47, installer 150, legacy DOS 9, native shim 27, render 28, smoke lint 18 and
 triage 31. Exact-revision post-push review remains pending for N01, N02 and N03.
+
+## Remaining companion removal and overlapping writer findings
+
+Exact-revision review of 02f2624 reproduced the remaining N01 failure with a
+metadata-only FileShare.Read lock. Removing the EXE first succeeded, removing
+the locked sidecar failed, and subsequent ownership checks refused the orphan.
+The earlier EXE-only lock regression did not cover this sequence.
+
+The focused correction acquires Windows DELETE-access leases on both owned
+ordinary files before mutation, checks their leased hashes, and stages both
+same-directory renames. A failed rename restores verified staged bytes or
+reports retained recovery paths. Successful cleanup touches only those exact
+staged leaves. The launcher binary source remains separate from the small
+file-lease helper. Metadata-only lock tests cover both production writers,
+both read-only and read/write sharing, unchanged CMD/EXE/sidecar bytes on refusal,
+and a successful retry after the reader releases its handle.
+Before the serialization changes, the focused pair-removal phase passed all
+28 native cases on Windows PowerShell 5.1 and PowerShell 7.
+
+Review also identified N04: cache generation and CMD/native publication are
+separate calls, so helper-local serialization alone would leave transaction
+gaps. All eight repository writer sites now enter Write-NativeShim, which holds
+one case-normalized directory mutex over preparation, CMD publication and native
+installation. Cache upgrades, pair removal and coherent ownership reads use the
+same reentrant mutex. Acquisition waits at most 15 seconds, handles an abandoned
+owner and disposes each acquired handle after success, timeout or exception.
+The Local mutex covers cooperating processes in the current Windows logon
+session. It does not claim protection from unrelated programs changing toolbox
+files, or recovery of bytes left by a killed publisher. Ownership is rechecked
+after acquisition and incomplete artifacts are still refused.
+The combined focused suite now passes all 31 native cases on Windows
+PowerShell 5.1 and PowerShell 7. The 150-case installer suite also passes on
+both hosts. Three real-process cases verify canonical-name timeout and exception
+cleanup, abandoned-owner acquisition, and two publishers overlapping during
+cache preparation. Each publisher is validated before its existing production
+transaction releases ownership; the final later generation is checked separately.
+Live refresh, full gates and the subsequent exact-revision audit remain pending.
+
+### Follow-up review: physical aliases and repair classification
+
+Read-only review found two remaining transaction gaps before the first shared
+writer commit. The deployed bin directory is reachable through existing 8.3
+profile and toolbox aliases. GetFullPath normalizes spelling and dot segments
+but gives those aliases different mutex names. N04 therefore requires the
+ordinary directory handle's volume and file identity, rather than a path hash.
+The planned regression holds a foreign process on one spelling and attempts
+ownership through the other while writing only an owned temporary fixture.
+A physical-directory rename case can also exercise identity on hosts where
+new 8.3 names are disabled.
+
+N05 concerns repair reporting. The repair script reads the CMD classification
+before Install-NativeShim acquires its transaction. Another publisher can
+change a batch contract in that gap, so installation follows the new EXE
+contract while the report still says BATCH. The repair transaction must cover
+classification, install, verification and the per-wrapper report together.
+The first 31-case shared-writer phase passed the complete Windows PowerShell
+5.1 gate at 2026-10-20T20:40:09, native-transaction-final51: 7 checks, 94/4/0
+smoke and all nine suites, including standalone/shared-session parity. Its native
+count increase from 27 to 31 was recorded as an allowed transition. This is
+phase evidence, not acceptance of the subsequently corrected alias behavior.
+
+The correction now hashes the volume serial and file index obtained from an
+ordinary directory handle. The handle refuses reparse points, supplies one
+identity through long names and 8.3 aliases, and closes after observation.
+The new fixture always proves contention after a real directory rename and
+also proves actual 8.3 contention when an existing ancestor alias is available.
+It reports which case ran; a host without short names still executes the
+physical-identity regression rather than skipping the case.
+
+Repair now delegates each wrapper to Repair-NativeShimContract. Classification,
+installation, verification and the report share the directory transaction, and
+the script counts the returned completed observation. An overlapping real
+repair/publisher fixture pauses after BATCH classification, verifies that the
+EXE publisher cannot proceed, then checks both the repair report and the later
+coherent native generation. The combined 33-case focused smoke, live refresh,
+final full gates and exact-revision post-push audit remain pending.
+
+### Final physical-directory transaction validation
+
+The final33-case native suite and150-case installer suite pass on both Windows
+PowerShell5.1 and PowerShell7. The native run explicitly proves contention
+through an actual8.3 ancestor alias on this workstation, plus the always-run
+physical-directory rename case and overlapping repair/publisher case.
+
+Host-projection preflight at2026-10-20T20:50:00 local reported an ordinary host
+view. Dry-run and final live repair each report165 native companions,6 batch
+wrappers and zero skipped wrappers. Target selection, PATH and the shared
+Python environment remain unchanged.
+
+The full native-physical-final51b gate at2026-10-20T21:10:34 and
+native-physical-final7 at2026-10-20T21:17:05 both pass7 repository checks,
+94 workstation smoke checks,4 optional environment warnings and zero failures.
+All nine suites pass independently and with CI-style in-session parity:
+agentdiscovery21,core27,gatechecks47,installer150,legacydos9,nativeshim33,
+render28,smokelint18,triage31. The earlier native-physical-final51 failure is
+retained: its only failed check was a Markdown extra blank line, since fixed.
+
+Independent read-only review of this production/test snapshot found no actionable
+regression, dead code, leaked handle, broken call or transaction gap within its
+documented cooperating-writer scope. Exact pushed-revision review and CI remain
+the final acceptance steps for N01 through N05.

@@ -150,6 +150,38 @@ fail locally. If you add a test, ask what on this box it is quietly reading.
 
 ## Open items
 
+The current transaction implementation passes33 native and150 installer checks
+on both hosts. Final repair is165 native/6 batch/zero skips. Full gates
+native-physical-final51b (2026-10-20T21:10:34) and native-physical-final7
+(2026-10-20T21:17:05) pass7 checks,94/4/0 smoke and all nine suites with parity.
+The detailed records below preserve each finding's original reproduction.
+Only exact-revision post-push review and CI remain before these items close.
+
+- **N05: Repair can report a stale contract after a concurrent writer changes it.**
+  repair-native-shims.ps1 classifies the CMD outside the installation transaction.
+  A cooperating writer can change a batch contract to an EXE contract before
+  Install-NativeShim acquires ownership. Repair then installs the current native
+  pair but reports the earlier BATCH classification. Hold one directory
+  transaction over classification, installation, validation and the wrapper
+  report. A deterministic overlapping repair/writer regression is pending.
+
+- **N04: Cooperating shim writers can interleave a CMD contract and its native artifacts.**
+  The eight production writer sites call Prepare-NativeShimWrite, publish CMD bytes,
+  and call Install-NativeShim separately. Get-NativeShimLauncher also has no
+  cross-process exclusion across its cache generation check and publication.
+  A per-helper lock alone cannot protect the gaps between these calls. Introduce
+  one shared directory transaction for cooperating writers and cache mutation,
+  with canonical case-normalized identity, bounded waits and abandoned-owner
+  cleanup. Prove actual two-process overlap before claiming serialization.
+  All eight writer sites now use the complete shared directory transaction.
+  The 31-case native suite and 150-case installer suite pass on both hosts,
+  including actual foreign-process timeout, abandoned ownership and overlapping
+  cache publishers. Subsequent review verified that a live directory reached
+  through its existing 8.3 aliases gets a different lexical mutex name.
+  Replace the lexical name with a verified ordinary directory handle identity
+  and prove actual alias contention before closing this item.
+  Live refresh, final full gates and exact-revision audit remain open.
+
 - **N03: A failed cache upgrade can invalidate its owned launcher receipt, audit of 9b9389c.**
   Get-NativeShimLauncher replaces the cached EXE before writing the receipt.
   A reader holding the receipt with FileShare.Read permits ownership validation
@@ -172,7 +204,13 @@ fail locally. If you add a test, ask what on this box it is quietly reading.
   and preflight existing artifacts before a CMD writer changes its contract.
   The 20-case focused suite passes on both PowerShell hosts. Live refresh
   redeployed165 companions; full gates51/7 pass7 checks,94 smoke and all9
-  suites with parity. The follow-up exact-revision post-push audit remains open.
+  suites with parity. Exact-revision audit of 02f2624 found a remaining metadata-only
+  lock failure: deleting the EXE before a locked sidecar leaves an orphan that
+  prevents every retry. A follow-up now acquires DELETE leases on both owned
+  leaves before staging their removal. Metadata-only lock regressions through
+  both writers now pass for read and read/write sharing, including a successful
+  retry after release. The combined 31-case suite passes on both hosts. Full
+  gates and the follow-up exact-revision post-push audit remain open.
 
 - **N02: Orphan metadata is overwritten without ownership, post-push audit of 18adf94.**
   Install-NativeShim checks ownership only when the companion EXE exists; a

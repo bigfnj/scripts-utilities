@@ -26,6 +26,17 @@ executables and orphan cache receipts are refused. Production writers perform
 these ownership checks before changing CMD bytes; a locked companion prevents
 the transition without changing the old CMD contract.
 
+Repository writers use `Write-NativeShim` to hold one directory transaction over
+preparation, CMD bytes and native installation. The mutex uses the ordinary
+directory handle identity, so long names and 8.3 aliases share ownership.
+Cache upgrades and companion
+removal use the same reentrant named mutex. Cooperating processes in the current
+Windows logon session wait at most 15 seconds for ownership; a timeout changes
+no artifacts. An abandoned owner permits acquisition and fresh ownership checks,
+rather than implying that an interrupted publication has been repaired.
+Repair holds classification, installation, validation and each wrapper report
+in the same transaction; its final counters summarize those completed observations.
+
 ## Developer CLI tools
 
 ### gh - GitHub CLI

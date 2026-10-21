@@ -19,6 +19,131 @@
 # Functions only. No side effects on dot-source, so any script can source it just to read or
 # write one wrapper.
 
+function Get-NativeShimMutexName {
+    param([Parameter(Mandatory)][string]$Directory)
+    Assert-NativeShimPath -Path $Directory
+    $api = Get-NativeShimFileApi
+    $canonical = $api::DirectoryIdentity([IO.Path]::GetFullPath($Directory))
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = [BitConverter]::ToString($algorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes($canonical))).Replace('-', '')
+    } finally { $algorithm.Dispose() }
+    return 'Local\DevToolbox.NativeShims.' + $digest
+}
+
+function Invoke-NativeShimMutation {
+    # The same reentrant directory mutex covers cache, companion and whole-CMD
+    # transactions. Only cooperating repository writers participate in this lock.
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][scriptblock]$Action,
+        [ValidateRange(0, 60000)][int]$TimeoutMilliseconds = 15000
+    )
+    $name = Get-NativeShimMutexName -Directory $Directory
+    $mutex = New-Object Threading.Mutex($false, $name)
+    $acquired = $false
+    try {
+        try { $acquired = $mutex.WaitOne($TimeoutMilliseconds) }
+        catch [Threading.AbandonedMutexException] { $acquired = $true }
+        if (-not $acquired) { throw ('Timed out waiting for native shim directory transaction: ' + $Directory) }
+        & $Action
+    } finally {
+        try { if ($acquired) { $mutex.ReleaseMutex() } }
+        finally { $mutex.Dispose() }
+    }
+}
+
+function Write-NativeShim {
+    # Every production CMD writer enters this transaction rather than separating
+    # Prepare, CMD publication and Install into independently locked operations.
+    param([Parameter(Mandatory)][string]$Wrapper, [Parameter(Mandatory)][string]$Body)
+    Assert-NativeShimPath -Path $Wrapper
+    Invoke-NativeShimMutation -Directory (Split-Path -Parent $Wrapper) -Action {
+        Prepare-NativeShimWrite -Wrapper $Wrapper -Body $Body
+        Set-Content -LiteralPath $Wrapper -Value $Body -Encoding ASCII -NoNewline
+        [void](Install-NativeShim -Wrapper $Wrapper)
+    }
+}
+
+function Repair-NativeShimContract {
+    # Classification and its report describe the same state as installation.
+    # The outer script counts completed observations; it never reclassifies them.
+    param([Parameter(Mandatory)][string]$Wrapper, [switch]$DryRun)
+    Assert-NativeShimPath -Path $Wrapper
+    Invoke-NativeShimMutation -Directory (Split-Path -Parent $Wrapper) -Action {
+        $owned = Get-NativeShimCompanionState -Wrapper $Wrapper
+        $configuration = Get-NativeShimConfiguration -Lines @(Get-Content -LiteralPath $Wrapper -Encoding UTF8)
+        $name = [IO.Path]::GetFileName($Wrapper)
+        $base = [IO.Path]::GetFileNameWithoutExtension($Wrapper)
+        if (-not $configuration) {
+            if ($DryRun -and $null -ne $owned) {
+                Write-Host "PLAN remove owned obsolete companion: $base.exe and .shim.json"
+            } elseif (-not $DryRun) {
+                [void](Install-NativeShim -Wrapper $Wrapper)
+                $failure = Test-NativeShim -Wrapper $Wrapper
+                if ($failure) { throw ($name + ': ' + $failure) }
+            }
+            Write-Host ("BATCH " + $name + ": explicit CMD wrapper; no native companion")
+            return 'BATCH'
+        }
+        if ($DryRun) { Write-Host "PLAN $base.exe -> $($configuration.target)" }
+        else {
+            [void](Install-NativeShim -Wrapper $Wrapper)
+            $failure = Test-NativeShim -Wrapper $Wrapper
+            if ($failure) { throw ($name + ': ' + $failure) }
+            Write-Host "OK $base.exe -> $($configuration.target)"
+        }
+        return 'NATIVE'
+    }
+}
+
+function Get-NativeShimCacheState {
+    param([Parameter(Mandatory)][string]$Directory)
+    Invoke-NativeShimMutation -Directory $Directory -Action { Get-NativeShimCacheStateCore -Directory $Directory }
+}
+
+function Get-NativeShimCompanionState {
+    param([Parameter(Mandatory)][string]$Wrapper)
+    Invoke-NativeShimMutation -Directory (Split-Path -Parent $Wrapper) -Action { Get-NativeShimCompanionStateCore -Wrapper $Wrapper }
+}
+
+function Remove-OwnedNativeShim {
+    param([Parameter(Mandatory)][string]$Wrapper)
+    Invoke-NativeShimMutation -Directory (Split-Path -Parent $Wrapper) -Action { Remove-OwnedNativeShimCore -Wrapper $Wrapper }
+}
+
+function Prepare-NativeShimWrite {
+    param([Parameter(Mandatory)][string]$Wrapper, [Parameter(Mandatory)][string]$Body)
+    Invoke-NativeShimMutation -Directory (Split-Path -Parent $Wrapper) -Action { Prepare-NativeShimWriteCore -Wrapper $Wrapper -Body $Body }
+}
+
+function Publish-NativeShimCache {
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][string]$StagedLauncher,
+        [Parameter(Mandatory)][string]$StagedReceipt,
+        [Parameter(Mandatory)][AllowNull()]$ExpectedCache
+    )
+    Invoke-NativeShimMutation -Directory $Directory -Action {
+        Publish-NativeShimCacheCore -Directory $Directory -StagedLauncher $StagedLauncher -StagedReceipt $StagedReceipt -ExpectedCache $ExpectedCache
+    }
+}
+
+function Get-NativeShimLauncher {
+    param([Parameter(Mandatory)][string]$Directory)
+    Invoke-NativeShimMutation -Directory $Directory -Action { Get-NativeShimLauncherCore -Directory $Directory }
+}
+
+function Install-NativeShim {
+    param([Parameter(Mandatory)][string]$Wrapper)
+    Invoke-NativeShimMutation -Directory (Split-Path -Parent $Wrapper) -Action { Install-NativeShimCore -Wrapper $Wrapper }
+}
+
+function Test-NativeShim {
+    param([Parameter(Mandatory)][string]$Wrapper)
+    Invoke-NativeShimMutation -Directory (Split-Path -Parent $Wrapper) -Action { Test-NativeShimCore -Wrapper $Wrapper }
+}
+
 function New-ShimBody {
     <#
         THE one definition of the shim byte shape:  @echo off<CRLF>"<abs target>" %*<CRLF>
@@ -103,7 +228,7 @@ function Get-NativeShimConfiguration {
     return [ordered]@{ schema_version = 1; target = $target; environment = @($environment.ToArray()) }
 }
 
-function Get-NativeShimCacheState {
+function Get-NativeShimCacheStateCore {
     param([Parameter(Mandatory)][string]$Directory)
     $launcher = Join-Path $Directory '.native-shim-launcher.exe'
     $receipt = Join-Path $Directory '.native-shim-launcher.json'
@@ -135,7 +260,7 @@ function Get-NativeShimCacheState {
     }
 }
 
-function Get-NativeShimCompanionState {
+function Get-NativeShimCompanionStateCore {
     # Ownership needs a complete pair, valid metadata and a verified launcher
     # digest. Neither the basename nor a sidecar present alone establishes it.
     param([Parameter(Mandatory)][string]$Wrapper)
@@ -174,18 +299,80 @@ function Get-NativeShimCompanionState {
     [pscustomobject]@{ Executable = $exe; Metadata = $metadata }
 }
 
-function Remove-OwnedNativeShim {
+function Get-NativeShimFileApi {
+    $source = Join-Path $PSScriptRoot 'NativeShimFiles.cs'
+    Assert-NativeShimPath -Path $source
+    $namespace = 'NativeShimFilesV' + (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+    $name = 'DevToolbox.' + $namespace + '.Files'
+    $api = $name -as [type]
+    if ($null -eq $api) {
+        $definition = [IO.File]::ReadAllText($source).Replace('NativeShimFilesTemplate', $namespace)
+        Add-Type -TypeDefinition $definition
+        $api = $name -as [type]
+    }
+    return $api
+}
+
+function Remove-OwnedNativeShimCore {
     param([Parameter(Mandatory)][string]$Wrapper)
     $owned = Get-NativeShimCompanionState -Wrapper $Wrapper
     if ($null -eq $owned) { return $false }
-    # Only these two verified leaf files, never a directory or recursive removal.
-    # Delete the executable first so a partial failure cannot shadow the CMD.
-    Remove-Item -LiteralPath $owned.Executable -Force
-    Remove-Item -LiteralPath $owned.Metadata -Force
+    # Only these two verified leaves. Acquire DELETE access to BOTH before the
+    # first rename; a reader denying deletion must leave the complete pair intact.
+    $api = Get-NativeShimFileApi
+    $token = [guid]::NewGuid().ToString('N')
+    $directory = Split-Path -Parent $Wrapper
+    $entries = @(
+        [pscustomobject]@{ Original = $owned.Executable; Stage = (Join-Path $directory ('.native-shim-remove-' + $token + '.exe')); Hash = ''; Lease = $null },
+        [pscustomobject]@{ Original = $owned.Metadata; Stage = (Join-Path $directory ('.native-shim-remove-' + $token + '.json')); Hash = ''; Lease = $null }
+    )
+    $moved = New-Object 'System.Collections.Generic.List[object]'
+    $complete = $false
+    try {
+        foreach ($entry in $entries) {
+            Assert-NativeShimPath -Path $entry.Stage
+            $entry.Hash = (Get-FileHash -LiteralPath $entry.Original -Algorithm SHA256).Hash
+        }
+        foreach ($entry in $entries) {
+            $entry.Lease = $api::OpenDeleteLease($entry.Original)
+            if ($api::Hash($entry.Lease) -ne $entry.Hash) {
+                throw 'Native companion bytes changed while acquiring removal leases.'
+            }
+        }
+        foreach ($entry in $entries) {
+            [IO.File]::Move($entry.Original, $entry.Stage)
+            $moved.Add($entry)
+        }
+        $complete = $true
+    } catch {
+        $failure = $_
+        $recoveryErrors = New-Object 'System.Collections.Generic.List[string]'
+        for ($i = $moved.Count - 1; $i -ge 0; $i--) {
+            $entry = $moved[$i]
+            try {
+                Assert-NativeShimPath -Path $entry.Stage
+                Assert-NativeShimPath -Path $entry.Original
+                if ($api::Hash($entry.Lease) -ne $entry.Hash) { throw 'Staged companion bytes changed.' }
+                [IO.File]::Move($entry.Stage, $entry.Original)
+            } catch { $recoveryErrors.Add($entry.Stage + ': ' + $_.Exception.Message) }
+        }
+        if ($recoveryErrors.Count) {
+            throw ('Native companion removal failed: ' + $failure.Exception.Message +
+                '. Recovery was blocked; retained owned staged bytes: ' + ($recoveryErrors -join '; '))
+        }
+        throw $failure
+    } finally {
+        foreach ($entry in $entries) {
+            if ($null -ne $entry.Lease) { $entry.Lease.Dispose() }
+        }
+    }
+    if ($complete) {
+        foreach ($entry in $entries) { Remove-NativeShimStagingFile -Path $entry.Stage }
+    }
     return $true
 }
 
-function Prepare-NativeShimWrite {
+function Prepare-NativeShimWriteCore {
     # Called before each CMD writer. Refuse unknown/incomplete artifacts before
     # changing CMD bytes; prepare an upgraded cache or remove obsolete companions first.
     param([Parameter(Mandatory)][string]$Wrapper, [Parameter(Mandatory)][string]$Body)
@@ -222,7 +409,7 @@ function Assert-NativeShimCacheWritable {
     }
 }
 
-function Publish-NativeShimCache {
+function Publish-NativeShimCacheCore {
     # Two files cannot be renamed atomically as a pair. Keep exact owned backups,
     # restore them if the second publication fails, and retain backups if recovery
     # itself is blocked. Only hash-verified files from this attempt may be removed.
@@ -321,7 +508,7 @@ function Publish-NativeShimCache {
     }
 }
 
-function Get-NativeShimLauncher {
+function Get-NativeShimLauncherCore {
     param([Parameter(Mandatory)][string]$Directory)
     Assert-NativeShimPath -Path $Directory
     $source = Join-Path $PSScriptRoot 'NativeShim.cs'
@@ -362,7 +549,7 @@ function Get-NativeShimLauncher {
     return $launcher
 }
 
-function Install-NativeShim {
+function Install-NativeShimCore {
     <#
         Publish native companions for understood EXE contracts, or remove a
         proven owned pair when the wrapper changes to an explicit batch contract.
@@ -401,7 +588,7 @@ function Install-NativeShim {
     return $true
 }
 
-function Test-NativeShim {
+function Test-NativeShimCore {
     # Return a concrete failure string, or null for a healthy/explicit batch-only shim.
     param([Parameter(Mandatory)][string]$Wrapper)
     Assert-NativeShimPath -Path $Wrapper

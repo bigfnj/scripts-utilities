@@ -36,25 +36,9 @@ foreach ($wrapper in Get-ChildItem -LiteralPath $bin -Filter '*.cmd' -File) {
         Write-Host "SKIP $($wrapper.Name): protected, linked or unresolvable path"
         continue
     }
-    $owned = Get-NativeShimCompanionState -Wrapper $wrapper.FullName
-    $configuration = Get-NativeShimConfiguration -Lines @(Get-Content -LiteralPath $wrapper.FullName -Encoding UTF8)
-    if (-not $configuration) {
-        $batch++
-        if ($DryRun -and $null -ne $owned) {
-            Write-Host "PLAN remove owned obsolete companion: $($wrapper.BaseName).exe and .shim.json"
-        } elseif (-not $DryRun) {
-            [void](Install-NativeShim -Wrapper $wrapper.FullName)
-        }
-        Write-Host "BATCH $($wrapper.Name): explicit CMD wrapper; no native companion"
-        continue
-    }
-    if ($DryRun) { Write-Host "PLAN $($wrapper.BaseName).exe -> $($configuration.target)" }
-    else {
-        [void](Install-NativeShim -Wrapper $wrapper.FullName)
-        $failure = Test-NativeShim -Wrapper $wrapper.FullName
-        if ($failure) { throw "$($wrapper.Name): $failure" }
-        Write-Host "OK $($wrapper.BaseName).exe -> $($configuration.target)"
-    }
-    $published++
+    $classification = Repair-NativeShimContract -Wrapper $wrapper.FullName -DryRun:$DryRun
+    if ($classification -eq 'BATCH') { $batch++ }
+    elseif ($classification -eq 'NATIVE') { $published++ }
+    else { throw ('Unexpected native repair classification: ' + $classification) }
 }
 Write-Host "native companions=$published explicit batch wrappers=$batch skipped=$skipped dry_run=$([bool]$DryRun)"

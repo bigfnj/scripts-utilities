@@ -48,6 +48,67 @@ function Read-Probe {
     param($Result)
     $Result.Output.Trim() | ConvertFrom-Json
 }
+function Start-NativeMutationProbe {
+    param(
+        [string]$Mode, [string]$Library, [string]$Directory, [string]$Ready,
+        [string]$Release, [string]$Completed, [string]$Wrapper = '', [string]$BodyFile = ''
+    )
+    $start = New-Object Diagnostics.ProcessStartInfo
+    $start.FileName = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+        (Join-Path $PSScriptRoot 'NativeShimMutationProbe.ps1'), '-Mode', $Mode,
+        '-Library', $Library, '-Directory', $Directory, '-Ready', $Ready,
+        '-Release', $Release, '-Completed', $Completed)
+    if ($Wrapper) { $arguments += @('-Wrapper', $Wrapper) }
+    if ($BodyFile) { $arguments += @('-BodyFile', $BodyFile) }
+    $start.Arguments = (@($arguments | ForEach-Object { '"' + $_ + '"' }) -join ' ')
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $start.EnvironmentVariables['PSModulePath'] = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\Modules'
+    $process = [Diagnostics.Process]::Start($start)
+    [pscustomobject]@{
+        Process = $process
+        Output = $process.StandardOutput.ReadToEndAsync()
+        Error = $process.StandardError.ReadToEndAsync()
+    }
+}
+function Wait-NativeMutationMarker {
+    param($Child, [string]$Path)
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while (-not (Test-Path -LiteralPath $Path)) {
+        if ($Child.Process.HasExited) {
+            throw ('Mutation child exited before its marker: ' + $Child.Error.Result + $Child.Output.Result)
+        }
+        if ($watch.ElapsedMilliseconds -ge 8000) { throw 'Mutation child marker timed out.' }
+        Start-Sleep -Milliseconds 20
+    }
+}
+function Complete-NativeMutationProbe {
+    param($Child)
+    if (-not $Child.Process.WaitForExit(15000)) { throw 'Mutation child did not complete.' }
+    if ($Child.Process.ExitCode -ne 0) { throw ($Child.Error.Result + $Child.Output.Result) }
+}
+function Stop-NativeMutationProbe {
+    param($Child)
+    if ($null -ne $Child) {
+        try {
+            if (-not $Child.Process.HasExited) {
+                $Child.Process.Kill()
+                [void]$Child.Process.WaitForExit(5000)
+            }
+        } finally { $Child.Process.Dispose() }
+    }
+}
+function Test-NativeMutationHandleReleased {
+    param([string]$Name)
+    try {
+        $unexpected = [Threading.Mutex]::OpenExisting($Name)
+        $unexpected.Dispose()
+        return $false
+    } catch [Threading.WaitHandleCannotBeOpenedException] { return $true }
+}
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('native-shim-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $fixture -Force | Out-Null
 $bin = Join-Path $fixture 'bin space'
@@ -385,6 +446,289 @@ $output = transition-probe
                 (Test-Path -LiteralPath $lockedExe) -and (Test-Path -LiteralPath $lockedMetadata)
         } finally { $handle.Dispose() }
     }
+    It 'metadata-only delete locks preserve both owned companions and CMD bytes until a production transition can retry' {
+        . (Join-Path $repoRoot 'lib\ShimPlan.ps1')
+        $tokens = $null
+        $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repoRoot 'scripts\build-devtoolbox.ps1'), [ref]$tokens, [ref]$errors)
+        $function = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'New-CmdWrapper' }, $true)
+        $definition = [scriptblock]::Create($function.Extent.Text)
+        foreach ($writer in @('builder', 'planner')) {
+            foreach ($share in @([IO.FileShare]::Read, [IO.FileShare]::ReadWrite)) {
+                $transitionRoot = Join-Path $fixture ('metadata-lock-' + $writer + '-' + $share)
+                $transitionBin = Join-Path $transitionRoot 'native\bin'
+                New-Item -ItemType Directory -Path $transitionBin -Force | Out-Null
+                $transitionWrapper = Join-Path $transitionBin 'metadata-lock.cmd'
+                Set-Content -LiteralPath $transitionWrapper -Value (New-ShimBody -Target $target) -Encoding ASCII -NoNewline
+                [void](Install-NativeShim -Wrapper $transitionWrapper)
+                $transitionExe = [IO.Path]::ChangeExtension($transitionWrapper, '.exe')
+                $transitionMetadata = [IO.Path]::ChangeExtension($transitionWrapper, '.shim.json')
+                $paths = @($transitionWrapper, $transitionExe, $transitionMetadata)
+                $before = @{}
+                foreach ($path in $paths) { $before[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+                $batchTarget = Join-Path $transitionRoot 'after.cmd'
+                [IO.File]::WriteAllLines($batchTarget, @('@echo off', 'echo metadata-lock retry'), [Text.Encoding]::ASCII)
+                $invokeWriter = {
+                    if ($writer -eq 'builder') {
+                        & {
+                            param($Definition, $Root, $Target)
+                            $DryRun = $false
+                            . $Definition
+                            New-CmdWrapper -Name 'metadata-lock' -Target $Target
+                        } $definition $transitionRoot $batchTarget | Out-Null
+                    } else {
+                        $plan = @{ Write = @([pscustomobject]@{ Name = 'metadata-lock'; Target = $batchTarget; Wrapper = $transitionWrapper; Refresh = $true }) }
+                        Invoke-ShimWrite -Plan $plan -NativeBin $transitionBin | Out-Null
+                    }
+                }
+                $handle = [IO.File]::Open($transitionMetadata, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+                try {
+                    $refused = $false
+                    try { & $invokeWriter } catch { $refused = $_.Exception.Message -match 'delete lease|sharing|used by another process' }
+                    if (-not $refused) { return $false }
+                    foreach ($path in $paths) {
+                        if ($before[$path] -ne (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash) { return $false }
+                    }
+                    [void](Get-NativeShimCompanionState -Wrapper $transitionWrapper)
+                    if (@(Get-ChildItem -LiteralPath $transitionBin -Filter '.native-shim-remove-*').Count) { return $false }
+                } finally { $handle.Dispose() }
+                & $invokeWriter
+                if ([IO.File]::ReadAllText($transitionWrapper) -cne (New-ShimBody -Target $batchTarget) -or
+                    (Test-Path -LiteralPath $transitionExe) -or (Test-Path -LiteralPath $transitionMetadata) -or
+                    $null -ne (Test-NativeShim -Wrapper $transitionWrapper)) { return $false }
+            }
+        }
+        $true
+    }
+    It 'directory mutation names normalize case and dots while real foreign ownership times out without leaking a handle' {
+        $mutexDirectory = Join-Path $fixture 'mutex-timeout'
+        New-Item -ItemType Directory -Path $mutexDirectory -Force | Out-Null
+        $name = Get-NativeShimMutexName -Directory $mutexDirectory
+        $equivalent = $mutexDirectory.ToUpperInvariant() + '\.'
+        if ($name -cne (Get-NativeShimMutexName -Directory $equivalent)) { return $false }
+        $ready = Join-Path $mutexDirectory 'ready.txt'
+        $release = Join-Path $mutexDirectory 'release.txt'
+        $completed = Join-Path $mutexDirectory 'completed.txt'
+        $child = $null
+        try {
+            $child = Start-NativeMutationProbe -Mode Hold -Library (Join-Path $repoRoot 'lib') -Directory $mutexDirectory -Ready $ready -Release $release -Completed $completed
+            Wait-NativeMutationMarker -Child $child -Path $ready
+            $ran = Join-Path $mutexDirectory 'must-not-run.txt'
+            $refused = $false
+            try {
+                Invoke-NativeShimMutation -Directory $equivalent -TimeoutMilliseconds 60 -Action {
+                    [IO.File]::WriteAllText($ran, 'incorrectly entered')
+                }
+            } catch { $refused = $_.Exception.Message -match 'Timed out waiting' }
+            if (-not $refused -or (Test-Path -LiteralPath $ran) -or (Test-Path -LiteralPath $completed)) { return $false }
+            [IO.File]::WriteAllText($release, 'release')
+            Complete-NativeMutationProbe -Child $child
+        } finally { Stop-NativeMutationProbe -Child $child }
+        if (-not (Test-NativeMutationHandleReleased -Name $name)) { return $false }
+        $threw = $false
+        try {
+            Invoke-NativeShimMutation -Directory $mutexDirectory -Action { throw 'isolated transaction exception' }
+        } catch { $threw = $_.Exception.Message -match 'isolated transaction exception' }
+        $threw -and (Test-NativeMutationHandleReleased -Name $name) -and
+            (Invoke-NativeShimMutation -Directory $mutexDirectory -TimeoutMilliseconds 60 -Action { $true })
+    }
+    It 'recovers an actually abandoned foreign mutex and disposes every local acquisition handle' {
+        $mutexDirectory = Join-Path $fixture 'mutex-abandoned'
+        New-Item -ItemType Directory -Path $mutexDirectory -Force | Out-Null
+        $name = Get-NativeShimMutexName -Directory $mutexDirectory
+        $ready = Join-Path $mutexDirectory 'ready.txt'
+        $release = Join-Path $mutexDirectory 'release.txt'
+        $completed = Join-Path $mutexDirectory 'completed.txt'
+        $child = $null
+        $retained = $null
+        try {
+            $child = Start-NativeMutationProbe -Mode Hold -Library (Join-Path $repoRoot 'lib') -Directory $mutexDirectory -Ready $ready -Release $release -Completed $completed
+            Wait-NativeMutationMarker -Child $child -Path $ready
+            # Keep the kernel object alive while its owning process actually exits.
+            $retained = [Threading.Mutex]::OpenExisting($name)
+            $child.Process.Kill()
+            if (-not $child.Process.WaitForExit(5000)) { return $false }
+            if (Test-Path -LiteralPath $completed) { return $false }
+            if (-not (Invoke-NativeShimMutation -Directory $mutexDirectory -TimeoutMilliseconds 60 -Action { $true })) { return $false }
+        } finally {
+            Stop-NativeMutationProbe -Child $child
+            if ($null -ne $retained) { $retained.Dispose() }
+        }
+        Test-NativeMutationHandleReleased -Name $name
+    }
+    It 'two real writers serialize cache preparation CMD publication and native installation as one transaction' {
+        $writerDirectory = Join-Path $fixture 'parallel-writers'
+        New-Item -ItemType Directory -Path $writerDirectory -Force | Out-Null
+        $writerWrapper = Join-Path $writerDirectory 'parallel.cmd'
+        $initialBody = New-ShimBody -Target $target
+        Write-NativeShim -Wrapper $writerWrapper -Body $initialBody
+        $children = @()
+        $contexts = @()
+        try {
+            foreach ($label in @('a', 'b')) {
+                $library = Join-Path $writerDirectory ('publisher-' + $label)
+                New-Item -ItemType Directory -Path $library -Force | Out-Null
+                foreach ($sourceName in @('ShimFormat.ps1', 'SourceFiles.ps1', 'NativeShim.cs', 'NativeShimFiles.cs')) {
+                    Copy-Item -LiteralPath (Join-Path $repoRoot ('lib\' + $sourceName)) -Destination (Join-Path $library $sourceName)
+                }
+                [IO.File]::AppendAllText((Join-Path $library 'NativeShim.cs'), ([Environment]::NewLine + '// isolated publisher ' + $label))
+                $writerTarget = Join-Path $writerDirectory ('target-' + $label + '.exe')
+                Copy-Item -LiteralPath $target -Destination $writerTarget
+                $body = New-ShimBody -Target $writerTarget
+                $bodyFile = Join-Path $writerDirectory ('body-' + $label + '.txt')
+                [IO.File]::WriteAllText($bodyFile, $body, [Text.Encoding]::ASCII)
+                $contexts += [pscustomobject]@{
+                    Library = $library; Body = $body; BodyFile = $bodyFile
+                    Ready = (Join-Path $writerDirectory ('ready-' + $label + '.txt'))
+                    Release = (Join-Path $writerDirectory ('release-' + $label + '.txt'))
+                    Completed = (Join-Path $writerDirectory ('completed-' + $label + '.txt'))
+                    Target = $writerTarget
+                }
+            }
+            $a = $contexts[0]
+            $b = $contexts[1]
+            $first = Start-NativeMutationProbe -Mode WritePaused -Library $a.Library -Directory $writerDirectory -Ready $a.Ready -Release $a.Release -Completed $a.Completed -Wrapper $writerWrapper -BodyFile $a.BodyFile
+            $children += $first
+            Wait-NativeMutationMarker -Child $first -Path $a.Ready
+            $cacheReceipt = Join-Path $writerDirectory '.native-shim-launcher.json'
+            $prepared = [IO.File]::ReadAllText($cacheReceipt)
+            $preparedRecord = $prepared | ConvertFrom-Json
+            if ($preparedRecord.source_sha256 -ne (Get-FileHash -LiteralPath (Join-Path $a.Library 'NativeShim.cs') -Algorithm SHA256).Hash) { return $false }
+            $second = Start-NativeMutationProbe -Mode Write -Library $b.Library -Directory $writerDirectory -Ready $b.Ready -Release $b.Release -Completed $b.Completed -Wrapper $writerWrapper -BodyFile $b.BodyFile
+            $children += $second
+            Wait-NativeMutationMarker -Child $second -Path $b.Ready
+            Start-Sleep -Milliseconds 100
+            if ($second.Process.HasExited -or (Test-Path -LiteralPath $b.Completed) -or
+                [IO.File]::ReadAllText($writerWrapper) -cne $initialBody -or
+                [IO.File]::ReadAllText($cacheReceipt) -cne $prepared) { return $false }
+            [IO.File]::WriteAllText($a.Release, 'release first transaction')
+            Complete-NativeMutationProbe -Child $first
+            Complete-NativeMutationProbe -Child $second
+            if (-not (Test-Path -LiteralPath $a.Completed) -or -not (Test-Path -LiteralPath $b.Completed)) { return $false }
+            $cache = Get-NativeShimCacheState -Directory $writerDirectory
+            $actual = [IO.File]::ReadAllText([IO.Path]::ChangeExtension($writerWrapper, '.shim.json')) | ConvertFrom-Json
+            $valid = & {
+                param($Library, $Wrapper)
+                . (Join-Path $Library 'ShimFormat.ps1')
+                $null -eq (Test-NativeShim -Wrapper $Wrapper)
+            } $b.Library $writerWrapper
+            $valid -and [IO.File]::ReadAllText($writerWrapper) -ceq $b.Body -and $actual.target -ceq $b.Target -and
+                $cache.Record.source_sha256 -eq (Get-FileHash -LiteralPath (Join-Path $b.Library 'NativeShim.cs') -Algorithm SHA256).Hash -and
+                $cache.Record.launcher_sha256 -eq (Get-FileHash -LiteralPath ([IO.Path]::ChangeExtension($writerWrapper, '.exe')) -Algorithm SHA256).Hash -and
+                @(Get-ChildItem -LiteralPath $writerDirectory -Filter '.native-shim-*.before.*').Count -eq 0
+        } finally { foreach ($child in $children) { Stop-NativeMutationProbe -Child $child } }
+    }
+    It 'physical directory identity keeps real rename and available 8.3 aliases under one foreign transaction' {
+        $parent = Join-Path $fixture 'physical-identity'
+        $original = Join-Path $parent 'original-directory'
+        $renamed = Join-Path $parent 'renamed-directory'
+        $peer = Join-Path $parent 'different-directory'
+        New-Item -ItemType Directory -Path $original, $peer -Force | Out-Null
+        $name = Get-NativeShimMutexName -Directory $original
+        if ($name -ceq (Get-NativeShimMutexName -Directory $peer)) { return $false }
+        $ready = Join-Path $parent 'ready.txt'
+        $release = Join-Path $parent 'release.txt'
+        $completed = Join-Path $parent 'completed.txt'
+        $ran = Join-Path $parent 'must-not-run.txt'
+        $child = $null
+        try {
+            $child = Start-NativeMutationProbe -Mode Hold -Library (Join-Path $repoRoot 'lib') -Directory $original -Ready $ready -Release $release -Completed $completed
+            Wait-NativeMutationMarker -Child $child -Path $ready
+            # This is an empty owned fixture directory; both resolved paths must
+            # remain inside the fixture before its same-volume rename.
+            $prefix = [IO.Path]::GetFullPath($fixture).TrimEnd('\') + '\'
+            foreach ($path in @($original, $renamed)) {
+                if (-not [IO.Path]::GetFullPath($path).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+                    throw 'Physical identity fixture escaped its owned root.'
+                }
+            }
+            [IO.Directory]::Move($original, $renamed)
+            if ($name -cne (Get-NativeShimMutexName -Directory $renamed)) { return $false }
+            $refused = $false
+            try {
+                Invoke-NativeShimMutation -Directory $renamed -TimeoutMilliseconds 60 -Action { [IO.File]::WriteAllText($ran, 'incorrect entry') }
+            } catch { $refused = $_.Exception.Message -match 'Timed out waiting' }
+            if (-not $refused -or (Test-Path -LiteralPath $ran)) { return $false }
+            [IO.File]::WriteAllText($release, 'release')
+            Complete-NativeMutationProbe -Child $child
+        } finally { Stop-NativeMutationProbe -Child $child }
+        if ($null -eq ('NativeShimPathProbe' -as [type])) {
+            Add-Type -Path (Join-Path $PSScriptRoot 'NativeShimPathProbe.cs')
+        }
+        $profileLong = [IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\')
+        $profileShort = [NativeShimPathProbe]::ShortPath($profileLong)
+        if ($renamed.StartsWith(($profileLong + '\'), [StringComparison]::OrdinalIgnoreCase)) {
+            # Reuse an existing profile alias even if new fixture 8.3 names are disabled.
+            $alias = $profileShort + $renamed.Substring($profileLong.Length)
+        } else { $alias = [NativeShimPathProbe]::ShortPath($renamed) }
+        if ($alias -ieq $renamed) { $alias = [NativeShimPathProbe]::ShortPath($renamed) }
+        if ($alias -ine $renamed) {
+            if ($name -cne (Get-NativeShimMutexName -Directory $alias)) { return $false }
+            $ready = Join-Path $parent 'alias-ready.txt'
+            $release = Join-Path $parent 'alias-release.txt'
+            $completed = Join-Path $parent 'alias-completed.txt'
+            $child = $null
+            try {
+                $child = Start-NativeMutationProbe -Mode Hold -Library (Join-Path $repoRoot 'lib') -Directory $renamed -Ready $ready -Release $release -Completed $completed
+                Wait-NativeMutationMarker -Child $child -Path $ready
+                $refused = $false
+                try {
+                    Invoke-NativeShimMutation -Directory $alias -TimeoutMilliseconds 60 -Action { [IO.File]::WriteAllText($ran, 'incorrect alias entry') }
+                } catch { $refused = $_.Exception.Message -match 'Timed out waiting' }
+                if (-not $refused -or (Test-Path -LiteralPath $ran)) { return $false }
+                [IO.File]::WriteAllText($release, 'release')
+                Complete-NativeMutationProbe -Child $child
+            } finally { Stop-NativeMutationProbe -Child $child }
+            Write-Host '     actual 8.3 alias contention verified'
+        } else {
+            Write-Host '     no 8.3 alias on this host; physical rename contention verified'
+        }
+        Test-NativeMutationHandleReleased -Name $name
+    }
+    It 'repair classifies installs verifies and reports under the same transaction before a waiting EXE writer proceeds' {
+        $repairScript = Join-Path $repoRoot 'scripts\repair-native-shims.ps1'
+        $ast = [Management.Automation.Language.Parser]::ParseFile($repairScript, [ref]$null, [ref]$null)
+        $calls = @($ast.FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] }, $true))
+        if (@($calls | Where-Object { $_.GetCommandName() -eq 'Repair-NativeShimContract' }).Count -ne 1 -or
+            @($calls | Where-Object { $_.GetCommandName() -eq 'Get-NativeShimConfiguration' }).Count -ne 0) { return $false }
+        $directory = Join-Path $fixture 'repair-overlap'
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+        $repairWrapper = Join-Path $directory 'repair-overlap.cmd'
+        $batchTarget = Join-Path $directory 'initial-batch.cmd'
+        [IO.File]::WriteAllLines($batchTarget, @('@echo off', 'echo original batch'), [Text.Encoding]::ASCII)
+        $initial = New-ShimBody -Target $batchTarget
+        Write-NativeShim -Wrapper $repairWrapper -Body $initial
+        $body = New-ShimBody -Target $target
+        $bodyFile = Join-Path $directory 'next-body.txt'
+        [IO.File]::WriteAllText($bodyFile, $body, [Text.Encoding]::ASCII)
+        $ready = Join-Path $directory 'repair-ready.txt'
+        $release = Join-Path $directory 'repair-release.txt'
+        $completed = Join-Path $directory 'repair-completed.txt'
+        $writerReady = Join-Path $directory 'writer-ready.txt'
+        $writerCompleted = Join-Path $directory 'writer-completed.txt'
+        $repair = $null
+        $writer = $null
+        try {
+            $repair = Start-NativeMutationProbe -Mode RepairPaused -Library (Join-Path $repoRoot 'lib') -Directory $directory -Ready $ready -Release $release -Completed $completed -Wrapper $repairWrapper
+            Wait-NativeMutationMarker -Child $repair -Path $ready
+            $writer = Start-NativeMutationProbe -Mode Write -Library (Join-Path $repoRoot 'lib') -Directory $directory -Ready $writerReady -Release $release -Completed $writerCompleted -Wrapper $repairWrapper -BodyFile $bodyFile
+            Wait-NativeMutationMarker -Child $writer -Path $writerReady
+            Start-Sleep -Milliseconds 100
+            if ($writer.Process.HasExited -or (Test-Path -LiteralPath $writerCompleted) -or
+                [IO.File]::ReadAllText($repairWrapper) -cne $initial -or
+                (Test-Path -LiteralPath ([IO.Path]::ChangeExtension($repairWrapper, '.exe')))) { return $false }
+            [IO.File]::WriteAllText($release, 'release repair classification')
+            Complete-NativeMutationProbe -Child $repair
+            Complete-NativeMutationProbe -Child $writer
+            [IO.File]::ReadAllText($completed) -ceq 'BATCH' -and
+                $repair.Output.Result -match 'BATCH repair-overlap.cmd: explicit CMD wrapper; no native companion' -and
+                [IO.File]::ReadAllText($repairWrapper) -ceq $body -and
+                $null -eq (Test-NativeShim -Wrapper $repairWrapper)
+        } finally {
+            Stop-NativeMutationProbe -Child $repair
+            Stop-NativeMutationProbe -Child $writer
+        }
+    }
     It 'a locked upgrade receipt preserves the owned cache and both production CMD contracts' {
         . (Join-Path $repoRoot 'lib\ShimPlan.ps1')
         $tokens = $null
@@ -397,7 +741,7 @@ $output = transition-probe
             $upgradeBin = Join-Path $upgradeRoot 'native\bin'
             $publisher = Join-Path $upgradeRoot 'publisher'
             New-Item -ItemType Directory -Path $upgradeBin, $publisher -Force | Out-Null
-            foreach ($name in @('ShimFormat.ps1', 'SourceFiles.ps1', 'NativeShim.cs')) {
+            foreach ($name in @('ShimFormat.ps1', 'SourceFiles.ps1', 'NativeShim.cs', 'NativeShimFiles.cs')) {
                 Copy-Item -LiteralPath (Join-Path $repoRoot ('lib\' + $name)) -Destination (Join-Path $publisher $name)
             }
             $passed = & {
