@@ -716,3 +716,38 @@ host-projection check. The complete `native-ownership-final51` and
 zero failures, all9 suites, and in-session parity. Their timestamps are
 2026-10-20T18:56:01 and19:03:24 local time. Exact-revision post-push review
 remains pending.
+
+## Native cache upgrade recovery, audit of 9b9389c
+
+N03 reproduced a source-upgrade failure with a real receipt held open by a
+read-only reader. Ownership validation could read the old receipt, but its
+replacement failed after the cached EXE changed. A production writer could
+also change CMD bytes before discovering the failed upgrade. The original
+20 cases passed while the added locked-upgrade regression failed.
+
+Cache preparation now finishes before either production CMD writer publishes
+new bytes. An unchanged owned cache remains usable under a read-only reader;
+an upgrade checks write access first. The publisher stages the EXE and receipt,
+verifies that ownership has not changed, retains exact backups, and validates
+the published pair. A failed second publication restores only bytes verified
+as belonging to that attempt. Blocked recovery retains the prior bytes and
+reports their paths. Cleanup warnings preserve the original failure.
+
+The focused suite passes 27 cases on Windows PowerShell 5.1 and PowerShell 7.
+The cases cover real locked source upgrades through the launcher and both
+production writers, locks arriving at publication, final-validation failure,
+unchanged-cache reuse, staging aliases, blocked rollback and locked cleanup.
+The deliberate cleanup-lock fixture emits its expected retained-file warning.
+A true .NET null is passed to File.Replace during rollback; PowerShell's null
+would otherwise marshal as an empty backup filename on these hosts.
+
+After a fresh host-projection preflight, live repair refreshed 165 native
+companions and retained 6 batch wrappers, with no skipped wrappers. The C#
+launcher source, target selection, shared Python environment and PATH did not
+change. Both complete gates passed: native-cache-final51 at
+2026-10-20T19:51:01 and native-cache-final7 at 2026-10-20T19:57:18 local time.
+Each recorded 7 repository checks, 94 workstation smoke successes, 4 optional
+environment warnings and zero failures. All nine suites passed independently
+and in the CI-style shared session: agent discovery 21, core 27, gate checks
+47, installer 150, legacy DOS 9, native shim 27, render 28, smoke lint 18 and
+triage 31. Exact-revision post-push review remains pending for N01, N02 and N03.

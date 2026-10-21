@@ -150,6 +150,20 @@ fail locally. If you add a test, ask what on this box it is quietly reading.
 
 ## Open items
 
+- **N03: A failed cache upgrade can invalidate its owned launcher receipt, audit of 9b9389c.**
+  Get-NativeShimLauncher replaces the cached EXE before writing the receipt.
+  A reader holding the receipt with FileShare.Read permits ownership validation
+  but prevents that write, leaving the new EXE paired with the old digest.
+  Prepare-NativeShimWrite currently checks ownership without attempting the
+  upgrade, so a production writer can also change CMD bytes before this failure.
+  Add an isolated locked-receipt source-upgrade regression, stage both cache
+  artifacts with rollback, and complete cache preparation before CMD publication.
+  Fixed with staged publication, verified rollback and cache preparation before CMD
+  publication. Focused tests pass 27 cases on both PowerShell hosts. Live repair
+  refreshed 165 native companions and retained 6 batch wrappers without skips.
+  Both native-cache-final gates pass 7 checks, 94 smoke successes and all 9 suites,
+  including CI-style parity. Exact-revision post-push verification remains open.
+
 - **N01: Native companion survives a contract transition, post-push audit of 18adf94.**
   Install-NativeShim returns early for batch targets or unsupported prologues,
   leaving an existing same-name EXE and sidecar active. Repair only reports BATCH,

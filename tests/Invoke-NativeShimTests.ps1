@@ -385,6 +385,249 @@ $output = transition-probe
                 (Test-Path -LiteralPath $lockedExe) -and (Test-Path -LiteralPath $lockedMetadata)
         } finally { $handle.Dispose() }
     }
+    It 'a locked upgrade receipt preserves the owned cache and both production CMD contracts' {
+        . (Join-Path $repoRoot 'lib\ShimPlan.ps1')
+        $tokens = $null
+        $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repoRoot 'scripts\build-devtoolbox.ps1'), [ref]$tokens, [ref]$errors)
+        $function = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'New-CmdWrapper' }, $true)
+        $definition = [scriptblock]::Create($function.Extent.Text)
+        foreach ($writer in @('launcher', 'builder', 'planner')) {
+            $upgradeRoot = Join-Path $fixture ('locked-cache-' + $writer)
+            $upgradeBin = Join-Path $upgradeRoot 'native\bin'
+            $publisher = Join-Path $upgradeRoot 'publisher'
+            New-Item -ItemType Directory -Path $upgradeBin, $publisher -Force | Out-Null
+            foreach ($name in @('ShimFormat.ps1', 'SourceFiles.ps1', 'NativeShim.cs')) {
+                Copy-Item -LiteralPath (Join-Path $repoRoot ('lib\' + $name)) -Destination (Join-Path $publisher $name)
+            }
+            $passed = & {
+                param($Publisher, $Root, $Bin, $Writer, $Definition, $Target)
+                . (Join-Path $Publisher 'ShimFormat.ps1')
+                $upgradeWrapper = Join-Path $Bin 'upgrade.cmd'
+                Set-Content -LiteralPath $upgradeWrapper -Value (New-ShimBody -Target $Target) -Encoding ASCII -NoNewline
+                [void](Install-NativeShim -Wrapper $upgradeWrapper)
+                $cache = Get-NativeShimCacheState -Directory $Bin
+                $paths = @($upgradeWrapper, $cache.Launcher, $cache.Receipt,
+                    [IO.Path]::ChangeExtension($upgradeWrapper, '.exe'), [IO.Path]::ChangeExtension($upgradeWrapper, '.shim.json'))
+                $before = @{}
+                foreach ($path in $paths) { $before[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+                # This is a real source upgrade in an isolated copied publisher.
+                [IO.File]::AppendAllText((Join-Path $Publisher 'NativeShim.cs'), ([Environment]::NewLine + '// isolated upgrade'))
+                $newTarget = Join-Path $Root 'new target.exe'
+                Copy-Item -LiteralPath $Target -Destination $newTarget
+                $handle = [IO.File]::Open($cache.Receipt, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+                try {
+                    $refused = $false
+                    try {
+                        if ($Writer -eq 'launcher') {
+                            Get-NativeShimLauncher -Directory $Bin | Out-Null
+                        } elseif ($Writer -eq 'builder') {
+                            $DryRun = $false
+                            . $Definition
+                            New-CmdWrapper -Name 'upgrade' -Target $newTarget | Out-Null
+                        } else {
+                            $plan = @{ Write = @([pscustomobject]@{ Name = 'upgrade'; Target = $newTarget; Wrapper = $upgradeWrapper; Refresh = $true }) }
+                            Invoke-ShimWrite -Plan $plan -NativeBin $Bin | Out-Null
+                        }
+                    } catch { $refused = $true }
+                    if (-not $refused) { return $false }
+                    foreach ($path in $paths) {
+                        if ($before[$path] -ne (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash) { return $false }
+                    }
+                    [void](Get-NativeShimCacheState -Directory $Bin)
+                } finally { $handle.Dispose() }
+                # The same upgrade succeeds after the external reader releases it.
+                [void](Install-NativeShim -Wrapper $upgradeWrapper)
+                $null -eq (Test-NativeShim -Wrapper $upgradeWrapper)
+            } $publisher $upgradeRoot $upgradeBin $writer $definition $target
+            if (-not $passed) { return $false }
+        }
+        $true
+    }
+    It 'cache publication restores the exact owned pair on late locks and post-publication validation failure' {
+        foreach ($failure in @('launcher', 'receipt', 'validation')) {
+            $publicationBin = Join-Path $fixture ('cache-rollback-' + $failure)
+            New-Item -ItemType Directory -Path $publicationBin -Force | Out-Null
+            [void](Get-NativeShimLauncher -Directory $publicationBin)
+            $cache = Get-NativeShimCacheState -Directory $publicationBin
+            $beforeLauncher = (Get-FileHash -LiteralPath $cache.Launcher -Algorithm SHA256).Hash
+            $beforeReceipt = (Get-FileHash -LiteralPath $cache.Receipt -Algorithm SHA256).Hash
+            $stagedLauncher = Join-Path $publicationBin '.native-shim-test.exe'
+            $stagedReceipt = Join-Path $publicationBin '.native-shim-test.json'
+            Copy-Item -LiteralPath $cache.Launcher -Destination $stagedLauncher
+            [IO.File]::AppendAllText($stagedLauncher, 'isolated transaction marker')
+            $digest = (Get-FileHash -LiteralPath $stagedLauncher -Algorithm SHA256).Hash
+            if ($failure -eq 'validation') { $digest = ('0' * 64) }
+            $record = [ordered]@{
+                source_sha256 = $cache.Record.source_sha256
+                launcher_sha256 = $digest
+                previous_launcher_sha256 = @($cache.KnownHashes)
+            }
+            [IO.File]::WriteAllText($stagedReceipt, ($record | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
+            $handle = $null
+            if ($failure -ne 'validation') {
+                $lockedPath = if ($failure -eq 'launcher') { $cache.Launcher } else { $cache.Receipt }
+                $handle = [IO.File]::Open($lockedPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            }
+            try {
+                $refused = $false
+                try {
+                    # A lock appearing after Get-NativeShimLauncher's preflight
+                    # must also be safe at the actual two-file publication boundary.
+                    Publish-NativeShimCache -Directory $publicationBin -StagedLauncher $stagedLauncher -StagedReceipt $stagedReceipt -ExpectedCache $cache
+                } catch { $refused = $true }
+                if (-not $refused -or
+                    $beforeLauncher -ne (Get-FileHash -LiteralPath $cache.Launcher -Algorithm SHA256).Hash -or
+                    $beforeReceipt -ne (Get-FileHash -LiteralPath $cache.Receipt -Algorithm SHA256).Hash) { return $false }
+                [void](Get-NativeShimCacheState -Directory $publicationBin)
+                if ((Test-Path -LiteralPath $stagedLauncher) -or (Test-Path -LiteralPath $stagedReceipt) -or
+                    @(Get-ChildItem -LiteralPath $publicationBin -Filter '.native-shim-*.before.*').Count) { return $false }
+            } finally { if ($null -ne $handle) { $handle.Dispose() } }
+        }
+        $true
+    }
+    It 'reuses an unchanged owned cache while its receipt is held by a read-only reader' {
+        $reuseBin = Join-Path $fixture 'cache-read-only-reuse'
+        New-Item -ItemType Directory -Path $reuseBin -Force | Out-Null
+        $launcher = Get-NativeShimLauncher -Directory $reuseBin
+        $cache = Get-NativeShimCacheState -Directory $reuseBin
+        $before = (Get-FileHash -LiteralPath $cache.Receipt -Algorithm SHA256).Hash
+        $handle = [IO.File]::Open($cache.Receipt, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        try {
+            (Get-NativeShimLauncher -Directory $reuseBin) -ceq $launcher -and
+                $before -eq (Get-FileHash -LiteralPath $cache.Receipt -Algorithm SHA256).Hash
+        } finally { $handle.Dispose() }
+    }
+    It 'refuses a stale prepared generation without discarding a healthy cache ownership history' {
+        $generationBin = Join-Path $fixture 'cache-stale-generation'
+        New-Item -ItemType Directory -Path $generationBin -Force | Out-Null
+        [void](Get-NativeShimLauncher -Directory $generationBin)
+        $cache = Get-NativeShimCacheState -Directory $generationBin
+        $stagedLauncher = Join-Path $generationBin '.native-shim-test.exe'
+        $stagedReceipt = Join-Path $generationBin '.native-shim-test.json'
+        Copy-Item -LiteralPath $cache.Launcher -Destination $stagedLauncher
+        Copy-Item -LiteralPath $cache.Receipt -Destination $stagedReceipt
+        # Model another valid publisher generation with an additional known digest.
+        # These are owned synthetic receipt bytes inside the isolated cache only.
+        $newRecord = [ordered]@{
+            source_sha256 = $cache.Record.source_sha256
+            launcher_sha256 = $cache.Record.launcher_sha256
+            previous_launcher_sha256 = @($cache.Record.previous_launcher_sha256) + @('F' * 64)
+        }
+        [IO.File]::WriteAllText($cache.Receipt, ($newRecord | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
+        [void](Get-NativeShimCacheState -Directory $generationBin)
+        $beforeLauncher = (Get-FileHash -LiteralPath $cache.Launcher -Algorithm SHA256).Hash
+        $beforeReceipt = (Get-FileHash -LiteralPath $cache.Receipt -Algorithm SHA256).Hash
+        $refused = $false
+        try {
+            Publish-NativeShimCache -Directory $generationBin -StagedLauncher $stagedLauncher -StagedReceipt $stagedReceipt -ExpectedCache $cache
+        } catch { $refused = $_.Exception.Message -match 'changed while preparing' }
+        $refused -and $beforeLauncher -eq (Get-FileHash -LiteralPath $cache.Launcher -Algorithm SHA256).Hash -and
+            $beforeReceipt -eq (Get-FileHash -LiteralPath $cache.Receipt -Algorithm SHA256).Hash
+    }
+    It 'refuses staging aliases before cleanup can remove any live cache artifact' {
+        $aliasBin = Join-Path $fixture 'cache-stage-aliases'
+        New-Item -ItemType Directory -Path $aliasBin -Force | Out-Null
+        [void](Get-NativeShimLauncher -Directory $aliasBin)
+        $cache = Get-NativeShimCacheState -Directory $aliasBin
+        $beforeLauncher = (Get-FileHash -LiteralPath $cache.Launcher -Algorithm SHA256).Hash
+        $beforeReceipt = (Get-FileHash -LiteralPath $cache.Receipt -Algorithm SHA256).Hash
+        $stage = Join-Path $aliasBin '.native-shim-test.exe'
+        Copy-Item -LiteralPath $cache.Launcher -Destination $stage
+        foreach ($pair in @(
+            @($cache.Launcher, $stage), @($stage, $cache.Receipt), @($stage, $stage)
+        )) {
+            $refused = $false
+            try {
+                Publish-NativeShimCache -Directory $aliasBin -StagedLauncher $pair[0] -StagedReceipt $pair[1] -ExpectedCache $cache
+            } catch { $refused = $_.Exception.Message -match 'alias|distinct' }
+            if (-not $refused -or $beforeLauncher -ne (Get-FileHash -LiteralPath $cache.Launcher -Algorithm SHA256).Hash -or
+                $beforeReceipt -ne (Get-FileHash -LiteralPath $cache.Receipt -Algorithm SHA256).Hash) { return $false }
+        }
+        [void](Get-NativeShimCacheState -Directory $aliasBin)
+        $true
+    }
+    It 'reports blocked rollback under Continue and preserves recoverable prior bytes' {
+        foreach ($existing in @($false, $true)) {
+            $recoveryBin = Join-Path $fixture ('cache-blocked-recovery-' + $existing)
+            New-Item -ItemType Directory -Path $recoveryBin -Force | Out-Null
+            $cache = $null
+            $oldHash = $null
+            if ($existing) {
+                [void](Get-NativeShimLauncher -Directory $recoveryBin)
+                $cache = Get-NativeShimCacheState -Directory $recoveryBin
+                $oldHash = (Get-FileHash -LiteralPath $cache.Launcher -Algorithm SHA256).Hash
+            }
+            $stagedLauncher = Join-Path $recoveryBin '.native-shim-test.exe'
+            $stagedReceipt = Join-Path $recoveryBin '.native-shim-test.json'
+            $seed = Get-NativeShimCacheState -Directory $bin
+            Copy-Item -LiteralPath $seed.Launcher -Destination $stagedLauncher
+            [IO.File]::AppendAllText($stagedLauncher, 'isolated rollback lock')
+            $newRecord = [ordered]@{
+                source_sha256 = $seed.Record.source_sha256
+                launcher_sha256 = (Get-FileHash -LiteralPath $stagedLauncher -Algorithm SHA256).Hash
+                previous_launcher_sha256 = @($seed.KnownHashes)
+            }
+            [IO.File]::WriteAllText($stagedReceipt, ($newRecord | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
+            $outcome = & {
+                param($Directory, $StageExe, $StageReceipt, $Expected)
+                $ErrorActionPreference = 'Continue'
+                $originalReader = (Get-Item -LiteralPath Function:\Get-NativeShimCacheState).ScriptBlock
+                $context = @{ Calls = 0; Handle = $null }
+                function Get-NativeShimCacheState {
+                    param([string]$Directory)
+                    $context.Calls++
+                    if ($context.Calls -eq 2) {
+                        $context.Handle = [IO.File]::Open((Join-Path $Directory '.native-shim-launcher.exe'),
+                            [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+                        throw 'isolated final verification failure'
+                    }
+                    & $originalReader -Directory $Directory
+                }
+                try {
+                    $failure = ''
+                    try {
+                        Publish-NativeShimCache -Directory $Directory -StagedLauncher $StageExe -StagedReceipt $StageReceipt -ExpectedCache $Expected
+                    } catch { $failure = $_.Exception.Message }
+                    $failure -match 'isolated final verification failure' -and $failure -match 'Recovery was blocked' -and
+                        $failure.Contains((Join-Path $Directory '.native-shim-launcher.exe')) -and $context.Calls -eq 2
+                } finally { if ($null -ne $context.Handle) { $context.Handle.Dispose() } }
+            } $recoveryBin $stagedLauncher $stagedReceipt $cache
+            if (-not $outcome) { return $false }
+            $recoveryExe = Join-Path $recoveryBin '.native-shim-launcher.exe'
+            $backups = @(Get-ChildItem -LiteralPath $recoveryBin -Filter '.native-shim-*.before.exe')
+            if ($existing) {
+                if ($backups.Count -ne 1 -or $oldHash -ne (Get-FileHash -LiteralPath $backups[0].FullName -Algorithm SHA256).Hash) { return $false }
+                [IO.File]::Replace($backups[0].FullName, $recoveryExe, [NullString]::Value)
+                [void](Get-NativeShimCacheState -Directory $recoveryBin)
+            } else {
+                if ($backups.Count -ne 0 -or (Test-Path -LiteralPath (Join-Path $recoveryBin '.native-shim-launcher.json'))) { return $false }
+                Remove-Item -LiteralPath $recoveryExe -Force -ErrorAction Stop
+                if ($null -ne (Get-NativeShimCacheState -Directory $recoveryBin)) { return $false }
+            }
+        }
+        $true
+    }
+    It 'a cleanup lock does not mask the original receipt publication failure' {
+        $cleanupBin = Join-Path $fixture 'cache-cleanup-lock'
+        New-Item -ItemType Directory -Path $cleanupBin -Force | Out-Null
+        [void](Get-NativeShimLauncher -Directory $cleanupBin)
+        $cache = Get-NativeShimCacheState -Directory $cleanupBin
+        $stagedLauncher = Join-Path $cleanupBin '.native-shim-test.exe'
+        $stagedReceipt = Join-Path $cleanupBin '.native-shim-test.json'
+        Copy-Item -LiteralPath $cache.Launcher -Destination $stagedLauncher
+        Copy-Item -LiteralPath $cache.Receipt -Destination $stagedReceipt
+        $oldLock = [IO.File]::Open($cache.Receipt, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        $stageLock = [IO.File]::Open($stagedReceipt, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        try {
+            $failure = ''
+            try {
+                Publish-NativeShimCache -Directory $cleanupBin -StagedLauncher $stagedLauncher -StagedReceipt $stagedReceipt -ExpectedCache $cache
+            } catch { $failure = $_.Exception.Message }
+            $failure -match 'Replace' -and (Test-Path -LiteralPath $stagedReceipt) -and
+                $null -ne (Get-NativeShimCacheState -Directory $cleanupBin)
+        } finally { $oldLock.Dispose(); $stageLock.Dispose() }
+    }
     It 'repair dry-run preserves an owned stale pair and apply removes it without changing the batch wrapper or cache' {
         $repairRoot = Join-Path $fixture 'repair-fixture'
         $repairBin = Join-Path $repairRoot 'native\bin'

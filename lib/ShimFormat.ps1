@@ -187,14 +187,137 @@ function Remove-OwnedNativeShim {
 
 function Prepare-NativeShimWrite {
     # Called before each CMD writer. Refuse unknown/incomplete artifacts before
-    # changing CMD bytes; remove owned obsolete companions before a batch switch.
+    # changing CMD bytes; prepare an upgraded cache or remove obsolete companions first.
     param([Parameter(Mandatory)][string]$Wrapper, [Parameter(Mandatory)][string]$Body)
     $owned = Get-NativeShimCompanionState -Wrapper $Wrapper
     $configuration = Get-NativeShimConfiguration -Lines ($Body -split "\r\n")
     if ($null -eq $configuration) {
         if ($null -ne $owned) { [void](Remove-OwnedNativeShim -Wrapper $Wrapper) }
     } else {
-        [void](Get-NativeShimCacheState -Directory (Split-Path -Parent $Wrapper))
+        [void](Get-NativeShimLauncher -Directory (Split-Path -Parent $Wrapper))
+    }
+}
+
+function Remove-NativeShimStagingFile {
+    # Cleanup must not replace a publication/recovery exception. A failed cleanup
+    # retains only the exact owned temporary file and reports its path separately.
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        if (Test-Path -LiteralPath $Path -ErrorAction Stop) {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        }
+    } catch {
+        Write-Warning ("Native cache cleanup retained '{0}': {1}" -f $Path, $_.Exception.Message) -WarningAction Continue
+    }
+}
+
+function Assert-NativeShimCacheWritable {
+    # Check an owned upgrade before compiling or changing either cached artifact.
+    # Read-only readers can allow hashing yet deny the later receipt replacement.
+    param([Parameter(Mandatory)]$Cache)
+    foreach ($path in @($Cache.Launcher, $Cache.Receipt)) {
+        $handle = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite,
+            ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        $handle.Dispose()
+    }
+}
+
+function Publish-NativeShimCache {
+    # Two files cannot be renamed atomically as a pair. Keep exact owned backups,
+    # restore them if the second publication fails, and retain backups if recovery
+    # itself is blocked. Only hash-verified files from this attempt may be removed.
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][string]$StagedLauncher,
+        [Parameter(Mandatory)][string]$StagedReceipt,
+        [Parameter(Mandatory)][AllowNull()]$ExpectedCache
+    )
+    $cache = Get-NativeShimCacheState -Directory $Directory
+    if (($null -eq $cache) -ne ($null -eq $ExpectedCache) -or
+        ($null -ne $cache -and (
+            $cache.Record.source_sha256 -ne $ExpectedCache.Record.source_sha256 -or
+            ($cache.KnownHashes -join ',') -cne ($ExpectedCache.KnownHashes -join ',')))) {
+        throw 'Native launcher cache changed while preparing its upgrade.'
+    }
+    $launcher = Join-Path $Directory '.native-shim-launcher.exe'
+    $receipt = Join-Path $Directory '.native-shim-launcher.json'
+    $token = [guid]::NewGuid().ToString('N')
+    $backupLauncher = Join-Path $Directory ('.native-shim-' + $token + '.before.exe')
+    $backupReceipt = Join-Path $Directory ('.native-shim-' + $token + '.before.json')
+    $destinations = @($launcher, $receipt, $backupLauncher, $backupReceipt)
+    $stagePaths = @([IO.Path]::GetFullPath($StagedLauncher), [IO.Path]::GetFullPath($StagedReceipt))
+    if ($stagePaths[0] -ieq $stagePaths[1]) { throw 'Native cache staging paths must be distinct.' }
+    foreach ($destination in $destinations) {
+        if ($stagePaths -contains [IO.Path]::GetFullPath($destination)) {
+            throw 'Native cache staging must not alias a live artifact or backup.'
+        }
+    }
+    foreach ($path in @($StagedLauncher, $StagedReceipt, $backupLauncher, $backupReceipt)) {
+        Assert-NativeShimPath -Path $path
+        if ((Split-Path -Parent ([IO.Path]::GetFullPath($path))) -ine [IO.Path]::GetFullPath($Directory).TrimEnd('\')) {
+            throw 'Native cache staging must stay in its cache directory.'
+        }
+    }
+    $newHashes = @{}
+    $newHashes[$launcher] = (Get-FileHash -LiteralPath $StagedLauncher -Algorithm SHA256).Hash
+    $newHashes[$receipt] = (Get-FileHash -LiteralPath $StagedReceipt -Algorithm SHA256).Hash
+    $published = New-Object 'System.Collections.Generic.List[string]'
+    $backups = @{ }
+    $keepBackups = $false
+    try {
+        if ($null -ne $cache) {
+            [IO.File]::Replace($StagedLauncher, $launcher, $backupLauncher)
+            $published.Add($launcher)
+            $backups[$launcher] = $backupLauncher
+            [IO.File]::Replace($StagedReceipt, $receipt, $backupReceipt)
+            $published.Add($receipt)
+            $backups[$receipt] = $backupReceipt
+        } else {
+            # Move refuses a destination that appeared after the ownership check.
+            [IO.File]::Move($StagedLauncher, $launcher)
+            $published.Add($launcher)
+            [IO.File]::Move($StagedReceipt, $receipt)
+            $published.Add($receipt)
+        }
+        $verified = Get-NativeShimCacheState -Directory $Directory
+        if ($verified.Record.launcher_sha256 -ne $newHashes[$launcher] -or
+            (Get-FileHash -LiteralPath $receipt -Algorithm SHA256).Hash -ne $newHashes[$receipt]) {
+            throw 'Native cache publication differs from its staged pair.'
+        }
+    } catch {
+        $failure = $_
+        $recoveryErrors = New-Object 'System.Collections.Generic.List[string]'
+        for ($i = $published.Count - 1; $i -ge 0; $i--) {
+            $path = $published[$i]
+            try {
+                Assert-NativeShimPath -Path $path
+                if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $newHashes[$path]) {
+                    throw 'Published bytes changed; refusing to replace unknown contents.'
+                }
+                if ($backups.ContainsKey($path)) {
+                    [IO.File]::Replace($backups[$path], $path, [NullString]::Value)
+                } else {
+                    Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+                }
+            } catch { $recoveryErrors.Add($path + ': ' + $_.Exception.Message) }
+        }
+        if ($recoveryErrors.Count) {
+            $keepBackups = $true
+            $retained = @(@($backupLauncher, $backupReceipt) + @($published.ToArray()) |
+                Where-Object { Test-Path -LiteralPath $_ -ErrorAction SilentlyContinue })
+            throw ("Native cache publication failed: {0}. Recovery was blocked: {1}. Retained recovery artifacts: {2}" -f
+                $failure.Exception.Message, ($recoveryErrors -join '; '), ($retained -join ', '))
+        }
+        throw $failure
+    } finally {
+        foreach ($path in @($StagedLauncher, $StagedReceipt)) {
+            Remove-NativeShimStagingFile -Path $path
+        }
+        if (-not $keepBackups) {
+            foreach ($path in @($backupLauncher, $backupReceipt)) {
+                Remove-NativeShimStagingFile -Path $path
+            }
+        }
     }
 }
 
@@ -204,31 +327,37 @@ function Get-NativeShimLauncher {
     $source = Join-Path $PSScriptRoot 'NativeShim.cs'
     $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
     $launcher = Join-Path $Directory '.native-shim-launcher.exe'
-    $receipt = Join-Path $Directory '.native-shim-launcher.json'
     $previous = @()
     $cache = Get-NativeShimCacheState -Directory $Directory
     if ($null -ne $cache) {
         $previous = @($cache.KnownHashes)
         if ($cache.Record.source_sha256 -eq $sourceHash) { return $launcher }
+        Assert-NativeShimCacheWritable -Cache $cache
     }
     # Windows PowerShell 5.1 already requires this Windows .NET Framework.
     $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
     if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) { throw 'Windows .NET Framework C# compiler is missing.' }
     $temporary = Join-Path $Directory ('.native-shim-' + [guid]::NewGuid().ToString('N') + '.exe')
+    $temporaryReceipt = [IO.Path]::ChangeExtension($temporary, '.json')
     try {
         $output = & $compiler /nologo /target:exe /optimize+ /platform:anycpu /reference:System.Web.Extensions.dll /reference:System.Runtime.Serialization.dll ("/out:" + $temporary) $source
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $temporary -PathType Leaf)) {
             throw "Native shim compilation failed: $($output -join ' ')"
         }
-        Move-Item -LiteralPath $temporary -Destination $launcher -Force
+        if ($sourceHash -ne (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash) {
+            throw 'Native shim source changed during compilation.'
+        }
         $record = [ordered]@{
             source_sha256 = $sourceHash
-            launcher_sha256 = (Get-FileHash -LiteralPath $launcher -Algorithm SHA256).Hash
+            launcher_sha256 = (Get-FileHash -LiteralPath $temporary -Algorithm SHA256).Hash
             previous_launcher_sha256 = @($previous | Select-Object -Unique -First 16)
         }
-        [IO.File]::WriteAllText($receipt, ($record | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($temporaryReceipt, ($record | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
+        Publish-NativeShimCache -Directory $Directory -StagedLauncher $temporary -StagedReceipt $temporaryReceipt -ExpectedCache $cache
     } finally {
-        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+        foreach ($path in @($temporary, $temporaryReceipt)) {
+            Remove-NativeShimStagingFile -Path $path
+        }
     }
     return $launcher
 }
