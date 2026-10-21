@@ -592,6 +592,7 @@ function Invoke-ShimWrite {
         [scriptblock]$FileExists = { param($p) Test-Path -LiteralPath $p -PathType Leaf },
         [scriptblock]$WriteFile = {
             param($p, $body)
+            Prepare-NativeShimWrite -Wrapper $p -Body $body
             Set-Content -LiteralPath $p -Value $body -Encoding ASCII -NoNewline
             [void](Install-NativeShim -Wrapper $p)
         }

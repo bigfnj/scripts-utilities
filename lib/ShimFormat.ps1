@@ -103,6 +103,101 @@ function Get-NativeShimConfiguration {
     return [ordered]@{ schema_version = 1; target = $target; environment = @($environment.ToArray()) }
 }
 
+function Get-NativeShimCacheState {
+    param([Parameter(Mandatory)][string]$Directory)
+    $launcher = Join-Path $Directory '.native-shim-launcher.exe'
+    $receipt = Join-Path $Directory '.native-shim-launcher.json'
+    Assert-NativeShimPath -Path $launcher
+    Assert-NativeShimPath -Path $receipt
+    $launcherItem = Get-Item -LiteralPath $launcher -ErrorAction SilentlyContinue
+    $receiptItem = Get-Item -LiteralPath $receipt -ErrorAction SilentlyContinue
+    if ($null -eq $launcherItem -and $null -eq $receiptItem) { return $null }
+    if ($null -eq $launcherItem -or $null -eq $receiptItem) { throw 'Refusing an incomplete/orphan native launcher cache.' }
+    if ($launcherItem.PSIsContainer -or $receiptItem.PSIsContainer) { throw 'Native launcher cache artifacts must be ordinary files.' }
+    $record = Get-Content -LiteralPath $receipt -Raw -Encoding UTF8 | ConvertFrom-Json
+    $names = @($record.PSObject.Properties.Name)
+    if ($names.Count -ne 3 -or $names -notcontains 'source_sha256' -or $names -notcontains 'launcher_sha256' -or
+        $names -notcontains 'previous_launcher_sha256' -or $record.source_sha256 -isnot [string] -or
+        $record.source_sha256 -notmatch '^[0-9a-fA-F]{64}$' -or $record.launcher_sha256 -isnot [string] -or
+        $record.launcher_sha256 -notmatch '^[0-9a-fA-F]{64}$' -or $record.previous_launcher_sha256 -isnot [array] -or
+        $record.previous_launcher_sha256.Count -gt 16) { throw 'Native launcher ownership receipt is malformed.' }
+    foreach ($digest in $record.previous_launcher_sha256) {
+        if ($digest -isnot [string] -or $digest -notmatch '^[0-9a-fA-F]{64}$') { throw 'Native launcher ownership history is malformed.' }
+    }
+    if ($record.launcher_sha256 -ne (Get-FileHash -LiteralPath $launcher -Algorithm SHA256).Hash) {
+        throw 'Native launcher cache bytes differ from its ownership receipt.'
+    }
+    [pscustomobject]@{
+        Launcher = $launcher
+        Receipt = $receipt
+        Record = $record
+        KnownHashes = @([string]$record.launcher_sha256) + @($record.previous_launcher_sha256)
+    }
+}
+
+function Get-NativeShimCompanionState {
+    # Ownership needs a complete pair, valid metadata and a verified launcher
+    # digest. Neither the basename nor a sidecar present alone establishes it.
+    param([Parameter(Mandatory)][string]$Wrapper)
+    Assert-NativeShimPath -Path $Wrapper
+    $exe = [IO.Path]::ChangeExtension($Wrapper, '.exe')
+    $metadata = [IO.Path]::ChangeExtension($Wrapper, '.shim.json')
+    Assert-NativeShimPath -Path $exe
+    Assert-NativeShimPath -Path $metadata
+    $exeItem = Get-Item -LiteralPath $exe -ErrorAction SilentlyContinue
+    $metadataItem = Get-Item -LiteralPath $metadata -ErrorAction SilentlyContinue
+    if ($null -eq $exeItem -and $null -eq $metadataItem) { return $null }
+    if ($null -eq $exeItem -or $null -eq $metadataItem) {
+        throw 'Refusing an incomplete/orphan companion pair, executable or metadata not owned by the shim publisher.'
+    }
+    if ($exeItem.PSIsContainer -or $metadataItem.PSIsContainer) { throw 'Native companion artifacts must be ordinary files.' }
+    $cache = Get-NativeShimCacheState -Directory (Split-Path -Parent $Wrapper)
+    if ($null -eq $cache -or $cache.KnownHashes -notcontains (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash) {
+        throw 'Refusing executable bytes not owned by the shim publisher.'
+    }
+    $document = Get-Content -LiteralPath $metadata -Raw -Encoding UTF8 | ConvertFrom-Json
+    $names = @($document.PSObject.Properties.Name)
+    if ($names.Count -ne 3 -or $names -notcontains 'schema_version' -or $names -notcontains 'target' -or
+        $names -notcontains 'environment' -or ($document.schema_version -isnot [int] -and $document.schema_version -isnot [long]) -or
+        $document.schema_version -ne 1 -or $document.target -isnot [string] -or $document.environment -isnot [array]) {
+        throw 'Native companion metadata is malformed, refusing to infer ownership.'
+    }
+    $prologue = @()
+    foreach ($entry in $document.environment) {
+        $fields = @($entry.PSObject.Properties.Name)
+        if ($fields.Count -ne 2 -or $fields -notcontains 'name' -or $fields -notcontains 'value' -or
+            $entry.name -isnot [string] -or $entry.value -isnot [string]) { throw 'Native companion environment metadata is malformed.' }
+        $prologue += ('set "' + $entry.name + '=' + $entry.value + '"')
+    }
+    $body = New-ShimBody -Target $document.target -Prologue $prologue
+    if ($null -eq (Get-NativeShimConfiguration -Lines ($body -split "\r\n"))) { throw 'Native companion metadata has an unsupported contract.' }
+    [pscustomobject]@{ Executable = $exe; Metadata = $metadata }
+}
+
+function Remove-OwnedNativeShim {
+    param([Parameter(Mandatory)][string]$Wrapper)
+    $owned = Get-NativeShimCompanionState -Wrapper $Wrapper
+    if ($null -eq $owned) { return $false }
+    # Only these two verified leaf files, never a directory or recursive removal.
+    # Delete the executable first so a partial failure cannot shadow the CMD.
+    Remove-Item -LiteralPath $owned.Executable -Force
+    Remove-Item -LiteralPath $owned.Metadata -Force
+    return $true
+}
+
+function Prepare-NativeShimWrite {
+    # Called before each CMD writer. Refuse unknown/incomplete artifacts before
+    # changing CMD bytes; remove owned obsolete companions before a batch switch.
+    param([Parameter(Mandatory)][string]$Wrapper, [Parameter(Mandatory)][string]$Body)
+    $owned = Get-NativeShimCompanionState -Wrapper $Wrapper
+    $configuration = Get-NativeShimConfiguration -Lines ($Body -split "\r\n")
+    if ($null -eq $configuration) {
+        if ($null -ne $owned) { [void](Remove-OwnedNativeShim -Wrapper $Wrapper) }
+    } else {
+        [void](Get-NativeShimCacheState -Directory (Split-Path -Parent $Wrapper))
+    }
+}
+
 function Get-NativeShimLauncher {
     param([Parameter(Mandatory)][string]$Directory)
     Assert-NativeShimPath -Path $Directory
@@ -110,21 +205,13 @@ function Get-NativeShimLauncher {
     $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
     $launcher = Join-Path $Directory '.native-shim-launcher.exe'
     $receipt = Join-Path $Directory '.native-shim-launcher.json'
-    Assert-NativeShimPath -Path $launcher
-    Assert-NativeShimPath -Path $receipt
     $previous = @()
-    if ((Test-Path -LiteralPath $launcher -PathType Leaf) -and -not (Test-Path -LiteralPath $receipt -PathType Leaf)) {
-        throw 'Refusing to replace an unowned native launcher cache.'
+    $cache = Get-NativeShimCacheState -Directory $Directory
+    if ($null -ne $cache) {
+        $previous = @($cache.KnownHashes)
+        if ($cache.Record.source_sha256 -eq $sourceHash) { return $launcher }
     }
-    if ((Test-Path -LiteralPath $launcher -PathType Leaf) -and (Test-Path -LiteralPath $receipt -PathType Leaf)) {
-        $old = Get-Content -LiteralPath $receipt -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($old.launcher_sha256 -ne (Get-FileHash -LiteralPath $launcher -Algorithm SHA256).Hash) { throw 'Native launcher cache bytes differ from its ownership receipt.' }
-        $previous = @([string]$old.launcher_sha256)
-        if (@($old.PSObject.Properties.Name) -contains 'previous_launcher_sha256') { $previous += @($old.previous_launcher_sha256) }
-        if ($old.source_sha256 -eq $sourceHash) { return $launcher }
-    }
-    # Windows PowerShell 5.1 already requires this Windows .NET Framework. No SDK,
-    # package download, global compiler install, PATH or Python environment change.
+    # Windows PowerShell 5.1 already requires this Windows .NET Framework.
     $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
     if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) { throw 'Windows .NET Framework C# compiler is missing.' }
     $temporary = Join-Path $Directory ('.native-shim-' + [guid]::NewGuid().ToString('N') + '.exe')
@@ -148,42 +235,32 @@ function Get-NativeShimLauncher {
 
 function Install-NativeShim {
     <#
-        Publish a companion only for an understood EXE-backed .cmd. The .cmd stays
-        byte-identical for explicit cmd/POSIX consumers. Bare PowerShell selects
-        the adjacent .exe and never sends arguments through the cmd parser.
-        This function does not install packages or alter target selection/PATH.
+        Publish native companions for understood EXE contracts, or remove a
+        proven owned pair when the wrapper changes to an explicit batch contract.
+        No target selection, package installation or PATH changes.
     #>
     param([Parameter(Mandatory)][string]$Wrapper)
     Assert-NativeShimPath -Path $Wrapper
     $lines = @(Get-Content -LiteralPath $Wrapper -Encoding UTF8)
     $configuration = Get-NativeShimConfiguration -Lines $lines
-    if (-not $configuration) { return $false }
+    if (-not $configuration) {
+        [void](Remove-OwnedNativeShim -Wrapper $Wrapper)
+        return $false
+    }
+    # Refuse incomplete pairs before a sidecar or launcher can be overwritten.
+    [void](Get-NativeShimCompanionState -Wrapper $Wrapper)
     $directory = Split-Path -Parent $Wrapper
     $exe = [IO.Path]::ChangeExtension($Wrapper, '.exe')
     $metadata = [IO.Path]::ChangeExtension($Wrapper, '.shim.json')
-    Assert-NativeShimPath -Path $exe
-    Assert-NativeShimPath -Path $metadata
     $target = [IO.Path]::GetFullPath([string]$configuration.target)
     Assert-NativeShimPath -Path $target
-    if ($target -ieq [IO.Path]::GetFullPath($exe) -or
-        (Test-Path -LiteralPath ([IO.Path]::ChangeExtension($target, '.shim.json')))) { throw 'Native shim chains and self targets are refused.' }
-    if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { throw "Native shim target is missing: $target" }
-    if (Test-Path -LiteralPath $exe) {
-        $cacheReceipt = Join-Path $directory '.native-shim-launcher.json'
-        Assert-NativeShimPath -Path $cacheReceipt
-        if (-not (Test-Path -LiteralPath $metadata -PathType Leaf) -or -not (Test-Path -LiteralPath $cacheReceipt -PathType Leaf)) {
-            throw "Refusing to overwrite an executable not owned by the shim publisher: $exe"
-        }
-        $owned = Get-Content -LiteralPath $cacheReceipt -Raw -Encoding UTF8 | ConvertFrom-Json
-        $knownHashes = @([string]$owned.launcher_sha256)
-        if (@($owned.PSObject.Properties.Name) -contains 'previous_launcher_sha256') { $knownHashes += @($owned.previous_launcher_sha256) }
-        if ($knownHashes -notcontains (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash) {
-            throw "Refusing to overwrite executable bytes not owned by the shim publisher: $exe"
-        }
+    $targetMetadata = [IO.Path]::ChangeExtension($target, '.shim.json')
+    Assert-NativeShimPath -Path $targetMetadata
+    if ($target -ieq [IO.Path]::GetFullPath($exe) -or (Test-Path -LiteralPath $targetMetadata)) {
+        throw 'Native shim chains and self targets are refused.'
     }
+    if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { throw "Native shim target is missing: $target" }
     $launcher = Get-NativeShimLauncher -Directory $directory
-    # Metadata is published first. A missing companion cannot be selected and an
-    # already-published companion sees the new complete JSON in one rename.
     $temporary = $metadata + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
     try {
         [IO.File]::WriteAllText($temporary, ($configuration | ConvertTo-Json -Depth 4 -Compress), (New-Object Text.UTF8Encoding($false)))
@@ -201,7 +278,13 @@ function Test-NativeShim {
     Assert-NativeShimPath -Path $Wrapper
     $expected = Get-NativeShimConfiguration -Lines @(Get-Content -LiteralPath $Wrapper -Encoding UTF8)
     if (-not $expected) {
-        if (Test-Path -LiteralPath ([IO.Path]::ChangeExtension($Wrapper, '.shim.json'))) { return 'an unsupported batch contract still has native companion metadata' }
+        $batchExe = [IO.Path]::ChangeExtension($Wrapper, '.exe')
+        $batchMetadata = [IO.Path]::ChangeExtension($Wrapper, '.shim.json')
+        Assert-NativeShimPath -Path $batchExe
+        Assert-NativeShimPath -Path $batchMetadata
+        if ((Test-Path -LiteralPath $batchExe) -or (Test-Path -LiteralPath $batchMetadata)) {
+            return 'an unsupported batch contract is still shadowed by a companion artifact'
+        }
         return $null
     }
     $exe = [IO.Path]::ChangeExtension($Wrapper, '.exe')

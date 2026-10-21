@@ -20,6 +20,11 @@ then check host projection and apply without `-DryRun`. The migration adds
 companions, preserves the original wrappers and never installs tools or changes
 PATH. Only literal EXE targets with SETLOCAL and ordinary quoted SET assignments
 are translated; control flow and special CMD substitutions remain batch-only.
+When a contract becomes batch-only, repair removes only a verified owned native
+EXE and sidecar. Dry-run reports that removal. Incomplete pairs, unrelated
+executables and orphan cache receipts are refused. Production writers perform
+these ownership checks before changing CMD bytes; a locked companion prevents
+the transition without changing the old CMD contract.
 
 ## Developer CLI tools
 

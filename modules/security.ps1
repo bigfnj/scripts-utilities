@@ -247,6 +247,7 @@ function security_install_debugger {
             # dropping it would append a THIRD line. Proven byte-identical on a TEMP fixture for
             # all four writers, and the live native\bin\windbg.cmd on this box - the only one of
             # the four whose target is installed - reproduces at 80 B exactly.
+            Prepare-NativeShimWrite -Wrapper (Join-Path $binDir "windbg.cmd") -Body (New-ShimBody -Target $dbg)
             New-ShimBody -Target $dbg | Set-Content -Path (Join-Path $binDir "windbg.cmd") -Encoding ASCII -NoNewline
             [void](Install-NativeShim -Wrapper (Join-Path $binDir "windbg.cmd"))
             Write-Ok "windbg -> $dbg"
@@ -359,6 +360,7 @@ function security_install_ghidra {
                 # -NoNewline: see the note at the windbg writer above. Measured both branches on a
                 # TEMP fixture - 132 B with a JDK, 61 B without - against what the old expression
                 # emitted: identical, byte for byte.
+                Prepare-NativeShimWrite -Wrapper (Join-Path $binDir "$name.cmd") -Body (New-ShimBody -Target $target -Prologue $jdkPrologue)
                 New-ShimBody -Target $target -Prologue $jdkPrologue |
                     Set-Content -Path (Join-Path $binDir "$name.cmd") -Encoding ASCII -NoNewline
                 [void](Install-NativeShim -Wrapper (Join-Path $binDir "$name.cmd"))
@@ -473,6 +475,7 @@ function security_wrap_poolmon {
         Write-Info "[DRY-RUN] wrapper poolmon -> $poolmonPath"
     } else {
         # -NoNewline: see the note at the windbg writer. Measured identical at 91 B.
+        Prepare-NativeShimWrite -Wrapper (Join-Path $binDir "poolmon.cmd") -Body (New-ShimBody -Target $poolmonPath)
         New-ShimBody -Target $poolmonPath | Set-Content -Path (Join-Path $binDir "poolmon.cmd") -Encoding ASCII -NoNewline
         [void](Install-NativeShim -Wrapper (Join-Path $binDir "poolmon.cmd"))
         Write-Ok "poolmon -> $poolmonPath"
@@ -537,6 +540,7 @@ function security_install_console_debuggers {
             Write-Info "[DRY-RUN] wrapper $tool -> $src"
         } else {
             # -NoNewline: see the note at the windbg writer. Measured identical at 78 B for cdb.
+            Prepare-NativeShimWrite -Wrapper (Join-Path $binDir "$tool.cmd") -Body (New-ShimBody -Target $src)
             New-ShimBody -Target $src | Set-Content -Path (Join-Path $binDir "$tool.cmd") -Encoding ASCII -NoNewline
             [void](Install-NativeShim -Wrapper (Join-Path $binDir "$tool.cmd"))
             Write-Ok "$tool -> $src"

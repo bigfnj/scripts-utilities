@@ -688,3 +688,31 @@ resolver already selects one candidate. A new helper was unnecessary.
 Run `scripts/repair-native-shims.ps1 -DryRun` before migrating an older toolbox.
 Use `scripts/refresh-agent-discovery.ps1` to update only managed discovery blocks.
 No dependency installation, global Python change or PATH rewrite is needed.
+
+## Native companion transitions and orphan ownership, audit of 18adf94
+
+The post-push audit found two gaps, tracked as N01 and N02 in BACKLOG.md.
+A batch-only transition retained the old native companion, and a sidecar or
+cache receipt present alone could be overwritten without proving ownership.
+Five new regression cases reproduced those failures while the original 13
+cases passed.
+
+The shared ownership checks now require complete ordinary-file pairs, valid
+metadata and a verified cached launcher digest. Orphan artifacts are refused.
+Production writers remove owned obsolete companions before changing CMD bytes,
+so a locked executable or unknown artifact leaves the previous CMD contract
+intact. Repair reports removal in dry-run and performs the same owned cleanup
+when applied. Original wrappers, selected targets, PATH and package files are
+preserved by repair.
+
+The expanded focused suite passes 20 cases on PowerShell 5.1 and 7, including
+real bare-name batch invocation, unsupported initialization, locked-file
+refusal, unchanged orphan bytes, and repair dry-run/apply against an isolated
+temporary toolbox. The nested 5.1 fixture uses inbox 5.1 modules because .NET
+ProcessStartInfo does not perform PS7's native-command module-path adjustment.
+Live refresh redeployed165 companions and retained6 batch wrappers after a fresh
+host-projection check. The complete `native-ownership-final51` and
+`native-ownership-final7` gates pass7 checks,94 workstation smoke checks with
+zero failures, all9 suites, and in-session parity. Their timestamps are
+2026-10-20T18:56:01 and19:03:24 local time. Exact-revision post-push review
+remains pending.

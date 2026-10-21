@@ -21,6 +21,12 @@ function Invoke-Probe {
     $start.FileName = $Exe
     $start.Arguments = $Raw
     $start.UseShellExecute = $false
+    # ProcessStartInfo bypasses PS7's native-command compatibility adjustment
+    # for powershell.exe. Keep this no-profile 5.1 fixture on inbox 5.1 modules,
+    # so a nested legacy shell does not attempt to import PS7's Utility module.
+    if ([IO.Path]::GetFileName($Exe) -ieq 'powershell.exe') {
+        $start.EnvironmentVariables['PSModulePath'] = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\Modules'
+    }
     $start.CreateNoWindow = $true
     $start.WorkingDirectory = $Directory
     $start.RedirectStandardInput = $true
@@ -239,6 +245,182 @@ $wrappedCode = $LASTEXITCODE
         [IO.File]::WriteAllText($forged, '{"schema_version":1,"target":"C:\\absent.exe","environment":[]}')
         try { Install-NativeShim -Wrapper $other; $false } catch { $_.Exception.Message -match 'bytes not owned' }
     }
+    It 'removes owned EXE companions when the target changes to batch and bare invocation uses the new target' {
+        $transition = Join-Path $bin 'transition-probe.cmd'
+        $transitionExe = [IO.Path]::ChangeExtension($transition, '.exe')
+        $transitionMetadata = [IO.Path]::ChangeExtension($transition, '.shim.json')
+        Set-Content -LiteralPath $transition -Value (New-ShimBody -Target $target) -Encoding ASCII -NoNewline
+        [void](Install-NativeShim -Wrapper $transition)
+        $batchTarget = Join-Path $fixture 'transition target.cmd'
+        [IO.File]::WriteAllLines($batchTarget, @('@echo off', 'echo transition batch target'), [Text.Encoding]::ASCII)
+        Set-Content -LiteralPath $transition -Value (New-ShimBody -Target $batchTarget) -Encoding ASCII -NoNewline
+        if (Install-NativeShim -Wrapper $transition) { return $false }
+        if ((Test-Path -LiteralPath $transitionExe) -or (Test-Path -LiteralPath $transitionMetadata)) { return $false }
+        if ($null -ne (Test-NativeShim -Wrapper $transition)) { return $false }
+        $driver = Join-Path $fixture 'transition-driver.ps1'
+        $code = @'
+$env:PATH = $env:SU_SHIM_TRANSITION_BIN + ';' + $env:PATH
+$resolved = (Get-Command transition-probe).Source
+$output = transition-probe
+[ordered]@{ resolved = $resolved; output = $output; code = $LASTEXITCODE } | ConvertTo-Json -Compress
+'@
+        [IO.File]::WriteAllText($driver, $code, (New-Object Text.UTF8Encoding($true)))
+        $saved = $env:SU_SHIM_TRANSITION_BIN
+        try {
+            $env:SU_SHIM_TRANSITION_BIN = $bin
+            $result = Invoke-Probe -Exe (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -Raw ('-NoProfile -File "' + $driver + '"') -InputText ''
+            $capture = Read-Probe $result
+            $result.ExitCode -eq 0 -and $capture.resolved -ieq $transition -and
+                $capture.output -ceq 'transition batch target' -and $capture.code -eq 0 -and
+                -not (Install-NativeShim -Wrapper $transition)
+        } finally { [Environment]::SetEnvironmentVariable('SU_SHIM_TRANSITION_BIN', $saved, 'Process') }
+    }
+    It 'removes owned EXE companions for unsupported prologues and executes their initialization' {
+        $transition = Join-Path $bin 'prologue-probe.cmd'
+        Set-Content -LiteralPath $transition -Value (New-ShimBody -Target $target) -Encoding ASCII -NoNewline
+        [void](Install-NativeShim -Wrapper $transition)
+        $changed = New-ShimBody -Target $target -Prologue @('echo initialization sentinel')
+        Set-Content -LiteralPath $transition -Value $changed -Encoding ASCII -NoNewline
+        if (Install-NativeShim -Wrapper $transition) { return $false }
+        if ((Test-Path -LiteralPath ([IO.Path]::ChangeExtension($transition, '.exe'))) -or
+            (Test-Path -LiteralPath ([IO.Path]::ChangeExtension($transition, '.shim.json')))) { return $false }
+        $result = Invoke-Probe -Exe (Join-Path $env:WINDIR 'System32\cmd.exe') -Raw ('/d /s /c ""' + $transition + '""') -InputText ''
+        $result.ExitCode -eq 0 -and $result.Output.StartsWith('initialization sentinel') -and
+            [IO.File]::ReadAllText($transition) -ceq $changed
+    }
+    It 'refuses orphan companion metadata without changing it or publishing an executable' {
+        $orphan = Join-Path $bin 'orphan-probe.cmd'
+        $orphanMetadata = [IO.Path]::ChangeExtension($orphan, '.shim.json')
+        Set-Content -LiteralPath $orphan -Value (New-ShimBody -Target $target) -Encoding ASCII -NoNewline
+        Copy-Item -LiteralPath $metadata -Destination $orphanMetadata
+        $before = (Get-FileHash -LiteralPath $orphanMetadata -Algorithm SHA256).Hash
+        $refused = $false
+        try { Install-NativeShim -Wrapper $orphan | Out-Null } catch { $refused = $_.Exception.Message -match 'orphan|incomplete' }
+        $refused -and $before -eq (Get-FileHash -LiteralPath $orphanMetadata -Algorithm SHA256).Hash -and
+            -not (Test-Path -LiteralPath ([IO.Path]::ChangeExtension($orphan, '.exe')))
+    }
+    It 'refuses either orphan cache artifact before compiling or changing its bytes' {
+        foreach ($which in @('receipt', 'executable')) {
+            $cacheDirectory = Join-Path $fixture ('orphan-cache-' + $which)
+            New-Item -ItemType Directory -Path $cacheDirectory -Force | Out-Null
+            $cacheExe = Join-Path $cacheDirectory '.native-shim-launcher.exe'
+            $cacheReceipt = Join-Path $cacheDirectory '.native-shim-launcher.json'
+            if ($which -eq 'receipt') {
+                Copy-Item -LiteralPath (Join-Path $bin '.native-shim-launcher.json') -Destination $cacheReceipt
+                $retained = $cacheReceipt
+                $absent = $cacheExe
+            } else {
+                Copy-Item -LiteralPath $target -Destination $cacheExe
+                $retained = $cacheExe
+                $absent = $cacheReceipt
+            }
+            $before = (Get-FileHash -LiteralPath $retained -Algorithm SHA256).Hash
+            $refused = $false
+            try { Get-NativeShimLauncher -Directory $cacheDirectory | Out-Null } catch { $refused = $_.Exception.Message -match 'orphan|incomplete|unowned' }
+            if (-not $refused -or $before -ne (Get-FileHash -LiteralPath $retained -Algorithm SHA256).Hash -or
+                (Test-Path -LiteralPath $absent)) { return $false }
+        }
+        $true
+    }
+    It 'production writers refuse unknown transition artifacts before changing existing CMD bytes' {
+        . (Join-Path $repoRoot 'lib\ShimPlan.ps1')
+        $tokens = $null
+        $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repoRoot 'scripts\build-devtoolbox.ps1'), [ref]$tokens, [ref]$errors)
+        $function = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'New-CmdWrapper' }, $true)
+        $definition = [scriptblock]::Create($function.Extent.Text)
+        foreach ($writer in @('builder', 'planner')) {
+            $writerRoot = Join-Path $fixture ('unknown-transition-' + $writer)
+            $writerBin = Join-Path $writerRoot 'native\bin'
+            New-Item -ItemType Directory -Path $writerBin -Force | Out-Null
+            $writerWrapper = Join-Path $writerBin 'unknown.cmd'
+            Set-Content -LiteralPath $writerWrapper -Value (New-ShimBody -Target $target) -Encoding ASCII -NoNewline
+            Copy-Item -LiteralPath $target -Destination ([IO.Path]::ChangeExtension($writerWrapper, '.exe'))
+            $before = (Get-FileHash -LiteralPath $writerWrapper -Algorithm SHA256).Hash
+            $refused = $false
+            try {
+                if ($writer -eq 'builder') {
+                    & {
+                        param($Definition, $Root, $Target)
+                        $DryRun = $false
+                        . $Definition
+                        New-CmdWrapper -Name 'unknown' -Target $Target
+                    } $definition $writerRoot (Join-Path $fixture 'new-target.cmd') | Out-Null
+                } else {
+                    $plan = @{ Write = @([pscustomobject]@{ Name = 'unknown'; Target = (Join-Path $fixture 'new-target.cmd'); Wrapper = $writerWrapper; Refresh = $true }) }
+                    Invoke-ShimWrite -Plan $plan -NativeBin $writerBin | Out-Null
+                }
+            } catch { $refused = $_.Exception.Message -match 'owned|orphan|incomplete' }
+            if (-not $refused -or $before -ne (Get-FileHash -LiteralPath $writerWrapper -Algorithm SHA256).Hash) { return $false }
+        }
+        $true
+    }
+    It 'a locked owned companion prevents the production builder from changing its CMD contract' {
+        $lockedRoot = Join-Path $fixture 'locked-transition'
+        $lockedBin = Join-Path $lockedRoot 'native\bin'
+        New-Item -ItemType Directory -Path $lockedBin -Force | Out-Null
+        $lockedWrapper = Join-Path $lockedBin 'locked.cmd'
+        Set-Content -LiteralPath $lockedWrapper -Value (New-ShimBody -Target $target) -Encoding ASCII -NoNewline
+        [void](Install-NativeShim -Wrapper $lockedWrapper)
+        $lockedExe = [IO.Path]::ChangeExtension($lockedWrapper, '.exe')
+        $lockedMetadata = [IO.Path]::ChangeExtension($lockedWrapper, '.shim.json')
+        $before = (Get-FileHash -LiteralPath $lockedWrapper -Algorithm SHA256).Hash
+        $tokens = $null
+        $errors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repoRoot 'scripts\build-devtoolbox.ps1'), [ref]$tokens, [ref]$errors)
+        $function = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'New-CmdWrapper' }, $true)
+        $definition = [scriptblock]::Create($function.Extent.Text)
+        $handle = [IO.File]::Open($lockedExe, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        try {
+            $refused = $false
+            try {
+                & {
+                    param($Definition, $Root, $Target)
+                    $DryRun = $false
+                    . $Definition
+                    New-CmdWrapper -Name 'locked' -Target $Target
+                } $definition $lockedRoot (Join-Path $fixture 'batch-after-lock.cmd') | Out-Null
+            } catch { $refused = $true }
+            $refused -and $before -eq (Get-FileHash -LiteralPath $lockedWrapper -Algorithm SHA256).Hash -and
+                (Test-Path -LiteralPath $lockedExe) -and (Test-Path -LiteralPath $lockedMetadata)
+        } finally { $handle.Dispose() }
+    }
+    It 'repair dry-run preserves an owned stale pair and apply removes it without changing the batch wrapper or cache' {
+        $repairRoot = Join-Path $fixture 'repair-fixture'
+        $repairBin = Join-Path $repairRoot 'native\bin'
+        New-Item -ItemType Directory -Path $repairBin -Force | Out-Null
+        $repairWrapper = Join-Path $repairBin 'repair-probe.cmd'
+        Set-Content -LiteralPath $repairWrapper -Value (New-ShimBody -Target $target) -Encoding ASCII -NoNewline
+        [void](Install-NativeShim -Wrapper $repairWrapper)
+        $repairExe = [IO.Path]::ChangeExtension($repairWrapper, '.exe')
+        $repairMetadata = [IO.Path]::ChangeExtension($repairWrapper, '.shim.json')
+        $originalMetadata = [IO.File]::ReadAllText($repairMetadata)
+        $batchTarget = Join-Path $fixture 'repair target.cmd'
+        [IO.File]::WriteAllLines($batchTarget, @('@echo off', 'echo repaired batch'), [Text.Encoding]::ASCII)
+        Set-Content -LiteralPath $repairWrapper -Value (New-ShimBody -Target $batchTarget) -Encoding ASCII -NoNewline
+        $cacheReceipt = Join-Path $repairBin '.native-shim-launcher.json'
+        $before = @{}
+        foreach ($path in @($repairWrapper, $repairExe, $repairMetadata, $cacheReceipt)) {
+            $before[$path] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+        }
+        $script = Join-Path $repoRoot 'scripts\repair-native-shims.ps1'
+        $shell = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $script + '" -Root "' + $repairRoot + '"'
+        $preview = Invoke-Probe -Exe $shell -Raw ($arguments + ' -DryRun') -InputText ''
+        if ($preview.ExitCode -ne 0 -or $preview.Output -notmatch 'PLAN remove owned obsolete companion') { throw "Repair preview failed $($preview.ExitCode): $($preview.Output) $($preview.Error)" }
+        foreach ($path in $before.Keys) {
+            if ($before[$path] -ne (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash) { return $false }
+        }
+        $applied = Invoke-Probe -Exe $shell -Raw $arguments -InputText ''
+        if ($applied.ExitCode -ne 0 -or (Test-Path -LiteralPath $repairExe) -or (Test-Path -LiteralPath $repairMetadata)) { throw "Repair apply failed $($applied.ExitCode): $($applied.Output) $($applied.Error)" }
+        if ($before[$repairWrapper] -ne (Get-FileHash -LiteralPath $repairWrapper -Algorithm SHA256).Hash -or
+            $before[$cacheReceipt] -ne (Get-FileHash -LiteralPath $cacheReceipt -Algorithm SHA256).Hash) { return $false }
+        [IO.File]::WriteAllText($repairMetadata, $originalMetadata, (New-Object Text.UTF8Encoding($false)))
+        $orphanBefore = (Get-FileHash -LiteralPath $repairMetadata -Algorithm SHA256).Hash
+        $refused = Invoke-Probe -Exe $shell -Raw ($arguments + ' -DryRun') -InputText ''
+        $refused.ExitCode -ne 0 -and $orphanBefore -eq (Get-FileHash -LiteralPath $repairMetadata -Algorithm SHA256).Hash -and
+            -not (Test-Path -LiteralPath $repairExe)
+    }
     It 'rejects missing malformed non-EXE and self-target metadata without launching a target' {
         $original = [IO.File]::ReadAllText($metadata)
         try {
@@ -278,6 +460,7 @@ $wrappedCode = $LASTEXITCODE
             catch { $refused = $_.Exception.Message -match 'bytes not owned' }
             if (-not $refused) { return $false }
             Remove-Item -LiteralPath $native -Force
+            Remove-Item -LiteralPath $metadata -Force
             [void](Install-NativeShim -Wrapper $wrapper)
             $null -eq (Test-NativeShim -Wrapper $wrapper)
         } finally { [IO.File]::WriteAllText($metadata, $original, (New-Object Text.UTF8Encoding($false))) }

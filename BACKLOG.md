@@ -150,6 +150,24 @@ fail locally. If you add a test, ask what on this box it is quietly reading.
 
 ## Open items
 
+- **N01: Native companion survives a contract transition, post-push audit of 18adf94.**
+  Install-NativeShim returns early for batch targets or unsupported prologues,
+  leaving an existing same-name EXE and sidecar active. Repair only reports BATCH,
+  so bare invocation continues using the previous target or environment. Require
+  ownership before removal, remove owned stale companions during transition,
+  and preflight existing artifacts before a CMD writer changes its contract.
+  The 20-case focused suite passes on both PowerShell hosts. Live refresh
+  redeployed165 companions; full gates51/7 pass7 checks,94 smoke and all9
+  suites with parity. The follow-up exact-revision post-push audit remains open.
+
+- **N02: Orphan metadata is overwritten without ownership, post-push audit of 18adf94.**
+  Install-NativeShim checks ownership only when the companion EXE exists; a
+  sidecar present alone can be overwritten. Get-NativeShimLauncher has the
+  analogous receipt-only gap. Refuse either incomplete pair before modifying
+  the sidecar, cache receipt or wrapper. The new negatives reproduced failures
+  on 18adf94 and now pass. Deployment and both full gates pass; exact-revision post-push verification
+  remains open.
+
 - **Native EXE wrapper argument preservation, confirmed 2026-10-21.**
   The shared `New-ShimBody` contract forwards through `cmd.exe` with `%*`.
   Bare PowerShell `rg 'pf->numpos'` can therefore become output redirection,

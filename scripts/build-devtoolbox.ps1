@@ -914,7 +914,9 @@ function New-CmdWrapper {
     # So this is a no-op on a correctly-checked-out tree - which is the point. The one byte the LF
     # column loses is the CR, and 28 B is what the byte-exact test in tests\Invoke-InstallerTests.ps1
     # pins. The difference is no longer reachable: the bytes now come from the code.
-    Set-Content -Path $wrapper -Value (New-ShimBody -Target $Target) -Encoding ASCII -NoNewline
+    $body = New-ShimBody -Target $Target
+    Prepare-NativeShimWrite -Wrapper $wrapper -Body $body
+    Set-Content -Path $wrapper -Value $body -Encoding ASCII -NoNewline
     [void](Install-NativeShim -Wrapper $wrapper)
     return $true
 }

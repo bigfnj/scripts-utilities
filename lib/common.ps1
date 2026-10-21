@@ -808,6 +808,7 @@ function New-VenvCliWrappers {
         #
         # -LiteralPath, not -Path: a venv console script is free to contain '[', and -Path would
         # treat it as a wildcard and silently write nothing at all.
+        Prepare-NativeShimWrite -Wrapper (Join-Path $binDir "$($exe.BaseName).cmd") -Body (New-ShimBody -Target $exe.FullName)
         New-ShimBody -Target $exe.FullName |
             Set-Content -LiteralPath (Join-Path $binDir "$($exe.BaseName).cmd") -Encoding ASCII -NoNewline
         [void](Install-NativeShim -Wrapper (Join-Path $binDir "$($exe.BaseName).cmd"))

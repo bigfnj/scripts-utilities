@@ -1,7 +1,6 @@
 // EXE-backed toolbox wrappers must never send arguments through cmd.exe.
 // Preserve the caller's complete raw command-line tail, including its quoting.
 using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
