@@ -852,3 +852,15 @@ Independent read-only review of this production/test snapshot found no actionabl
 regression, dead code, leaked handle, broken call or transaction gap within its
 documented cooperating-writer scope. Exact pushed-revision review and CI remain
 the final acceptance steps for N01 through N05.
+
+### Exact-revision closure
+
+Commit714ef1098f34c072cc76a2906d4c374e9112e8a0 is pushed to main. GitHub
+Actions run39543485422 passes both suites and checks jobs. Independent
+read-only post-push review verifies HEAD and origin/main are that revision,
+the working tree is clean, production/test bytes match the reviewed snapshot,
+and documentation preserves the measured evidence and cooperating-writer scope.
+It reports no actionable regression, dead code, leak, broken call or remaining
+transaction finding. Native argument preservation and N01,N02,N03,N04,N05
+are closed. Later documentation-only closure does not change any executable
+source or test contract.

@@ -150,86 +150,11 @@ fail locally. If you add a test, ask what on this box it is quietly reading.
 
 ## Open items
 
-The current transaction implementation passes33 native and150 installer checks
-on both hosts. Final repair is165 native/6 batch/zero skips. Full gates
-native-physical-final51b (2026-10-20T21:10:34) and native-physical-final7
-(2026-10-20T21:17:05) pass7 checks,94/4/0 smoke and all nine suites with parity.
-The detailed records below preserve each finding's original reproduction.
-Only exact-revision post-push review and CI remain before these items close.
-
-- **N05: Repair can report a stale contract after a concurrent writer changes it.**
-  repair-native-shims.ps1 classifies the CMD outside the installation transaction.
-  A cooperating writer can change a batch contract to an EXE contract before
-  Install-NativeShim acquires ownership. Repair then installs the current native
-  pair but reports the earlier BATCH classification. Hold one directory
-  transaction over classification, installation, validation and the wrapper
-  report. A deterministic overlapping repair/writer regression is pending.
-
-- **N04: Cooperating shim writers can interleave a CMD contract and its native artifacts.**
-  The eight production writer sites call Prepare-NativeShimWrite, publish CMD bytes,
-  and call Install-NativeShim separately. Get-NativeShimLauncher also has no
-  cross-process exclusion across its cache generation check and publication.
-  A per-helper lock alone cannot protect the gaps between these calls. Introduce
-  one shared directory transaction for cooperating writers and cache mutation,
-  with canonical case-normalized identity, bounded waits and abandoned-owner
-  cleanup. Prove actual two-process overlap before claiming serialization.
-  All eight writer sites now use the complete shared directory transaction.
-  The 31-case native suite and 150-case installer suite pass on both hosts,
-  including actual foreign-process timeout, abandoned ownership and overlapping
-  cache publishers. Subsequent review verified that a live directory reached
-  through its existing 8.3 aliases gets a different lexical mutex name.
-  Replace the lexical name with a verified ordinary directory handle identity
-  and prove actual alias contention before closing this item.
-  Live refresh, final full gates and exact-revision audit remain open.
-
-- **N03: A failed cache upgrade can invalidate its owned launcher receipt, audit of 9b9389c.**
-  Get-NativeShimLauncher replaces the cached EXE before writing the receipt.
-  A reader holding the receipt with FileShare.Read permits ownership validation
-  but prevents that write, leaving the new EXE paired with the old digest.
-  Prepare-NativeShimWrite currently checks ownership without attempting the
-  upgrade, so a production writer can also change CMD bytes before this failure.
-  Add an isolated locked-receipt source-upgrade regression, stage both cache
-  artifacts with rollback, and complete cache preparation before CMD publication.
-  Fixed with staged publication, verified rollback and cache preparation before CMD
-  publication. Focused tests pass 27 cases on both PowerShell hosts. Live repair
-  refreshed 165 native companions and retained 6 batch wrappers without skips.
-  Both native-cache-final gates pass 7 checks, 94 smoke successes and all 9 suites,
-  including CI-style parity. Exact-revision post-push verification remains open.
-
-- **N01: Native companion survives a contract transition, post-push audit of 18adf94.**
-  Install-NativeShim returns early for batch targets or unsupported prologues,
-  leaving an existing same-name EXE and sidecar active. Repair only reports BATCH,
-  so bare invocation continues using the previous target or environment. Require
-  ownership before removal, remove owned stale companions during transition,
-  and preflight existing artifacts before a CMD writer changes its contract.
-  The 20-case focused suite passes on both PowerShell hosts. Live refresh
-  redeployed165 companions; full gates51/7 pass7 checks,94 smoke and all9
-  suites with parity. Exact-revision audit of 02f2624 found a remaining metadata-only
-  lock failure: deleting the EXE before a locked sidecar leaves an orphan that
-  prevents every retry. A follow-up now acquires DELETE leases on both owned
-  leaves before staging their removal. Metadata-only lock regressions through
-  both writers now pass for read and read/write sharing, including a successful
-  retry after release. The combined 31-case suite passes on both hosts. Full
-  gates and the follow-up exact-revision post-push audit remain open.
-
-- **N02: Orphan metadata is overwritten without ownership, post-push audit of 18adf94.**
-  Install-NativeShim checks ownership only when the companion EXE exists; a
-  sidecar present alone can be overwritten. Get-NativeShimLauncher has the
-  analogous receipt-only gap. Refuse either incomplete pair before modifying
-  the sidecar, cache receipt or wrapper. The new negatives reproduced failures
-  on 18adf94 and now pass. Deployment and both full gates pass; exact-revision post-push verification
-  remains open.
-
-- **Native EXE wrapper argument preservation, confirmed 2026-10-21.**
-  The shared `New-ShimBody` contract forwards through `cmd.exe` with `%*`.
-  Bare PowerShell `rg 'pf->numpos'` can therefore become output redirection,
-  and literal regex pipes can execute another command. Add native EXE companions
-  without changing target selection or process-local initialization. Focused
-  real subprocess smoke: 13 passed, including writer integration and real
-  console control events. All165 companions are deployed; full gates on
-  PowerShell5.1 and7 pass7 checks,94 smoke checks and all9 suites, including
-  in-session parity. Post-push audit is pending.
-
+No open items. Native launcher argument preservation and N01 through N05 are
+closed after both full local gates, live deployment, successful CI39543485422
+and independent exact-revision audit of714ef1098f34c072cc76a2906d4c374e9112e8a0.
+The original failures, implementation scope and closure evidence are preserved
+in docs/engineering-record.md.
 The six optional DOS tool integration findings from the
 2026-10-20 post-push audit are closed after focused regressions, actual tool
 checks and the cumulative gate. Their causes, fixes and evidence are recorded in
