@@ -148,7 +148,24 @@ fail locally. If you add a test, ask what on this box it is quietly reading.
 
 ---
 
-## Open items
+## Latest audit closures
+
+No open toolbox code items. Publication audits remain part of each release.
+
+### Q105: mixed All and explicit control selection
+
+Independent post-push audit of ce021391 reproduced `All,DosboxControl` silently
+dropping the explicitly requested control runtime in an actual no-write dry run.
+The selector now unions explicit additions with the historical five-component
+All set and deduplicates them using an order-preserving case-insensitive set.
+A real installer dry-run regression covers All alone, both mixed orders,
+repeated control and mixed-case legacy/control selection. Prior producers are
+preserved under ignored `logs/q105-all-explicit-control-20261022/`.
+Closed for component selection after independent actual mixed-case DryRuns,
+11 PowerShell controls plus31 nested Python regressions in both shells, and the
+complete `q105-casefold-final` gate:7 checks,97 smoke checks and389 tests in10
+suites, exact process/in-session parity and direct phase reruns. No installs or
+registry writes were needed for this fix. Exact post-push audit follows publication.
 
 ### Q98: generated .NET fixture entries exceeded the persistent PATH budget
 
@@ -172,7 +189,9 @@ both Windows PowerShell5.1 and PowerShell7.6.6.
 Full `q98-path-repaired` gate passes7 hygiene checks,97 smoke checks with zero
 failures, and10 suites/388 tests with exact process/in-session parity plus direct
 phase reruns. The four existing optional forensics/browser warnings are retained.
-Post-push audit remains required. See `docs/generated-dotnet-path.md`.
+Independent exact ce021391 post-push source audit found the PATH repair sound;
+the separate selector issue is Q105 above. The final cumulative gate retains
+all PATH controls. Closed for the User PATH repair. See `docs/generated-dotnet-path.md`.
 The root gate now calls `Sync-EnvPath` before checks so installed user tools are
 visible even when the agent inherited an incomplete PATH.
 

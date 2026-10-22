@@ -26,8 +26,12 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $repoRoot 'lib\LegacyDos.ps1')
 $script:DryRun = [bool]$DryRun
 if (-not $Component.Count) { throw 'Select -Component Capstone, Unicorn, Dosbox, DosboxControl, Ghidra, Watcom, or All. Nothing is installed by default.' }
-# All retains the established toolset. The separate control runtime is explicit opt-in.
-$selected = if ($Component -contains 'All') { @('Capstone', 'Unicorn', 'Dosbox', 'Ghidra', 'Watcom') } else { @($Component | Select-Object -Unique) }
+# All retains the established toolset. Explicit additions are still opt-in.
+$selected = @()
+if ($Component -contains 'All') { $selected += @('Capstone', 'Unicorn', 'Dosbox', 'Ghidra', 'Watcom') }
+$selected += @($Component | Where-Object { $_ -ne 'All' })
+$seen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$selected = @($selected | Where-Object { $seen.Add($_) })
 $configPath = Join-Path $repoRoot 'config\legacy-dos-tools.json'
 $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($config.schema_version -ne 1) { throw 'Unsupported legacy DOS tools configuration.' }
