@@ -841,3 +841,12 @@ Capstone, Unicorn, Ghidra, Dosbox, or Watcom. Normal bootstrap leaves these tool
 The DOSBox-X installer is not used by this workflow: its advertised Winget user
 scope conflicts with the tagged installer's administrator setting. Official
 portable archives are pinned by URL and SHA-256 in config/legacy-dos-tools.json.
+
+For the separate October 2026 control runtime, review
+`scripts/install-legacy-dos.ps1 -Component DosboxControl -DryRun`, perform the
+host-projection preflight, then explicitly select that component. Its directory
+is `native/dosbox-control-2026.10.01` and command is `dosbox-x-control`.
+The established `Dosbox`/`All` August selection and `dosbox-x` command are preserved.
+Named checked-text dumps retain unreadable-byte markers; the October TCP debugger
+uses REQ/BEGIN/END framing. Calibrate those capabilities separately before capture,
+including fresh files, address/extent checks, fault rejection and actual stop proof.

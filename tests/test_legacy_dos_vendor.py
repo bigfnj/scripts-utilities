@@ -21,6 +21,51 @@ SPEC.loader.exec_module(vendor)
 
 
 class VendorTests(unittest.TestCase):
+    def test_control_configuration_is_separate_and_preserves_august_pin(self):
+        config = SOURCE.parents[1] / "config/legacy-dos-tools.json"
+        legacy = vendor.load_spec(config, "dosbox")
+        control = vendor.load_spec(config, "dosbox-control")
+        self.assertEqual((legacy["release"], legacy["sha256"]), ("2026.08.02",
+            "ca28208f5fee25a74caf3a02cc0189c7f7943a42ce37c02848f5fc03450a96cf"))
+        self.assertEqual((control["release"], control["sha256"]), ("2026.10.01",
+            "3c50915e63aefe35777d65ebb4391a06b4a2c2342e4c75cbee6bbda4c6916e33"))
+        self.assertNotEqual(legacy["url"], control["url"])
+
+    def test_parallel_control_install_and_reuse_leave_august_bytes_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = "Release SDL2/dosbox-x.exe"
+            def specification(config, component):
+                return {"release": "2026.08.02" if component == "dosbox" else "2026.10.01",
+                    "url": "https://example.invalid/unused", "sha256": "0" * 64,
+                    "format": "zip", "marker": marker, "required": [marker]}
+            def fake_download(spec, destination):
+                with zipfile.ZipFile(destination, "w") as archive:
+                    archive.writestr(marker, spec["release"].encode("ascii"))
+            with mock.patch.object(vendor, "load_spec", side_effect=specification), \
+                 mock.patch.object(vendor, "download", side_effect=fake_download):
+                legacy = vendor.install(root, Path("unused.json"), "dosbox")
+                before = {name: (Path(legacy["root"]) / name).read_bytes()
+                          for name in (marker, "toolbox-install.json")}
+                control = vendor.install(root, Path("unused.json"), "dosbox-control")
+                with mock.patch.object(vendor, "download", side_effect=AssertionError("repeat download")):
+                    self.assertEqual(vendor.install(root, Path("unused.json"), "dosbox-control"), control)
+            self.assertNotEqual(legacy["root"], control["root"])
+            self.assertEqual(Path(control["executable"]).read_bytes(), b"2026.10.01")
+            self.assertEqual(before, {name: (Path(legacy["root"]) / name).read_bytes() for name in before})
+
+    def test_control_cannot_readmit_august_provenance_at_its_separate_target(self):
+        config = SOURCE.parents[1] / "config/legacy-dos-tools.json"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "native/dosbox-control-2026.10.01"
+            target.mkdir(parents=True)
+            (target / "toolbox-install.json").write_text(json.dumps({"component": "dosbox"}), encoding="utf-8")
+            with mock.patch.object(vendor, "download", side_effect=AssertionError("network used")), \
+                 mock.patch.object(vendor, "extract", side_effect=AssertionError("extraction used")):
+                with self.assertRaisesRegex(ValueError, "provenance"):
+                    vendor.install(root, config, "dosbox-control")
+
     def test_windows_paths_cannot_escape_or_alias_destinations(self):
         for name in ("../escape", "/absolute", "C:/absolute", "bin\\escape", "bin/aux.txt", "bin/x.", "bin/x "):
             with self.subTest(name=name), self.assertRaises(ValueError):

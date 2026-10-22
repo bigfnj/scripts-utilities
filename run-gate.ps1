@@ -67,6 +67,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = $PSScriptRoot
+. (Join-Path $repoRoot 'lib\common.ps1')
+Sync-EnvPath
 
 $ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 if (-not (Test-Path -LiteralPath $ps51)) { Write-Host "FATAL: Windows PowerShell 5.1 not found at $ps51" -ForegroundColor Red; exit 2 }

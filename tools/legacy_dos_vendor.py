@@ -22,6 +22,7 @@ import zipfile
 VENDORS = {
     "watcom": ("github.com", "/open-watcom/open-watcom-v2/releases/download/"),
     "dosbox": ("github.com", "/joncampbell123/dosbox-x/releases/download/"),
+    "dosbox-control": ("github.com", "/joncampbell123/dosbox-x/releases/download/"),
 }
 from vendor_archive import ProtectedArchivePath, archive_path, inside
 
