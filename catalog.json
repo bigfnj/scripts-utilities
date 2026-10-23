@@ -115,6 +115,12 @@
       "notes": "convert pktmon/netsh-trace .etl captures to .pcapng for tshark/Wireshark (driver-free capture path)"
     },
     {
+      "name": "upx", "group": "security", "channel": "winget-user",
+      "id": "UPX.UPX", "binary": "upx", "detect": "upx --version",
+      "default": true,
+      "notes": "Executable packer/unpacker; use trusted local research copies and decompress with upx -d -o output.exe input.exe. WinGet owns the portable user-scope installation."
+    },
+    {
       "name": "frida", "group": "security", "channel": "pip-toolbox",
       "id": "frida-tools", "binary": "frida", "import": "frida", "detect": "frida --version",
       "default": true,

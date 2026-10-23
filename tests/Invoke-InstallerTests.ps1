@@ -466,6 +466,95 @@ It 'cli-tools_desc names every tool in the cli-tools catalog group' {
     $missing.Count -eq 0
 }
 
+function Invoke-SUSecurityUpxFixture {
+    param([bool]$FailUpx)
+    # Child function scope keeps every stub away from the remaining installer tests.
+    . (Join-Path $repoRoot 'modules\security.ps1')
+    $calls = New-Object 'System.Collections.Generic.List[string]'
+    $messages = New-Object 'System.Collections.Generic.List[string]'
+    function Get-CatalogItem { param([string]$Name) [pscustomobject]@{ name = $Name } }
+    function Install-CatalogItem {
+        param($Item)
+        $calls.Add($Item.name)
+        return (-not ($FailUpx -and $Item.name -eq 'upx'))
+    }
+    function Test-CommandAvailable { param($Name) return $true }
+    function Write-Warn { param($Msg) $messages.Add($Msg) }
+    function Write-Ok { param($Msg) $messages.Add($Msg) }
+    function Write-Err { param($Msg) $messages.Add($Msg) }
+    function Write-Skip { param($Msg) $messages.Add($Msg) }
+    function security_register_npcap { }
+    function security_install_ghidra { }
+    function security_install_debugger { $script:DebuggerFailed = $false }
+    function security_install_wdk { }
+    function security_install_console_debuggers { }
+    function security_report_deletion_forensics { }
+    $failed = security_install
+    [pscustomobject]@{ Failed = $failed; Calls = @($calls); Messages = @($messages) }
+}
+
+It 'security_install requests UPX once and preserves a successful group result' {
+    $result = Invoke-SUSecurityUpxFixture -FailUpx $false
+    ($result.Failed -eq 0) -and (@($result.Calls | Where-Object { $_ -eq 'upx' }).Count -eq 1)
+}
+
+It 'security_install counts an UPX failure and names it in the incomplete result' {
+    $result = Invoke-SUSecurityUpxFixture -FailUpx $true
+    ($result.Failed -eq 1) -and
+        ($result.Messages -contains 'install failed: upx') -and
+        (@($result.Messages | Where-Object { $_ -like 'security group INCOMPLETE: 1 of *' }).Count -eq 1)
+}
+
+It 'WinDbg launcher selection prefers the real installed package executable' {
+    & {
+        . (Join-Path $repoRoot 'modules\security.ps1')
+        $packageRoot = Join-Path $scratch 'windbg-package'
+        New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
+        $executable = Join-Path $packageRoot 'DbgX.Shell.exe'
+        Set-Content -LiteralPath $executable -Value 'synthetic launcher metadata fixture' -Encoding ASCII
+        function Get-AppxPackage { param($Name, $ErrorAction) [pscustomobject]@{ InstallLocation = $packageRoot } }
+        (Find-WinDbgLauncher) -eq $executable
+    }
+}
+
+It 'WinDbg launcher selection refuses a linked fallback without weakening the shim guard' {
+    & {
+        . (Join-Path $repoRoot 'modules\security.ps1')
+        function Get-AppxPackage { param($Name, $ErrorAction) return @() }
+        function Get-Command { param($Name, $ErrorAction) [pscustomobject]@{ Source = 'C:\fixture\WinDbgX.exe' } }
+        function Assert-NativeShimPath { param($Path) throw 'Native shim path contains a link or junction.' }
+        function Write-Warn { param($Msg) }
+        $null -eq (Find-WinDbgLauncher)
+    }
+}
+
+It 'WinDbg launcher selection refuses a linked package executable' {
+    & {
+        . (Join-Path $repoRoot 'modules\security.ps1')
+        $packageRoot = Join-Path $scratch 'windbg-linked-package'
+        New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $packageRoot 'DbgX.Shell.exe') -Value 'synthetic linked metadata fixture' -Encoding ASCII
+        function Get-AppxPackage { param($Name, $ErrorAction) [pscustomobject]@{ InstallLocation = $packageRoot } }
+        function Get-Command { param($Name, $ErrorAction) return $null }
+        function Assert-NativeShimPath { param($Path) throw 'Native shim path contains a link or junction.' }
+        function Write-Warn { param($Msg) }
+        $null -eq (Find-WinDbgLauncher)
+    }
+}
+
+It 'WinDbg launcher selection refuses its own toolbox shim as a fallback' {
+    & {
+        . (Join-Path $repoRoot 'modules\security.ps1')
+        $toolboxRoot = if ($env:CODEX_TOOLBOX) { $env:CODEX_TOOLBOX } else { "$env:LOCALAPPDATA\DevToolbox" }
+        $selfTarget = Join-Path $toolboxRoot 'native\bin\windbg.exe'
+        function Get-AppxPackage { param($Name, $ErrorAction) return @() }
+        function Get-Command { param($Name, $ErrorAction) [pscustomobject]@{ Source = $selfTarget } }
+        function Assert-NativeShimPath { param($Path) }
+        function Write-Warn { param($Msg) }
+        $null -eq (Find-WinDbgLauncher)
+    }
+}
+
 Write-Host "`n== manifest provenance is measured, not assumed ==" -ForegroundColor Cyan
 
 $securityPs1 = Join-Path $repoRoot 'modules\security.ps1'

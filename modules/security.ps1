@@ -14,12 +14,12 @@
 # installed here; only WinDbg is. The rest are detected on the machine and wrapped
 # into native\bin, which is a very different consent question (nothing is downloaded,
 # and if they are absent you get a warning, not a tool).
-function security_desc { "installs Wireshark (tshark), etl2pcapng, WinDbg + MS symbol server, frida (toolbox venv); detects and wraps only: cdb/kd/ntsd, poolmon (WDK), Ghidra, Npcap; reports deletion-forensics health (Sysmon + USN)" }
+function security_desc { "installs Wireshark (tshark), etl2pcapng, UPX, WinDbg + MS symbol server, frida (toolbox venv); detects and wraps only: cdb/kd/ntsd, poolmon (WDK), Ghidra, Npcap; reports deletion-forensics health (Sysmon + USN)" }
 
 function security_install {
     # Failure count for the catalog-driven installs in this group. They were each
     # piped to Out-Null, so "security group complete" printed even when all of them
-    # failed. $attempted rather than a literal 3, because TOOLBOX_SKIP_WIRESHARK
+    # failed. $attempted rather than a literal count, because TOOLBOX_SKIP_WIRESHARK
     # legitimately removes one of them.
     $failed = 0
     $attempted = 0
@@ -54,6 +54,13 @@ function security_install {
     }
     if (-not (Test-CommandAvailable "etl2pcapng")) {
         Write-Warn "etl2pcapng installed but not visible on PATH in this session"
+    }
+
+    # UPX uses WinGet's portable user-scope channel; no separate vendor installer.
+    $attempted++
+    if (-not (Install-CatalogItem -Item (Get-CatalogItem -Name "upx"))) {
+        $failed++
+        Write-Warn "install failed: upx"
     }
 
     # Ghidra - NSA reverse-engineering suite. Detected/wrapped only (no winget
@@ -94,7 +101,7 @@ function security_install {
     # opt-in helper rather than something a bootstrap run does to you.
     security_report_deletion_forensics
 
-    # Only the three catalog installs above are counted. The detect-and-wrap helpers
+    # Only the catalog installs and WinDbg installer are counted. The detect-and-wrap helpers
     # warn for themselves and a missing WDK/Ghidra/Npcap is not an install failure.
     if ($failed -eq 0) {
         Write-Ok "security group complete"
@@ -162,6 +169,37 @@ function security_report_deletion_forensics {
     }
 }
 
+function Find-WinDbgLauncher {
+    # WindowsApps execution aliases are reparse points. Prefer the actual package
+    # executable so the native shim keeps its existing no-links contract.
+    foreach ($package in @(Get-AppxPackage -Name Microsoft.WinDbg -ErrorAction SilentlyContinue)) {
+        if (-not $package.InstallLocation) { continue }
+        foreach ($leaf in @('DbgX.Shell.exe', 'WinDbgX.exe')) {
+            $candidate = Join-Path $package.InstallLocation $leaf
+            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+            try {
+                Assert-NativeShimPath -Path $candidate
+                return $candidate
+            } catch { Write-Warn "WinDbg package launcher unavailable: $($_.Exception.Message)" }
+        }
+    }
+    $toolboxRoot = if ($env:CODEX_TOOLBOX) { $env:CODEX_TOOLBOX } else { "$env:LOCALAPPDATA\DevToolbox" }
+    $shimDirectory = [IO.Path]::GetFullPath((Join-Path $toolboxRoot 'native\bin')).TrimEnd('\')
+    foreach ($name in @('WinDbgX', 'windbg')) {
+        $command = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $command -or -not $command.Source) { continue }
+        if ([IO.Path]::GetFullPath((Split-Path -Parent $command.Source)).TrimEnd('\') -ieq $shimDirectory) {
+            Write-Warn 'WinDbg fallback resolves to the toolbox shim directory; refusing a shim chain'
+            continue
+        }
+        try {
+            Assert-NativeShimPath -Path $command.Source
+            return $command.Source
+        } catch { Write-Warn "WinDbg launcher unavailable: $($_.Exception.Message)" }
+    }
+    return $null
+}
+
 function security_install_debugger {
     # WinDbg - Microsoft's crash-dump / live user- and kernel-mode debugger. Shipped
     # as an MSIX app in winget, so it installs at user scope without elevation.
@@ -213,15 +251,8 @@ function security_install_debugger {
         $script:DebuggerFailed = 1
     }
 
-    # Resolve the launcher the MSIX put on PATH (a WindowsApps alias) and wrap it as
-    # `windbg` in native\bin, so it is invocable by a stable name and the smoke test
-    # can find it. MSIX aliases can need a fresh shell to appear; if it is not visible
-    # yet, skip recording it rather than register a binary the smoke test can't see.
-    $dbg = $null
-    foreach ($n in @("WinDbgX", "windbg")) {
-        $cmd = Get-Command $n -ErrorAction SilentlyContinue
-        if ($cmd -and $cmd.Source) { $dbg = $cmd.Source; break }
-    }
+    # Resolve the real installed package executable before considering PATH aliases.
+    $dbg = Find-WinDbgLauncher
     if ($dbg) {
         $root   = if ($env:CODEX_TOOLBOX) { $env:CODEX_TOOLBOX } else { "$env:LOCALAPPDATA\DevToolbox" }
         $binDir = Join-Path $root "native\bin"

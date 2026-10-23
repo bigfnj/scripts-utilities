@@ -298,6 +298,24 @@ etl2pcapng cap.etl -o cap.pcapng                  # or: pktmon pcapng cap.etl -o
 tshark -r cap.pcapng -Y "tcp.flags.reset==1"      # analyze (no Npcap needed to READ)
 ```
 
+### UPX - executable unpacking
+
+The security group installs `UPX.UPX` through WinGet's portable user-scope channel.
+The x64 host tool also handles supported x86 executables. Work on trusted copies;
+UPX's upstream security policy treats even listing and testing as executable-file
+handling. Keep the original file and choose a distinct output path:
+
+```powershell
+upx --version
+upx -t original-copy.exe
+upx -d -o unpacked-copy.exe original-copy.exe
+```
+
+`-t` tests the compressed data, not the entire file. Decompression can change the
+file layout, so retain hashes of the original and unpacked copies separately.
+See the [upstream manual](https://github.com/upx/upx/blob/devel/doc/upx.1)
+and [security policy](https://github.com/upx/upx/security/policy).
+
 ### Ghidra - reverse engineering suite
 
 Ghidra is optional and has no current Winget package. Provision the portable,
@@ -321,8 +339,11 @@ analyzeHeadless `
     -deleteProject
 ```
 
-For scripted analysis, Ghidra's headless mode accepts Java or Python (Jython)
-scripts placed in `ghidra_scripts/` or passed with `-scriptPath`.
+For scripted analysis, Ghidra's headless mode accepts Java scripts placed in
+`ghidra_scripts/` or passed with `-scriptPath`. Ghidra 12.1 also provides native
+CPython 3 through PyGhidra. Launch its Python mode explicitly; do not assume an
+installed Jython provider. The portable release's `Ghidra/Features/PyGhidra/README.md`
+and `support/analyzeHeadlessREADME.md` describe the supported entrypoints.
 
 ### Deletion forensics — Sysmon + a sized USN journal
 
