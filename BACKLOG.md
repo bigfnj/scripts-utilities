@@ -148,7 +148,62 @@ fail locally. If you add a test, ask what on this box it is quietly reading.
 
 ---
 
-## Open items
+## Latest audit closures
+
+No open toolbox code items. Publication audits remain part of each release.
+
+### Q105: mixed All and explicit control selection
+
+Independent post-push audit of ce021391 reproduced `All,DosboxControl` silently
+dropping the explicitly requested control runtime in an actual no-write dry run.
+The selector now unions explicit additions with the historical five-component
+All set and deduplicates them using an order-preserving case-insensitive set.
+A real installer dry-run regression covers All alone, both mixed orders,
+repeated control and mixed-case legacy/control selection. Prior producers are
+preserved under ignored `logs/q105-all-explicit-control-20261022/`.
+Closed for component selection after independent actual mixed-case DryRuns,
+11 PowerShell controls plus31 nested Python regressions in both shells, and the
+complete `q105-casefold-final` gate:7 checks,97 smoke checks and389 tests in10
+suites, exact process/in-session parity and direct phase reruns. No installs or
+registry writes were needed for this fix. Exact post-push audit follows publication.
+
+### Q98: generated .NET fixture entries exceeded the persistent PATH budget
+
+The 2026-10-22 root gate (`q95-session-52866-output.txt`, SHA256
+`fd8c4a2a44ef6cbff72e4ac7c5e60237a3dc60f5378f0371a3ef3ef0ae40f8f8` in the
+decompilation project's ignored toolbox-gates directory) failed the PATH check:
+8,343 expanded characters. The separately read real User hive contained 56
+generated artifact `.dotnet/tools` entries, consuming 6,159 characters with
+separators. Candidate roots were desktop-ai-companion artifacts in long and
+short spellings, including `gq`. Other entries must remain untouched.
+
+The reviewed `scripts/repair-generated-dotnet-path.ps1` defaults to a pinned
+review plan. Plan73826994 was applied through the supported action approval:
+56 generated entries removed, all22 retained raw tokens unchanged, User PATH
+7534 to1375 characters, raw REG_EXPAND_SZ preserved and Machine PATH unchanged.
+Exclusive backupa6820bbc precedes the only User setter. The first apply refused
+before backup/write on automatic PS7 JSON timestamp coercion; preserved producers
+and the exact serialized-plan repair pass independent review and23 controls in
+both Windows PowerShell5.1 and PowerShell7.6.6.
+
+Full `q98-path-repaired` gate passes7 hygiene checks,97 smoke checks with zero
+failures, and10 suites/388 tests with exact process/in-session parity plus direct
+phase reruns. The four existing optional forensics/browser warnings are retained.
+Independent exact ce021391 post-push source audit found the PATH repair sound;
+the separate selector issue is Q105 above. The final cumulative gate retains
+all PATH controls. Closed for the User PATH repair. See `docs/generated-dotnet-path.md`.
+The root gate now calls `Sync-EnvPath` before checks so installed user tools are
+visible even when the agent inherited an incomplete PATH.
+
+Prevention now sets process-only `DOTNET_ADD_GLOBAL_TOOLS_TO_PATH=0` beside
+the existing DOTNET_CLI_HOME overrides in the sibling project's
+`tests/Invoke-IsolatedGate.ps1` and `tools/agentbroker/Invoke-MutationShards.ps1`.
+No application rebuild, machine PATH change or candidate directory cleanup is
+part of this repair. The existing caller environment restoration remains in place;
+mutation-shard overrides belong only to each child process. Actual prevention
+validation in that application remains separate from this toolbox's pure controls.
+
+### Earlier closures
 
 No open items. Native launcher argument preservation and N01 through N05 are
 closed after both full local gates, live deployment, successful CI39543485422

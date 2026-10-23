@@ -10,10 +10,12 @@ default. The normal bootstrap does not invoke this script.
 .\scripts\install-legacy-dos.ps1 -Component Capstone
 .EXAMPLE
 .\scripts\install-legacy-dos.ps1 -Component All -DryRun
+.EXAMPLE
+.\scripts\install-legacy-dos.ps1 -Component DosboxControl -DryRun
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Capstone', 'Unicorn', 'Dosbox', 'Ghidra', 'Watcom', 'All')]
+    [ValidateSet('Capstone', 'Unicorn', 'Dosbox', 'DosboxControl', 'Ghidra', 'Watcom', 'All')]
     [string[]]$Component = @(),
     [string]$Root = $(if ($env:CODEX_TOOLBOX) { $env:CODEX_TOOLBOX } else { "$env:LOCALAPPDATA\DevToolbox" }),
     [switch]$DryRun
@@ -23,8 +25,13 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $repoRoot 'lib\common.ps1')
 . (Join-Path $repoRoot 'lib\LegacyDos.ps1')
 $script:DryRun = [bool]$DryRun
-if (-not $Component.Count) { throw 'Select -Component Capstone, Unicorn, Dosbox, Ghidra, Watcom, or All. Nothing is installed by default.' }
-$selected = if ($Component -contains 'All') { @('Capstone', 'Unicorn', 'Dosbox', 'Ghidra', 'Watcom') } else { @($Component | Select-Object -Unique) }
+if (-not $Component.Count) { throw 'Select -Component Capstone, Unicorn, Dosbox, DosboxControl, Ghidra, Watcom, or All. Nothing is installed by default.' }
+# All retains the established toolset. Explicit additions are still opt-in.
+$selected = @()
+if ($Component -contains 'All') { $selected += @('Capstone', 'Unicorn', 'Dosbox', 'Ghidra', 'Watcom') }
+$selected += @($Component | Where-Object { $_ -ne 'All' })
+$seen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$selected = @($selected | Where-Object { $seen.Add($_) })
 $configPath = Join-Path $repoRoot 'config\legacy-dos-tools.json'
 $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($config.schema_version -ne 1) { throw 'Unsupported legacy DOS tools configuration.' }
@@ -90,13 +97,15 @@ try {
                 security_install_ghidra -InstallPath $pinned.InstallPath -JdkPath $pinned.JdkPath -JdkMajor $config.ghidra.jdk_major
             }
             default {
-                $key = $name.ToLowerInvariant()
+                $selection = Get-SULegacyVendorSelection -Name $name
+                $key = $selection.Component
                 $result = Invoke-Native -FilePath $py -Arguments @('-X', 'utf8', $vendorTool, $key, '--root', $Root, '--config', $configPath)
                 if ($result.ExitCode -ne 0) { throw "$name vendor provisioning failed: $($result.Output -join ' ')" }
                 $receipt = ($result.Output -join [Environment]::NewLine) | ConvertFrom-Json
-                if ($name -eq 'Dosbox') {
-                    Register-LegacyDosShim -Name 'dosbox-x' -Target $receipt.executable
-                    Add-WinManifest -Name 'dosbox-x' -Binary 'dosbox-x' -Group 'security' -Method 'vendor-archive' -Scope 'toolbox' -Detect 'dosbox-x -version' -Notes "Official portable DOSBox-X $($receipt.release), SHA-256 $($receipt.sha256); verify debugger capabilities separately."
+                if ($selection.Wrapper) {
+                    $wrapper = [string]$selection.Wrapper
+                    Register-LegacyDosShim -Name $wrapper -Target $receipt.executable
+                    Add-WinManifest -Name $wrapper -Binary $wrapper -Group 'security' -Method 'vendor-archive' -Scope 'toolbox' -Detect "$wrapper -version" -Notes "Official portable DOSBox-X $($receipt.release), SHA-256 $($receipt.sha256); verify debugger capabilities separately."
                 } else {
                     $toolRoot = [string]$receipt.root
                     $localEnvironment = @('setlocal', ('set "WATCOM={0}"' -f $toolRoot), ('set "INCLUDE={0}\h"' -f $toolRoot), ('set "PATH={0}\binnt64;%PATH%"' -f $toolRoot))

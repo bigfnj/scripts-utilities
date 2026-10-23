@@ -1009,7 +1009,7 @@ $suiteRequired = @('Invoke-CoreTests.ps1', 'Invoke-InstallerTests.ps1',
                    'Invoke-TriageTests.ps1', 'Invoke-RenderTests.ps1',
                    'Invoke-SmokeLintTests.ps1', 'Invoke-GateChecksTests.ps1',
                    'Invoke-AgentDiscoveryTests.ps1', 'Invoke-LegacyDosTests.ps1',
-                   'Invoke-NativeShimTests.ps1')
+                   'Invoke-NativeShimTests.ps1', 'Invoke-GeneratedDotNetPathTests.ps1')
 $suiteFiles = @(Get-ChildItem -LiteralPath (Join-Path $REPO_ROOT 'tests') -Filter 'Invoke-*Tests.ps1' `
                     -File -ErrorAction SilentlyContinue | Sort-Object Name)
 foreach ($suiteReq in $suiteRequired) {

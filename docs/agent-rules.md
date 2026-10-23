@@ -212,7 +212,7 @@ that verification.
 ### Optional legacy DOS tools
 
 The explicit entrypoint is scripts/install-legacy-dos.ps1 -Component NAME.
-It accepts Capstone, Unicorn, Dosbox, Ghidra, Watcom, or All; it installs nothing without
+It accepts Capstone, Unicorn, Dosbox, DosboxControl, Ghidra, Watcom, or All; it installs nothing without
 a selection and is never called by normal bootstrap. Capstone and Unicorn are
 optional pip-toolbox catalog libraries in the existing shared venv. Their narrow
 installer reads the exact catalog pin, verifies the installed distribution version,
@@ -242,6 +242,10 @@ Run scripts/test-host-projection.ps1 before agent package changes or AppData
 writes. Use -DryRun to review component selection without downloads or writes.
 Verify the installed DOSBox-X debugger commands separately: current development
 documentation does not prove an older release has MCP control.
+DosboxControl is explicit opt-in and installs October 2026 beside the established
+August runtime, using its own native folder, dosbox-x-control wrapper and manifest
+entry. All retains the established component set. Keep old runtime pins and
+capture proofs unchanged; named text-dump/TCP capabilities need fresh calibration.
 
 ### 2. Python libraries -> dev toolbox venv (`pip` into venv)
 

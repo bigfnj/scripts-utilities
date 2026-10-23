@@ -24,7 +24,7 @@ It 'offline vendor archive security regressions pass without installed RE tools'
     if (-not $py) { throw 'Python is needed for the stdlib archive regression tests.' }
     $result = Invoke-Native -FilePath $py -Arguments @('-X', 'utf8', '-Werror::ResourceWarning', (Join-Path $PSScriptRoot 'test_legacy_dos_vendor.py'))
     foreach ($line in $result.Output) { Write-Host "    $line" }
-    Test-SURequiredPythonResult -ExitCode $result.ExitCode -Output $result.Output -MinimumTests 28
+    Test-SURequiredPythonResult -ExitCode $result.ExitCode -Output $result.Output -MinimumTests 31
 }
 It 'source path predicates reject protected leaf and ancestor names without access' {
     $protected = @(
@@ -101,6 +101,30 @@ It 'projection measures the selected root instead of inherited toolbox environme
     $selected = 'C:\fixture\selected-toolbox'
     $result = Test-SULegacyHostProjection -Root $selected -Probe $probe
     $seen.Count -eq 1 -and $seen[0] -eq (Join-Path $selected 'python\.venv\Scripts\python.exe') -and -not $result.IsProjected
+}
+It 'parallel DOSBox control selection cannot replace the established wrapper' {
+    $legacy = Get-SULegacyVendorSelection -Name Dosbox
+    $control = Get-SULegacyVendorSelection -Name DosboxControl
+    $compiler = Get-SULegacyVendorSelection -Name Watcom
+    $legacy.Component -eq 'dosbox' -and $legacy.Wrapper -eq 'dosbox-x' -and
+        $control.Component -eq 'dosbox-control' -and $control.Wrapper -eq 'dosbox-x-control' -and
+        $compiler.Component -eq 'watcom' -and $null -eq $compiler.Wrapper
+}
+It 'actual installer dry run expands All and retains an explicit control exactly once' {
+    $installer = Join-Path $repoRoot 'scripts\install-legacy-dos.ps1'
+    foreach ($components in @(@('All'), @('All', 'DosboxControl', 'DosboxControl'), @('DosboxControl', 'All'),
+            @('All', 'DosboxControl', 'dosboxcontrol', 'capstone', 'watcom'),
+            @('dosboxcontrol', 'all', 'DOSBOXCONTROL', 'DOSBOX'))) {
+        $output = @(& $installer -Component $components -Root 'C:\fixture\not-accessed' -DryRun 6>&1)
+        $names = @($output | ForEach-Object {
+            if ([string]$_ -match 'explicit optional component: ([A-Za-z]+) ->') { $Matches[1] }
+        })
+        $expected = @('Capstone', 'Unicorn', 'Dosbox', 'Ghidra', 'Watcom')
+        if ($components -contains 'DosboxControl') { $expected += 'DosboxControl' }
+        if (-not [string]::Equals(($names -join ','), ($expected -join ','), [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        if (@($output | Where-Object { [string]$_ -like '*no downloads, package changes, registry changes*' }).Count -ne 1) { return $false }
+    }
+    return $true
 }
 It 'pinned Ghidra selection ignores registered older releases and other JDK majors' {
     $root = 'C:\fixture\selected-toolbox'

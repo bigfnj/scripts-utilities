@@ -1,4 +1,15 @@
 # Pure selection and result guards for the explicit optional DOS tool workflow.
+function Get-SULegacyVendorSelection {
+    param([Parameter(Mandatory)][ValidateSet('Dosbox', 'DosboxControl', 'Watcom')][string]$Name)
+    if ($Name -eq 'Dosbox') {
+        return [pscustomobject]@{ Component = 'dosbox'; Wrapper = 'dosbox-x' }
+    }
+    if ($Name -eq 'DosboxControl') {
+        return [pscustomobject]@{ Component = 'dosbox-control'; Wrapper = 'dosbox-x-control' }
+    }
+    [pscustomobject]@{ Component = 'watcom'; Wrapper = $null }
+}
+
 function Test-SULegacyHostProjection {
     param([Parameter(Mandatory)][string]$Root,
         [scriptblock]$Probe = { param($Path) Test-HostPathProjection -Path $Path })

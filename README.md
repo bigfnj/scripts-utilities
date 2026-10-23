@@ -510,6 +510,13 @@ debugger capabilities before relying on automated game tracing. The optional
 smoke parameter -WindowMonitorDevice accepts an explicit Windows display device,
 preserves hidden state, and moves only that invocation's live DOSBox process windows.
 
+`-Component DosboxControl` separately selects the pinned October 2026 portable
+runtime in `native/dosbox-control-2026.10.01`, with its own `dosbox-x-control`
+wrapper and manifest row. `Dosbox` and `All` keep the August runtime and
+`dosbox-x` selection. Review with `-DryRun` and run the host-projection preflight
+before installing. October's named checked-text dumps and TCP debugger protocol
+require separate live calibration; installation is not debugger acceptance.
+
 ## Licence
 
 [MIT](LICENSE).

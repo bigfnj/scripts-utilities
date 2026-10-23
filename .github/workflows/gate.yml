@@ -102,6 +102,15 @@ jobs:
           if ($null -eq $code) { Write-Host 'FAIL suite set no exit code'; exit 1 }
           if ($code -ne 0) { exit $code }
 
+      - name: Generated .NET fixture PATH suite
+        if: ${{ !cancelled() }}
+        shell: powershell
+        run: |
+          .\tests\Invoke-GeneratedDotNetPathTests.ps1
+          $code = $LASTEXITCODE
+          if ($null -eq $code) { Write-Host 'FAIL suite set no exit code'; exit 1 }
+          if ($code -ne 0) { exit $code }
+
       - name: Triage suite
         if: ${{ !cancelled() }}
         shell: powershell

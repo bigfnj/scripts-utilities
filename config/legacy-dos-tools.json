@@ -20,6 +20,16 @@
       "h/stdio.h"
     ]
   },
+  "dosbox-control": {
+    "release": "2026.10.01",
+    "url": "https://github.com/joncampbell123/dosbox-x/releases/download/dosbox-x-v2026.10.01/dosbox-x-vsbuild-win64-2026.10.01-portable.zip",
+    "sha256": "3c50915e63aefe35777d65ebb4391a06b4a2c2342e4c75cbee6bbda4c6916e33",
+    "format": "zip",
+    "marker": "Release SDL2/dosbox-x.exe",
+    "required": [
+      "Release SDL2/dosbox-x.exe"
+    ]
+  },
   "dosbox": {
     "release": "2026.08.02",
     "url": "https://github.com/joncampbell123/dosbox-x/releases/download/dosbox-x-v2026.08.02/dosbox-x-vsbuild-win64-2026.08.02-portable.zip",
