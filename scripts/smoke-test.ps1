@@ -14,6 +14,7 @@ $MANIFEST_PATH = Join-Path $REPO_ROOT "manifest\tools.json"
 
 . (Join-Path $REPO_ROOT "lib\common.ps1")
 . (Join-Path $REPO_ROOT "lib\catalog.ps1")
+. (Join-Path $REPO_ROOT "lib\JunctionTrust.ps1")
 Sync-EnvPath
 
 $Pass = 0; $Fail = 0; $Warn = 0
@@ -596,6 +597,39 @@ if (Test-Path -LiteralPath $venvCfg) {
     } else {
         Test-Ok "pyvenv.cfg names no packaged-host container"
     }
+
+    # THE BASE INTERPRETER MUST OPEN FROM THE SHELL ASKING, and an elevated shell can be refused a
+    # path an unelevated one opens. Measured 2026-10-30: `home` was uv's
+    # cpython-3.11-windows-x86_64-none junction, made unelevated, so every ELEVATED agent shell got
+    # `No Python at '"...python.exe'` (exit 103), taking recall and every wrapped CLI with it, while
+    # the owner's own terminals worked. lib\JunctionTrust.ps1 has the measurements.
+    #
+    # An unelevated OK through a junction cannot vouch for an elevated host, and the line says so
+    # rather than warning: no repair makes an unelevated shell able to tell, so a warning there
+    # could never clear.
+    $jtHome = $null
+    try { $jtHome = Get-JtVenvHomeState -PyvenvCfg $venvCfg }
+    catch { Test-Fail "could not read the toolbox venv's home from pyvenv.cfg: $($_.Exception.Message)" }
+    if ($jtHome) {
+        switch ($jtHome.Status) {
+            'ok' {
+                if ($jtHome.ThroughLink -and -not $jtHome.Elevated) {
+                    Test-Ok ("toolbox venv base interpreter opens from this UNELEVATED shell; its path crosses a " +
+                             "junction an elevated host may refuse, so gate elevated to check: $($jtHome.Home)")
+                } else {
+                    Test-Ok "toolbox venv base interpreter opens from this shell: $($jtHome.Home)"
+                }
+            }
+            'untrusted' {
+                Test-Fail ("toolbox venv base interpreter is behind a junction this elevated shell may not follow " +
+                           "(WinError 448, untrusted mount point): $($jtHome.Home) - run .\scripts\repair-untrusted-junctions.ps1")
+            }
+            'no-home' { Test-Fail "pyvenv.cfg has no home line: $venvCfg" }
+            default {
+                Test-Fail "toolbox venv base interpreter cannot be opened ($($jtHome.Status)): $($jtHome.Home) $($jtHome.Message)"
+            }
+        }
+    }
 }
 
 if (-not (Test-Path -LiteralPath $tbRoot)) {
@@ -1009,7 +1043,8 @@ $suiteRequired = @('Invoke-CoreTests.ps1', 'Invoke-InstallerTests.ps1',
                    'Invoke-TriageTests.ps1', 'Invoke-RenderTests.ps1',
                    'Invoke-SmokeLintTests.ps1', 'Invoke-GateChecksTests.ps1',
                    'Invoke-AgentDiscoveryTests.ps1', 'Invoke-LegacyDosTests.ps1',
-                   'Invoke-NativeShimTests.ps1', 'Invoke-GeneratedDotNetPathTests.ps1')
+                   'Invoke-NativeShimTests.ps1', 'Invoke-GeneratedDotNetPathTests.ps1',
+                   'Invoke-JunctionTrustTests.ps1')
 $suiteFiles = @(Get-ChildItem -LiteralPath (Join-Path $REPO_ROOT 'tests') -Filter 'Invoke-*Tests.ps1' `
                     -File -ErrorAction SilentlyContinue | Sort-Object Name)
 foreach ($suiteReq in $suiteRequired) {

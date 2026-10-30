@@ -73,6 +73,15 @@ projection before applying. Selected tools, package provenance, PATH and the sha
 Python environment stay the same. PowerShell 5.1 retains its own native argument
 limitations, which are also present when calling the real executable directly.
 
+**An elevated agent is refused junctions you made.** Windows will not let an elevated process
+follow a directory junction that was created without admin rights, while your own unelevated
+shells follow it fine. uv's version links and npm workspace links are made that way, so an agent
+host that runs elevated can find the toolbox Python "missing" while it works for you. Gated from
+an elevated shell, the smoke test fails when the toolbox venv's base interpreter sits behind such
+a link, and [scripts/repair-untrusted-junctions.ps1](scripts/repair-untrusted-junctions.ps1)
+recreates such links from an elevated shell after a reviewed dry run. The measurements are in
+[docs/junction-trust.md](docs/junction-trust.md).
+
 ### The PATH problem this had to solve
 
 Two failures make a correctly installed tool report "not found" in an agent shell, and both are
@@ -384,6 +393,7 @@ lib/AgentDiscovery.ps1              agent-block discovery and safe block rewriti
 lib/SmokeLint.ps1                   lint rules the smoke test enforces on itself
 lib/GateChecks.ps1                  the seven repo hygiene checks, one registry
 lib/SysmonConfig.ps1                Sysmon config rendering and validation
+lib/JunctionTrust.ps1               junctions an elevated process refuses: find, plan, recreate
 modules/                            cli-tools, security, extras groups
 tools/browse/                       the `browse` CLI: a pip package so its shim stays in contract
 scripts/build-devtoolbox.ps1        Python + native DevToolbox builder
@@ -403,6 +413,7 @@ scripts/uninstall-toolbox.ps1       full-reset uninstaller
 scripts/get-msu.ps1                 fetch a KB's .msu from the Microsoft Update Catalog
 scripts/run-unprojected.ps1         run a script in a process this agent host did not spawn
 scripts/test-host-projection.ps1    is this shell seeing a packaged host's redirected view?
+scripts/repair-untrusted-junctions.ps1  recreate junctions an elevated agent cannot follow; plan first
 scripts/run-gate-checks.ps1         the hygiene-check runner CI and run-gate.ps1 share
 scripts/smoke-test.ps1              repository-level functional gate
 tests/Invoke-AgentDiscoveryTests.ps1  the agent-block extractor's AST allowlist
@@ -412,12 +423,14 @@ tests/Invoke-InstallerTests.ps1     installers, shims, PATH editing, native-stde
 tests/Invoke-RenderTests.ps1        forensics report rendering and escaping
 tests/Invoke-SmokeLintTests.ps1     the smoke test's own lint rules
 tests/Invoke-TriageTests.ps1        triage classification
+tests/Invoke-JunctionTrustTests.ps1  junction classifier, walker, plan and guarded recreate
 tests/SUTestGuard.ps1               deletion tripwire + suite floors, dot-sourced by every suite
 gui/toolbox-gui.ps1                 WinForms front-end
 gui/Start-ToolboxGui.cmd            GUI launcher
 docs/agent-rules.md                 contribution + install-channel rules
 docs/tools-reference.md             how to use each tool
 docs/engineering-record.md          closed work: refuted, retracted or deliberately decided
+docs/junction-trust.md              why elevated hosts refuse some junctions, and the repair
 docs/fresh-workstation-audit.md     the 2026-07-31 audit and its go/no-go gate
 tasks/fresh-toolbox-setup.md        replacement-workstation checklist
 .github/workflows/gate.yml          CI: parse sweep, control-character scan, every suite
