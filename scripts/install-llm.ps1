@@ -274,7 +274,7 @@ function Install-Reranker {
     #   $py <toolbox>\scripts\rerank.py "query" "doc A" "doc B" ...
     # prints JSON [{index, score, text}] sorted best-first.
     $helper = @'
-import json, sys, os
+import contextlib, json, sys, os
 import numpy as np
 import onnxruntime as ort
 from tokenizers import Tokenizer
@@ -287,11 +287,14 @@ def session():
     # The CUDA provider's DLL needs the venv's nvidia-* wheels (cuDNN, cuBLAS) on the load path,
     # and onnxruntime finds them only when asked: without preload_dlls() it falls back to CPU in
     # silence. TensorRT is left out: it is compiled in but needs its own libraries.
+    # preload_dlls() PRINTS each DLL it cannot load to stdout; this helper's stdout is JSON, so
+    # that output goes to stderr.
     if hasattr(ort, "preload_dlls"):
-        try:
-            ort.preload_dlls()
-        except Exception:
-            pass
+        with contextlib.redirect_stdout(sys.stderr):
+            try:
+                ort.preload_dlls()
+            except Exception:
+                pass
     want = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in ort.get_available_providers()]
     return ort.InferenceSession(os.path.join(MODEL_DIR, "model.onnx"), providers=want)
 
