@@ -20,13 +20,19 @@ is not installed here yet.
   .\scripts\install-llm.ps1                 # Ollama + tiered default models + reranker
   .\scripts\install-llm.ps1 -DryRun         # show what would happen, change nothing
   .\scripts\install-llm.ps1 -SkipReranker   # skip the ONNX reranker provisioning
+  .\scripts\install-llm.ps1 -RerankerOnly   # only the ONNX reranker: no Ollama, no models,
+                                            # no OLLAMA_MODELS change
   .\scripts\install-llm.ps1 -Models qwen2.5:3b,moondream   # explicit model set
+
+The reranker step installs only what the toolbox venv lacks, and never a second onnxruntime:
+a venv that already has onnxruntime-gpu (or -directml) keeps it.
 #>
 [CmdletBinding()]
 param(
     [string]  $Root = $(if ($env:CODEX_TOOLBOX) { $env:CODEX_TOOLBOX } else { "$env:LOCALAPPDATA\DevToolbox" }),
     [string[]]$Models,
     [switch]  $SkipReranker,
+    [switch]  $RerankerOnly,
     [switch]  $IncludeLlamaCpp,
     [switch]  $DryRun
 )
@@ -42,6 +48,12 @@ $REPO_ROOT = Split-Path $PSScriptRoot
 . (Join-Path $REPO_ROOT "lib\common.ps1")
 . (Join-Path $REPO_ROOT "lib\catalog.ps1")
 if ($DryRun) { $script:DryRun = $true }
+
+# Contradictory switches are refused, not reconciled: a run that silently drops half of what it
+# was asked for still exits 0, and anything scripting it reads that as done.
+if ($RerankerOnly -and $SkipReranker) { throw "-RerankerOnly and -SkipReranker contradict each other: pass one" }
+if ($RerankerOnly -and $Models) { throw "-RerankerOnly pulls no models: drop -Models, or drop -RerankerOnly" }
+if ($RerankerOnly -and $IncludeLlamaCpp) { throw "-RerankerOnly installs no engine: drop -IncludeLlamaCpp" }
 
 $llm = (Get-Catalog).llm
 if (-not $llm) { throw "catalog.json has no 'llm' section" }
@@ -179,19 +191,75 @@ function Install-Reranker {
     # onnxruntime (already present). Best-effort: warns and continues on failure.
     $rr = $llm.reranker
     if (-not $rr) { return }
+    # Every way out below that leaves no working reranker is COUNTED, as the asset check at the
+    # end already was: the run was asked for a reranker, so not getting one is a failure.
     $py = Get-ToolboxPython
-    if (-not $py) { Write-Warn "toolbox Python not found - skipping reranker (build the toolbox first)"; return }
+    if (-not $py) {
+        Write-Err "toolbox Python not found - reranker NOT provisioned (build the toolbox first)"
+        $script:LlmFailures++
+        return
+    }
     $dir = Join-Path $Root $rr.dir_relative
+
+    # Install only what is missing, and NEVER a second onnxruntime. This step used to run
+    # `pip install tokenizers onnxruntime` unconditionally. In a venv that already carries a GPU
+    # build (onnxruntime-gpu, onnxruntime-directml), the CPU wheel unpacks into the SAME
+    # `onnxruntime` package directory, and the GPU providers silently disappear for every other
+    # user of the venv. So ask the venv which distributions it has (read-only, so a dry run
+    # does it too). Single quotes only: Windows PowerShell 5.1 mangles embedded double quotes
+    # in native arguments.
+    $probe = "import importlib.metadata as m, importlib.util as u, json; " +
+             "n = {(d.metadata['Name'] or '').lower().replace('_', '-') for d in m.distributions()}; " +
+             "print(json.dumps({'ort': sorted(x for x in n if x.startswith('onnxruntime')), " +
+             "'tokenizers': u.find_spec('tokenizers') is not None}))"
+    $raw = & $py -c $probe
+    if ($LASTEXITCODE -ne 0 -or -not $raw) {
+        Write-Err "could not inspect the toolbox venv ($py) - reranker NOT provisioned"
+        $script:LlmFailures++
+        return
+    }
+    $state = ($raw | Select-Object -Last 1) | ConvertFrom-Json
+    $ortDists = @($state.ort | Where-Object { $_ })
+    $need = @()
+    if (-not $state.tokenizers) { $need += 'tokenizers' }
+    if ($ortDists.Count -eq 0) {
+        $need += 'onnxruntime'
+    } else {
+        Write-Skip ("onnxruntime already provided by {0} - not installing a second runtime" -f ($ortDists -join ', '))
+    }
+    if ($ortDists.Count -gt 1) {
+        Write-Warn ("{0} onnxruntime distributions share one package directory ({1}); uninstall all but one" -f
+                    $ortDists.Count, ($ortDists -join ', '))
+    }
     if ($DryRun) {
-        Write-Info "[DRY-RUN] would pip install tokenizers/onnxruntime into the venv"
+        if ($need.Count) { Write-Info ("[DRY-RUN] would pip install {0} into the venv" -f ($need -join ' ')) }
+        else { Write-Info "[DRY-RUN] would pip install nothing: tokenizers and an onnxruntime are present" }
         Write-Info "[DRY-RUN] would download $($rr.name) ONNX + tokenizer -> $dir"
         Write-Info "[DRY-RUN] would write $Root\scripts\rerank.py"
         return
     }
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    Write-Info "pip install tokenizers onnxruntime (toolbox venv)"
-    & $py -m pip install --quiet tokenizers onnxruntime
-    if ($LASTEXITCODE -ne 0) { Write-Warn "reranker python deps failed to install - skipping"; return }
+    if ($need.Count) {
+        Write-Info ("pip install {0} (toolbox venv)" -f ($need -join ' '))
+        & $py -m pip install --quiet $need
+        if ($LASTEXITCODE -ne 0) {
+            Write-Err ("reranker python deps failed to install ({0}) - reranker NOT provisioned" -f ($need -join ', '))
+            $script:LlmFailures++
+            return
+        }
+    } else {
+        Write-Skip "tokenizers and onnxruntime already present - nothing to pip install"
+    }
+    # Prove both import. get_available_providers() lists the providers COMPILED IN, not the ones
+    # that load: CUDA is listed even when its DLL cannot find cuDNN/cuBLAS. The session check
+    # after the download below says which provider really runs the model.
+    $prov = & $py -c "import tokenizers, onnxruntime; print(','.join(onnxruntime.get_available_providers()))"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "tokenizers/onnxruntime do not import in the toolbox venv - reranker NOT provisioned"
+        $script:LlmFailures++
+        return
+    }
+    Write-Info "onnxruntime providers compiled in: $prov"
     # Count the failures. Every asset used to be its own try/catch-warn and then
     # "OK reranker provisioned" printed regardless - so all three could fail and the
     # run still ended by telling you the reranker was ready.
@@ -215,13 +283,26 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.environ.get("CODEX_TOOLBOX", os.path.dirname(HERE))
 MODEL_DIR = os.path.join(ROOT, "models", "reranker", "bge-reranker-base")
 
+def session():
+    # The CUDA provider's DLL needs the venv's nvidia-* wheels (cuDNN, cuBLAS) on the load path,
+    # and onnxruntime finds them only when asked: without preload_dlls() it falls back to CPU in
+    # silence. TensorRT is left out: it is compiled in but needs its own libraries.
+    if hasattr(ort, "preload_dlls"):
+        try:
+            ort.preload_dlls()
+        except Exception:
+            pass
+    want = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in ort.get_available_providers()]
+    return ort.InferenceSession(os.path.join(MODEL_DIR, "model.onnx"), providers=want)
+
 def main(argv):
+    if argv[1:] == ["--check"]:          # load the model; print the providers that really run it
+        print(",".join(session().get_providers())); return 0
     if len(argv) < 3:
-        print("usage: rerank.py <query> <doc> [<doc> ...]", file=sys.stderr); return 2
+        print("usage: rerank.py <query> <doc> [<doc> ...] | rerank.py --check", file=sys.stderr); return 2
     query, docs = argv[1], argv[2:]
     tok = Tokenizer.from_file(os.path.join(MODEL_DIR, "tokenizer.json"))
-    sess = ort.InferenceSession(os.path.join(MODEL_DIR, "model.onnx"),
-                                providers=ort.get_available_providers())
+    sess = session()
     want = {i.name for i in sess.get_inputs()}
     scores = []
     for doc in docs:
@@ -254,10 +335,39 @@ if __name__ == "__main__":
                    $missing.Count, @($rr.files).Count, ($missing -join ', '))
         return
     }
+    # Load the model once and report the provider that REALLY runs it. CPU-only is a working
+    # reranker, just a slow one (seconds per query instead of a fraction of one), so it warns.
+    # No 2> redirect: under Windows PowerShell 5.1 with ErrorActionPreference Stop, a redirected
+    # stderr line (onnxruntime logs a CUDA load failure there) becomes a terminating error.
+    $used = & $py (Join-Path $Root "scripts\rerank.py") --check
+    if ($LASTEXITCODE -ne 0 -or -not $used) {
+        Write-Err "the reranker model does not load (rerank.py --check failed) - reranker NOT provisioned"
+        $script:LlmFailures++
+        return
+    }
+    $used = ($used | Select-Object -Last 1)
+    if ($used -like "CUDAExecutionProvider*") { Write-Info "reranker runs on: $used" }
+    else { Write-Warn "reranker runs on CPU only ($used): correct but slow; the CUDA provider did not load" }
     Write-Ok "reranker provisioned: $dir (helper: $Root\scripts\rerank.py)"
 }
 
 # -- Main ----------------------------------------------------------------------
+if ($RerankerOnly) {
+    # Before anything that touches Ollama: no OLLAMA_MODELS or TOOLBOX_LLM_URL change, no winget,
+    # no pulls. A box with its own Ollama and models keeps them exactly as they are.
+    Write-Group "reranker only (ONNX via toolbox Python)"
+    Write-Info "toolbox root: $Root"
+    Write-Info "-RerankerOnly: Ollama, its models and OLLAMA_MODELS are left untouched"
+    Install-Reranker
+    Write-Group "done"
+    if ($script:LlmFailures -gt 0) {
+        Write-Err "reranker INCOMPLETE - $($script:LlmFailures) step(s) failed. Fix those, then re-run; this script is idempotent."
+        exit 1
+    }
+    if ($DryRun) { Write-Ok "dry run complete: nothing was changed" }
+    exit 0
+}
+
 Write-Group "local LLM stack (Ollama)"
 Write-Info "toolbox root: $Root"
 Write-Info "models dir:   $modelsDir"

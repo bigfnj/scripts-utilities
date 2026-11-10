@@ -268,8 +268,10 @@ gets `moondream` (vision), `qwen2.5:3b` + `mistral:7b` (text) and `qwen3-embeddi
 (embeddings); a box reporting **20 GB** or more of VRAM also gets `mistral-small`, per
 `tier_24gb_min_vram_mb: 20000` in `catalog.json` (the key is named for the card class, not the
 threshold). A `bge-reranker-base` cross-encoder runs via
-the toolbox `onnxruntime` (`-SkipReranker` to omit). The model set is defined in `catalog.json`
-under `llm`.
+the toolbox `onnxruntime` (`-SkipReranker` to omit; `-RerankerOnly` to provision just the
+reranker without touching Ollama, its models or `OLLAMA_MODELS`). The reranker step installs only
+what the venv lacks and never a second `onnxruntime`, so an existing `onnxruntime-gpu` keeps its
+GPU providers. The model set is defined in `catalog.json` under `llm`.
 
 ### Optional — web reading (`scripts/install-browse.ps1`)
 

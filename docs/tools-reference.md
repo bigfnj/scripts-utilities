@@ -812,7 +812,19 @@ ollama run moondream "describe this image ./photo.jpg"   # vision
 # Rerank retrieved passages with the ONNX cross-encoder (RAG quality)
 & $env:TOOLBOX_PYTHON "$env:CODEX_TOOLBOX\scripts\rerank.py" "the query" "passage A" "passage B"
 # -> JSON [{index, score, text}] sorted best-first
+
+# Provision only the reranker (no Ollama, no models, OLLAMA_MODELS untouched)
+.\scripts\install-llm.ps1 -RerankerOnly -DryRun   # review first
+.\scripts\install-llm.ps1 -RerankerOnly
 ```
+
+The reranker step pip-installs only what the toolbox venv lacks (`tokenizers`, and
+`onnxruntime` only when no onnxruntime distribution is present), so an `onnxruntime-gpu`
+venv keeps its CUDA providers. It then loads the model once and reports the provider that
+really runs it (`rerank.py --check`). `onnxruntime.get_available_providers()` lists the
+providers compiled in, not the ones that load: the CUDA provider needs the venv's nvidia-*
+DLLs, which `rerank.py` preloads with `onnxruntime.preload_dlls()`. Without that preload it
+falls back to CPU in silence, about 6x slower.
 
 Models are VRAM-tiered (8 GB gets the light set; 24 GB also gets `mistral-small`)
 and stored under `%CODEX_TOOLBOX%\models`. Prefer `mistral:7b`/`mistral-small`
