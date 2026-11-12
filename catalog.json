@@ -65,6 +65,12 @@
       "notes": "code statistics and LOC counter"
     },
     {
+      "name": "ruff", "group": "cli-tools", "channel": "winget-user",
+      "id": "astral-sh.ruff", "binary": "ruff", "detect": "ruff --version",
+      "default": true,
+      "notes": "Python linter and formatter (one native binary): ruff check <path>; --select F,E9,B,PLE keeps it to likely bugs"
+    },
+    {
       "name": "podman", "group": "cli-tools", "channel": "winget-default",
       "id": "Podman.CLI", "binary": "podman", "detect": "podman --version",
       "default": true,
@@ -167,6 +173,12 @@
       "id": "csvkit", "binary": "csvlook", "import": "csvkit", "detect": "csvlook --version",
       "default": true,
       "notes": "CSV utilities: csvlook, csvcut, csvstat, csvjoin, in2csv, sql2csv"
+    },
+    {
+      "name": "vulture", "group": "extras", "channel": "pip-toolbox",
+      "id": "vulture", "binary": "vulture", "import": "vulture", "detect": "vulture --version",
+      "default": true,
+      "notes": "Python dead-code finder (toolbox venv): vulture <path> --min-confidence 80; review hits, it cannot see dynamic use"
     },
     {
       "name": "pytoshop", "group": "extras", "channel": "pip-toolbox",

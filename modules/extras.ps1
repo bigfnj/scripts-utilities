@@ -4,7 +4,7 @@
 # (toolbox venv pip). These are small additions that round out the toolbox
 # without introducing new heavy dependencies.
 
-function extras_desc { "markdownlint-cli (npm), jupyterlab + sqlite-utils + csvkit + pytoshop (toolbox venv)" }
+function extras_desc { "markdownlint-cli (npm), jupyterlab + sqlite-utils + csvkit + vulture + pytoshop (toolbox venv)" }
 
 function extras_install {
     # Tool definitions live in catalog.json. pytoshop is an import-only library
